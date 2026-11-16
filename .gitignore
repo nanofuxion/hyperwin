@@ -1,0 +1,17 @@
+build/
+.gradle/
+local.properties
+*.qcow2
+.DS_Store
+app/build/
+app/.cxx/
+
+# Third-party UEFI tree. Built locally, not part of this repo.
+firmware/edk2-gunyah/
+
+# Generated local firmware configuration, toolchain and outputs.
+firmware/avf-edk2/conf/
+firmware/avf-edk2/out/
+firmware/avf-edk2/toolchain/
+guest/efi/*.aml
+guest/efi/*.hex

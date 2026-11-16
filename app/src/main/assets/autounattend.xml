@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>260</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>16</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>FAT32</Format>
+              <Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>3</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key>
+              <Value>1</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <ProductKey>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+      </UserData>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>HyperWin</Name>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>HyperWin</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>HyperWin</Username>
+        <Password>
+          <Value>HyperWin</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd.exe /c mkdir C:\HyperWin &amp; for %D in (D E F G H I) do @if exist %D:\hyperwin.id xcopy /E /I /Y %D:\hyperwin C:\HyperWin\ &amp; reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v C:\HyperWin\vulkan_gfxstream.json /t REG_DWORD /d 0 /f</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
