@@ -21,9 +21,22 @@ android {
     ndkVersion = "27.2.12479018"
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
 
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("src/main/jniLibs", "../gpu/work/android")
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = false
+            excludes += setOf(
+                "**/ring_test",
+                "**/bctest",
+                "**/scaledtest",
+                "**/libvulkan_*.so",
+                "**/libbcn_layer.so",
+            )
         }
     }
 

@@ -1,0 +1,15 @@
+diff --git a/src/bcn_layer.cpp b/src/bcn_layer.cpp
+index 6536b4b..1332446 100644
+--- a/src/bcn_layer.cpp
++++ b/src/bcn_layer.cpp
+@@ -400,8 +400,9 @@ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+     memoryIndex = idx < memoryProps.memoryTypeCount ? idx : UINT32_MAX;
+ 
++    VkPhysicalDeviceFeatures enabledFeatures;
+     if (createInfo.pEnabledFeatures) {
+-    	VkPhysicalDeviceFeatures enabledFeatures = *createInfo.pEnabledFeatures;
++    	enabledFeatures = *createInfo.pEnabledFeatures;
+     	enabledFeatures.textureCompressionBC &= featuresMap[GetKey(physicalDevice)].textureCompressionBC;
+     	createInfo.pEnabledFeatures = &enabledFeatures;
+     }

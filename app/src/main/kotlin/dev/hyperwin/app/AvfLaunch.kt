@@ -206,7 +206,8 @@ object AvfLaunch {
             val window = AvfPlan.createWindow(ByteArray(0), width, height)
             sharedWindow?.close()
             sharedWindow = window
-                startDebugTap(window, File(dir, "frame.bgra"))
+            HwGpu.start(window, width, height)
+            startDebugTap(window, File(dir, "frame.bgra"))
             startCppcCounter(window)
             val report = boot(
                 ctx,
@@ -247,8 +248,9 @@ object AvfLaunch {
         val window = AvfPlan.createWindow(ByteArray(0))
         sharedWindow?.close()
         sharedWindow = window
+        HwGpu.start(window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
         startDebugTap(window, File(dir, "frame.bgra"))
-            startCppcCounter(window)
+        startCppcCounter(window)
         val report = boot(
             ctx,
             GuestBoot.setupImage(firmware, listOf(esp, media)),
@@ -280,6 +282,7 @@ object AvfLaunch {
             machine = null
             VsockInput.stop()
             GuestAgent.stop()
+            HwGpu.stop()
             runCatching { onVmStopped() }
             sharedWindow?.let { window ->
                 sharedWindow = null
@@ -510,6 +513,7 @@ object AvfLaunch {
         machine = null
         VsockInput.stop()
         GuestAgent.stop()
+        HwGpu.stop()
         runCatching { onVmStopped() }
         if (window != null && sharedWindow === window) {
             sharedWindow = null

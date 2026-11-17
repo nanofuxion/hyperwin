@@ -1,0 +1,938 @@
+diff --git a/src/gfxstream/aemu/ring_buffer.cpp b/src/gfxstream/aemu/ring_buffer.cpp
+index 576bc5a..665a93c 100644
+--- a/src/gfxstream/aemu/ring_buffer.cpp
++++ b/src/gfxstream/aemu/ring_buffer.cpp
+@@ -321,7 +321,7 @@ long ring_buffer_view_read(struct ring_buffer* r, struct ring_buffer_view* v, vo
+ 
+ void ring_buffer_yield() {
+ #ifdef _WIN32
+-    _mm_pause();
++    YieldProcessor();
+ #else
+     sched_yield();
+ #endif
+diff --git a/src/gfxstream/guest/platform/VirtGpu.cpp b/src/gfxstream/guest/platform/VirtGpu.cpp
+index cdb4369..530a66c 100644
+--- a/src/gfxstream/guest/platform/VirtGpu.cpp
++++ b/src/gfxstream/guest/platform/VirtGpu.cpp
+@@ -74,3 +74,9 @@ SyncHelper* createPlatformSyncHelper() {
+ }
+ 
+ }  // namespace gfxstream
++
++#if !defined(_WIN32)
++// Shared memory needs nothing here. The Windows ring backend keeps guest copies and defines these.
++__attribute__((weak)) void virtGpuGuestMemoryWillBeRead() {}
++__attribute__((weak)) void virtGpuHostMemoryWasWritten() {}
++#endif
+diff --git a/src/gfxstream/guest/platform/include/VirtGpu.h b/src/gfxstream/guest/platform/include/VirtGpu.h
+index 68885b3..4b442f9 100644
+--- a/src/gfxstream/guest/platform/include/VirtGpu.h
++++ b/src/gfxstream/guest/platform/include/VirtGpu.h
+@@ -202,6 +202,15 @@ class VirtGpuDevice {
+     enum VirtGpuCapset mCapset;
+ };
+ 
++// A transport without shared memory (the Darwin sgpu backend) keeps guest copies of mapped blobs
++// and brings them in step with the host's only at the Vulkan calls that make one side read what
++// the other wrote. The entry points for those calls (func_table.cpp) say so with these.
++void virtGpuGuestMemoryWillBeRead();  // a queue submit: the host will read what the guest wrote
++void virtGpuHostMemoryWasWritten();   // a wait or status query returned: the GPU may have written
++struct VirtGpuHostWroteScope {
++    ~VirtGpuHostWroteScope() { virtGpuHostMemoryWasWritten(); }
++};
++
+ VirtGpuDevice* kumquatCreateVirtGpuDevice(enum VirtGpuCapset capset = kCapsetNone, int fd = -1);
+ VirtGpuDevice* osCreateVirtGpuDevice(enum VirtGpuCapset capset = kCapsetNone, int fd = -1);
+ 
+diff --git a/src/gfxstream/guest/platform/windows/WindowsSync.cpp b/src/gfxstream/guest/platform/windows/WindowsSync.cpp
+index dd98ef4..2e388f4 100644
+--- a/src/gfxstream/guest/platform/windows/WindowsSync.cpp
++++ b/src/gfxstream/guest/platform/windows/WindowsSync.cpp
+@@ -23,8 +23,7 @@ int WindowsSyncHelper::close(int syncFd) {
+     return -1;  // stub constant
+ }
+ 
+-SyncHelper* osCreateSyncHelper() {
+-    return nullptr;  // stub constant
+-}
++// No sync handles over the ring yet. The helper exists so callers need no null checks.
++SyncHelper* osCreateSyncHelper() { return new WindowsSyncHelper(); }
+ 
+ }  // namespace gfxstream
+diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
+index 476a2cd..a50b823 100644
+--- a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
++++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
+@@ -3,15 +3,80 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++// Windows VirtGpu backend for HyperWin: SweetCider's sgpu requests (virtio-gpu control commands,
++// sgpu_proto.h) carried through a byte ring in RAM shared with the Android host (hwgpu_ring.h).
++// hwgpu.sys maps this process's channel into it (hwgpu_ioctl.h); after that no system call sits
++// between the encoder and the phone. Mapped blobs are guest copies kept in step with the host's:
++// guest changes go out before a queue submit, host changes come back after a wait for the GPU.
++
+ #pragma once
+ 
++#include <atomic>
++#include <cstddef>
++#include <map>
++#include <mutex>
++#include <vector>
++
+ #include "VirtGpu.h"
+ 
++class HwgpuConnection {
++   public:
++    // The process-wide connection, opened on first use.
++    static HwgpuConnection* get();
++
++    // Sends one request and returns its reply (starting with vgpu_hdr), or an empty vector when
++    // the connection failed.
++    std::vector<uint8_t> call(const void* req, size_t len, const void* tail = nullptr,
++                              size_t tail_len = 0);
++    // call() for commands answered with OK_NODATA. Returns 0 or -EIO.
++    int simple(const void* req, size_t len, const void* tail = nullptr, size_t tail_len = 0);
++
++    // One host context per process, id HWGPU_CTX(slot). Created on first use, with Vulkan when
++    // the first device names no capset.
++    uint32_t context(enum VirtGpuCapset capset);
++    uint32_t newResourceId();
++
++    const std::map<uint32_t, std::vector<uint8_t>>& capsets() const { return mCapsets; }
++
++    void addMirror(uint32_t resourceId, uint8_t* local, size_t size);
++    void removeMirror(uint32_t resourceId);
++    // Sends guest changes to every mirror; with pull, also applies the host's changes.
++    void sync(bool pull);
++    // The host only reads mapped memory when it runs a queue submit, so guest changes go out with
++    // the first bytes streamed after one was started, not with every write.
++    void notePush() { mPush.store(true); }
++    void pushIfNoted();
++
++   private:
++    // The \\.\HwGpu handle stays open for the life of the process; closing it frees the channel.
++    HwgpuConnection(void* chan, uint32_t slot, uint32_t generation)
++        : mChan(chan), mSlot(slot), mGeneration(generation) {}
++    bool hello();
++    std::vector<uint8_t> callLocked(const void* req, size_t len, const void* tail,
++                                    size_t tail_len);
++
++    struct Mirror {
++        uint8_t* local;
++        std::vector<uint8_t> last;  // contents at the last sync
++    };
++
++    void* mChan;
++    uint32_t mSlot;
++    uint32_t mGeneration;
++    bool mBroken = false;
++    std::atomic<bool> mPush{false};
++    std::recursive_mutex mLock;
++    uint32_t mContext = 0;
++    uint32_t mNextResource = 1;
++    std::map<uint32_t, std::vector<uint8_t>> mCapsets;
++    std::map<uint32_t, Mirror> mMirrors;
++};
++
+ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGpuResource>,
+                                public VirtGpuResource {
+    public:
+-    WindowsVirtGpuResource(int64_t deviceHandle, uint32_t blobHandle, uint32_t resourceHandle,
+-                           uint64_t size);
++    WindowsVirtGpuResource(uint32_t ctxId, uint32_t resourceHandle, uint64_t size, uint32_t stride,
++                           bool blob);
+     ~WindowsVirtGpuResource();
+ 
+     void intoRaw() override;
+@@ -27,13 +92,16 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
+     int transferToHost(uint32_t x, uint32_t y, uint32_t w, uint32_t h) override;
+ 
+    private:
+-    // Not owned.  Really should use a ScopedFD for this, but doesn't matter since we have a
+-    // singleton deviceimplemenentation anyways.
+-    int64_t mDeviceHandle;
++    uint8_t* local();
++    int transfer(bool toHost, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ 
+-    uint32_t mBlobHandle;
++    uint32_t mCtxId;
+     uint32_t mResourceHandle;
+     uint64_t mSize;
++    uint32_t mStride;
++    bool mBlob;
++    bool mMapped = false;
++    uint8_t* mLocal = nullptr;  // page-aligned guest copy
+ };
+ 
+ class WindowsVirtGpuResourceMapping : public VirtGpuResourceMapping {
+@@ -54,19 +122,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
+     WindowsVirtGpuDevice(enum VirtGpuCapset capset, int fd = -1);
+     virtual ~WindowsVirtGpuDevice();
+ 
+-    virtual int64_t getDeviceHandle(void);
++    bool valid() const { return mCtxId != 0; }
++
++    int64_t getDeviceHandle(void) override;
+ 
+-    virtual struct VirtGpuCaps getCaps(void);
++    struct VirtGpuCaps getCaps(void) override;
+ 
+     VirtGpuResourcePtr createBlob(const struct VirtGpuCreateBlob& blobCreate) override;
+     VirtGpuResourcePtr createResource(uint32_t width, uint32_t height, uint32_t stride,
+                                       uint32_t size, uint32_t virglFormat, uint32_t target,
+                                       uint32_t bind) override;
+ 
+-    virtual VirtGpuResourcePtr importBlob(const struct VirtGpuExternalHandle& handle);
+-    virtual int execBuffer(struct VirtGpuExecBuffer& execbuffer, const VirtGpuResource* blob);
++    VirtGpuResourcePtr importBlob(const struct VirtGpuExternalHandle& handle) override;
++    int execBuffer(struct VirtGpuExecBuffer& execbuffer, const VirtGpuResource* blob) override;
+ 
+    private:
+-    int64_t mDeviceHandle;
++    uint32_t mCtxId = 0;
+     struct VirtGpuCaps mCaps;
+ };
+diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp
+index 9113d96..8edda7e 100644
+--- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp
++++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp
+@@ -3,44 +3,139 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
+-#include "WindowsVirtGpu.h"
++#include <errno.h>
++#include <string.h>
++
++#include <algorithm>
+ 
+-WindowsVirtGpuResource::WindowsVirtGpuResource(int64_t deviceHandle, uint32_t blobHandle,
+-                                               uint32_t resourceHandle, uint64_t size)
+-    : mDeviceHandle(deviceHandle),
+-      mBlobHandle(blobHandle),
+-      mResourceHandle(resourceHandle),
+-      mSize(size) {}
++#include "WindowsVirtGpu.h"
++#include "hwgpu_ring.h"
++#include "sgpu_proto.h"
++#include "util/log.h"
+ 
+-WindowsVirtGpuResource::~WindowsVirtGpuResource() {}
++WindowsVirtGpuResource::WindowsVirtGpuResource(uint32_t ctxId, uint32_t resourceHandle,
++                                               uint64_t size, uint32_t stride, bool blob)
++    : mCtxId(ctxId), mResourceHandle(resourceHandle), mSize(size), mStride(stride), mBlob(blob) {}
+ 
+-void WindowsVirtGpuResource::intoRaw() {
+-    mBlobHandle = INVALID_DESCRIPTOR;
+-    mResourceHandle = INVALID_DESCRIPTOR;
++WindowsVirtGpuResource::~WindowsVirtGpuResource() {
++    auto* c = HwgpuConnection::get();
++    if (c && mMapped) c->removeMirror(mResourceHandle);
++    if (c && mResourceHandle) {
++        vgpu_resource_unref u = {};
++        u.hdr.type = VGPU_CMD_RESOURCE_UNREF;
++        u.hdr.ctx_id = mCtxId;
++        u.resource_id = mResourceHandle;
++        c->simple(&u, sizeof(u));
++    }
++    if (mLocal) VirtualFree(mLocal, 0, MEM_RELEASE);
+ }
+ 
+-uint32_t WindowsVirtGpuResource::getBlobHandle() const { return mBlobHandle; }
++void WindowsVirtGpuResource::intoRaw() { mResourceHandle = 0; }
++
++uint32_t WindowsVirtGpuResource::getBlobHandle() const { return mResourceHandle; }
+ 
+ uint32_t WindowsVirtGpuResource::getResourceHandle() const { return mResourceHandle; }
+ 
+ uint64_t WindowsVirtGpuResource::getSize() const { return mSize; }
+ 
+-VirtGpuResourceMappingPtr WindowsVirtGpuResource::createMapping() {
+-    return nullptr;  // stub constant
++uint8_t* WindowsVirtGpuResource::local() {
++    if (!mLocal)
++        mLocal = static_cast<uint8_t*>(
++            VirtualAlloc(nullptr, size_t(mSize), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
++    return mLocal;
+ }
+ 
+-int WindowsVirtGpuResource::exportBlob(struct VirtGpuExternalHandle& handle) {
+-    return 0;  // stub constant
++VirtGpuResourceMappingPtr WindowsVirtGpuResource::createMapping() {
++    uint8_t* p = local();
++    if (!p) return nullptr;
++    if (mBlob && !mMapped) {
++        auto* c = HwgpuConnection::get();
++        vgpu_map_blob m = {};
++        m.hdr.type = VGPU_CMD_RESOURCE_MAP_BLOB;
++        m.hdr.ctx_id = mCtxId;
++        m.resource_id = mResourceHandle;
++        auto r = c->call(&m, sizeof(m));
++        if (r.size() < sizeof(vgpu_hdr) ||
++            reinterpret_cast<vgpu_hdr*>(r.data())->type != VGPU_RESP_OK_MAP_INFO) {
++            mesa_loge("hwgpu: map of resource %u failed", mResourceHandle);
++            return nullptr;
++        }
++        // Start from the host's contents, then keep the copy in step. Stay well under the rx ring.
++        for (uint64_t off = 0; off < mSize;) {
++            uint32_t n = uint32_t(std::min<uint64_t>(mSize - off, HWGPU_RX_BYTES / 2));
++            sgpu_blob_io io = {};
++            io.hdr.type = SGPU_CMD_BLOB_READ;
++            io.resource_id = mResourceHandle;
++            io.len = n;
++            io.offset = off;
++            auto d = c->call(&io, sizeof(io));
++            if (d.size() != sizeof(sgpu_resp_data) + n ||
++                reinterpret_cast<sgpu_resp_data*>(d.data())->hdr.type != SGPU_RESP_OK_DATA) {
++                mesa_loge("hwgpu: read of resource %u failed", mResourceHandle);
++                return nullptr;
++            }
++            memcpy(p + off, d.data() + sizeof(sgpu_resp_data), n);
++            off += n;
++        }
++        c->addMirror(mResourceHandle, p, size_t(mSize));
++        mMapped = true;
++    }
++    return std::make_shared<WindowsVirtGpuResourceMapping>(shared_from_this(), p, mSize);
+ }
+ 
+-int WindowsVirtGpuResource::wait() {
+-    return 0;  // stub constant
++int WindowsVirtGpuResource::exportBlob(struct VirtGpuExternalHandle& handle) { return -EINVAL; }
++
++// Commands complete in order on the host, so there is nothing to wait for.
++int WindowsVirtGpuResource::wait() { return 0; }
++
++int WindowsVirtGpuResource::transfer(bool toHost, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
++    uint8_t* p = local();
++    if (!p) return -ENOMEM;
++    // Buffers (and pipes) move bytes [x, x + w). Images move whole rows.
++    uint64_t off = x, len = w;
++    if (h > 1 || y) {
++        off = uint64_t(y) * mStride;
++        len = uint64_t(h) * mStride;
++    }
++    if (off > mSize || len > mSize - off) return -EINVAL;
++
++    auto* c = HwgpuConnection::get();
++    struct {
++        vgpu_transfer_3d t;
++        uint32_t len;
++    } __attribute__((packed)) req = {};
++    req.t.hdr.type = toHost ? VGPU_CMD_TRANSFER_TO_HOST_3D : VGPU_CMD_TRANSFER_FROM_HOST_3D;
++    req.t.hdr.ctx_id = mCtxId;
++    req.t.box = {x, y, 0, w, h, 1};
++    req.t.offset = off;
++    req.t.resource_id = mResourceHandle;
++    req.t.stride = mStride;
++    req.len = uint32_t(len);
++    if (toHost) {
++        c->pushIfNoted();
++        return c->simple(&req, sizeof(req), p + off, size_t(len));
++    }
++    // A pipe with nothing to read yet answers AGAIN. Ask again, backing off, without holding
++    // the connection, so other threads keep streaming while this one waits on the host.
++    std::vector<uint8_t> r;
++    for (unsigned backoff = 50;; backoff = std::min(backoff * 2, 2000u)) {
++        r = c->call(&req, sizeof(req));
++        if (r.size() != sizeof(vgpu_hdr) ||
++            reinterpret_cast<vgpu_hdr*>(r.data())->type != SGPU_RESP_AGAIN)
++            break;
++        hwgpu_pause(backoff);
++    }
++    if (r.size() != sizeof(sgpu_resp_data) + len ||
++        reinterpret_cast<sgpu_resp_data*>(r.data())->hdr.type != SGPU_RESP_OK_DATA)
++        return -EIO;
++    memcpy(p + off, r.data() + sizeof(sgpu_resp_data), size_t(len));
++    return 0;
+ }
+ 
+ int WindowsVirtGpuResource::transferToHost(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+-    return 0;  // stub constant
++    return transfer(true, x, y, w, h);
+ }
+ 
+ int WindowsVirtGpuResource::transferFromHost(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+-    return 0;  // stub constant
++    return transfer(false, x, y, w, h);
+ }
+diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
+index 9d8b83b..930deaa 100644
+--- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
++++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
+@@ -3,37 +3,378 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <errno.h>
++#include <string.h>
++
++#include <algorithm>
++
+ #include "WindowsVirtGpu.h"
++#include "hwgpu_ioctl.h"
++#include "hwgpu_ring.h"
++#include "sgpu_proto.h"
++#include "util/log.h"
++
++HwgpuConnection* HwgpuConnection::get() {
++    static std::once_flag once;
++    static HwgpuConnection* conn = nullptr;
++    std::call_once(once, [] {
++        HANDLE dev = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
++                                 OPEN_EXISTING, 0, nullptr);
++        if (dev == INVALID_HANDLE_VALUE) {
++            mesa_loge("hwgpu: no \\\\.\\HwGpu (error %lu); is hwgpu.sys running?", GetLastError());
++            return;
++        }
++        hwgpu_open_out out = {};
++        DWORD got = 0;
++        if (!DeviceIoControl(dev, IOCTL_HWGPU_OPEN, nullptr, 0, &out, sizeof(out), &got, nullptr) ||
++            got != sizeof(out)) {
++            mesa_loge("hwgpu: no GPU channel (error %lu)", GetLastError());
++            CloseHandle(dev);
++            return;
++        }
++        void* chan = reinterpret_cast<void*>(uintptr_t(out.chan));
++        // The phone answers within one pass of its loop; give it a few seconds.
++        for (int i = 0; i < 3000 && !hwgpu_alive(hwgpu_chan_ctl(chan), out.generation); i++) Sleep(1);
++        auto* c = new HwgpuConnection(chan, out.slot, out.generation);
++        if (!hwgpu_alive(hwgpu_chan_ctl(chan), out.generation) || !c->hello()) {
++            mesa_loge("hwgpu: the phone did not answer on channel %u", out.slot);
++            CloseHandle(dev);
++            delete c;
++            return;
++        }
++        mesa_logi("hwgpu: channel %u", out.slot);
++        conn = c;
++    });
++    return conn;
++}
++
++// The one place bytes move. The WDDM variant replaces this with a call into its kernel driver.
++std::vector<uint8_t> HwgpuConnection::callLocked(const void* req, size_t len, const void* tail,
++                                                 size_t tail_len) {
++    if (mBroken) return {};
++    uint32_t n = uint32_t(len + tail_len);
++    std::vector<uint8_t> r;
++    if (hwgpu_write_all(mChan, mGeneration, 1, &n, sizeof(n)) &&
++        hwgpu_write_all(mChan, mGeneration, 1, req, len) &&
++        (!tail_len || hwgpu_write_all(mChan, mGeneration, 1, tail, tail_len)) &&
++        hwgpu_read_all(mChan, mGeneration, 1, &n, sizeof(n)) && n >= sizeof(vgpu_hdr) &&
++        n <= (256u << 20)) {
++        r.resize(n);
++        if (hwgpu_read_all(mChan, mGeneration, 1, r.data(), n)) return r;
++    }
++    // Requests and replies share one stream; after a failure they can no longer be paired.
++    mesa_loge("hwgpu: channel %u lost", mSlot);
++    mBroken = true;
++    return {};
++}
++
++std::vector<uint8_t> HwgpuConnection::call(const void* req, size_t len, const void* tail,
++                                           size_t tail_len) {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    return callLocked(req, len, tail, tail_len);
++}
++
++int HwgpuConnection::simple(const void* req, size_t len, const void* tail, size_t tail_len) {
++    auto r = call(req, len, tail, tail_len);
++    if (r.empty()) return -EIO;
++    uint32_t type = reinterpret_cast<const vgpu_hdr*>(r.data())->type;
++    if (type != VGPU_RESP_OK_NODATA) {
++        mesa_loge("hwgpu: command 0x%x failed with 0x%x",
++                  reinterpret_cast<const vgpu_hdr*>(req)->type, type);
++        return -EIO;
++    }
++    return 0;
++}
++
++uint32_t HwgpuConnection::context(enum VirtGpuCapset capset) {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    if (mContext) return mContext;
++    vgpu_ctx_create cc = {};
++    cc.hdr.type = VGPU_CMD_CTX_CREATE;
++    cc.hdr.ctx_id = HWGPU_CTX(mSlot);
++    cc.context_init = uint32_t(capset == kCapsetNone ? kCapsetGfxStreamVulkan : capset) &
++                      VGPU_CONTEXT_INIT_CAPSET_ID_MASK;
++    char path[MAX_PATH] = {};
++    GetModuleFileNameA(nullptr, path, sizeof(path));
++    const char* name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
++    cc.nlen = uint32_t(std::min(strlen(name), sizeof(cc.debug_name) - 1));
++    memcpy(cc.debug_name, name, cc.nlen);
++    if (simple(&cc, sizeof(cc)) == 0) mContext = HWGPU_CTX(mSlot);
++    return mContext;
++}
++
++uint32_t HwgpuConnection::newResourceId() {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    return HWGPU_RES_BASE(mSlot) + mNextResource++;
++}
++
++bool HwgpuConnection::hello() {
++    sgpu_hello h = {};
++    h.hdr.type = SGPU_CMD_HELLO;
++    h.version = SGPU_VERSION;
++    auto r = call(&h, sizeof(h));
++    if (r.size() < sizeof(sgpu_hello_resp) ||
++        reinterpret_cast<sgpu_hello_resp*>(r.data())->hdr.type != SGPU_RESP_OK_HELLO)
++        return false;
++    uint32_t count = reinterpret_cast<sgpu_hello_resp*>(r.data())->num_capsets;
++    for (uint32_t i = 0; i < count; i++) {
++        vgpu_get_capset_info q = {};
++        q.hdr.type = VGPU_CMD_GET_CAPSET_INFO;
++        q.capset_index = i;
++        auto ri = call(&q, sizeof(q));
++        if (ri.size() < sizeof(vgpu_resp_capset_info)) return false;
++        auto info = *reinterpret_cast<vgpu_resp_capset_info*>(ri.data());
++        if (info.hdr.type != VGPU_RESP_OK_CAPSET_INFO) continue;
++        vgpu_get_capset g = {};
++        g.hdr.type = VGPU_CMD_GET_CAPSET;
++        g.capset_id = info.capset_id;
++        g.capset_version = info.capset_max_version;
++        auto rc = call(&g, sizeof(g));
++        if (rc.size() < sizeof(vgpu_hdr) ||
++            reinterpret_cast<vgpu_hdr*>(rc.data())->type != VGPU_RESP_OK_CAPSET)
++            continue;
++        mCapsets[info.capset_id].assign(rc.begin() + sizeof(vgpu_hdr), rc.end());
++    }
++    return true;
++}
++
++void HwgpuConnection::addMirror(uint32_t resourceId, uint8_t* local, size_t size) {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    mMirrors[resourceId] = Mirror{local, std::vector<uint8_t>(local, local + size)};
++}
++
++void HwgpuConnection::removeMirror(uint32_t resourceId) {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    mMirrors.erase(resourceId);
++}
++
++void HwgpuConnection::sync(bool pull) {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    if (mMirrors.empty()) return;
++
++    vgpu_hdr h = {};
++    h.type = SGPU_CMD_SYNC;
++    // Guest changes since the last sync, as runs of changed pages, at most SGPU_SYNC_CHUNK
++    // bytes per message.
++    std::vector<uint8_t> body;
++    auto push = [&]() {
++        h.flags = 0;
++        auto r = callLocked(&h, sizeof(h), body.data(), body.size());
++        body.clear();
++        return r.size() >= sizeof(vgpu_hdr) &&
++               reinterpret_cast<vgpu_hdr*>(r.data())->type == SGPU_RESP_SYNC;
++    };
++    for (auto& [res, m] : mMirrors) {
++        const size_t size = m.last.size();
++        size_t off = 0;
++        while (off < size) {
++            if (body.size() >= SGPU_SYNC_CHUNK && !push()) {
++                mesa_loge("hwgpu: sync failed");
++                return;
++            }
++            size_t n = std::min<size_t>(SGPU_SYNC_PAGE, size - off);
++            if (!memcmp(m.local + off, m.last.data() + off, n)) {
++                off += n;
++                continue;
++            }
++            size_t start = off;
++            while (off < size && off - start < SGPU_SYNC_CHUNK) {
++                n = std::min<size_t>(SGPU_SYNC_PAGE, size - off);
++                if (!memcmp(m.local + off, m.last.data() + off, n)) break;
++                off += n;
++            }
++            // Copy first, then send the copy, so what the host gets is what we remember.
++            memcpy(m.last.data() + start, m.local + start, off - start);
++            sgpu_sync_entry e = {res, uint32_t(off - start), start};
++            const auto* eb = reinterpret_cast<const uint8_t*>(&e);
++            body.insert(body.end(), eb, eb + sizeof(e));
++            body.insert(body.end(), m.last.data() + start, m.last.data() + off);
++        }
++    }
++    if (!pull) {
++        if (!body.empty() && !push()) mesa_loge("hwgpu: sync failed");
++        return;
++    }
++
++    // The last guest changes go with the first pull. The host answers with its changes since
++    // the last sync, SGPU_SYNC_CHUNK at a time.
++    for (bool more = true; more;) {
++        h.flags = SGPU_SYNC_PULL;
++        auto r = callLocked(&h, sizeof(h), body.data(), body.size());
++        body.clear();
++        if (r.size() < sizeof(vgpu_hdr) ||
++            reinterpret_cast<vgpu_hdr*>(r.data())->type != SGPU_RESP_SYNC) {
++            mesa_loge("hwgpu: sync failed");
++            return;
++        }
++        more = reinterpret_cast<vgpu_hdr*>(r.data())->flags & SGPU_SYNC_MORE;
++        size_t at = sizeof(vgpu_hdr);
++        while (at + sizeof(sgpu_sync_entry) <= r.size()) {
++            sgpu_sync_entry e;
++            memcpy(&e, r.data() + at, sizeof(e));
++            at += sizeof(e);
++            if (at + e.len > r.size()) break;
++            auto it = mMirrors.find(e.resource_id);
++            if (it != mMirrors.end() && e.offset + e.len <= it->second.last.size()) {
++                memcpy(it->second.local + e.offset, r.data() + at, e.len);
++                memcpy(it->second.last.data() + e.offset, r.data() + at, e.len);
++            }
++            at += e.len;
++        }
++    }
++}
++
++void HwgpuConnection::pushIfNoted() {
++    // Under the lock, so no other thread's bytes pass between the check and the push.
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    if (mPush.exchange(false)) sync(false);
++}
++
++void virtGpuGuestMemoryWillBeRead() {
++    if (auto* c = HwgpuConnection::get()) c->notePush();
++}
++
++void virtGpuHostMemoryWasWritten() {
++    if (auto* c = HwgpuConnection::get()) c->sync(true);
++}
+ 
+ WindowsVirtGpuDevice::WindowsVirtGpuDevice(enum VirtGpuCapset capset, int32_t descriptor)
+-    : VirtGpuDevice(capset) {}
++    : VirtGpuDevice(capset) {
++    memset(&mCaps, 0, sizeof(mCaps));
++    auto* c = HwgpuConnection::get();
++    if (!c) return;
+ 
++    mCtxId = c->context(capset);
++    if (!mCtxId) return;
++
++    mCaps.params[kParam3D] = 1;
++    mCaps.params[kParamCapsetFix] = 1;
++    mCaps.params[kParamResourceBlob] = 1;
++    mCaps.params[kParamHostVisible] = 1;
++    mCaps.params[kParamContextInit] = 1;
++    for (auto& [id, bytes] : c->capsets()) {
++        mCaps.params[kParamSupportedCapsetIds] |= 1ull << id;
++        void* dst = nullptr;
++        size_t size = 0;
++        switch (id) {
++            case kCapsetGfxStreamVulkan:
++                dst = &mCaps.vulkanCapset, size = sizeof(mCaps.vulkanCapset);
++                break;
++            case kCapsetGfxStreamGles:
++                dst = &mCaps.glesCapset, size = sizeof(mCaps.glesCapset);
++                break;
++            case kCapsetGfxStreamComposer:
++                dst = &mCaps.composerCapset, size = sizeof(mCaps.composerCapset);
++                break;
++        }
++        if (dst) memcpy(dst, bytes.data(), std::min(size, bytes.size()));
++    }
++    if (!mCaps.vulkanCapset.blobAlignment) mCaps.vulkanCapset.blobAlignment = 4096;
++}
++
++// The process context lives as long as the connection.
+ WindowsVirtGpuDevice::~WindowsVirtGpuDevice() {}
+ 
+ struct VirtGpuCaps WindowsVirtGpuDevice::getCaps(void) { return mCaps; }
+ 
+-int64_t WindowsVirtGpuDevice::getDeviceHandle(void) { return mDeviceHandle; }
++int64_t WindowsVirtGpuDevice::getDeviceHandle(void) { return -1; }
++
++static int attach(uint32_t ctx, uint32_t res) {
++    vgpu_resource_unref a = {};
++    a.hdr.type = VGPU_CMD_CTX_ATTACH_RESOURCE;
++    a.hdr.ctx_id = ctx;
++    a.resource_id = res;
++    return HwgpuConnection::get()->simple(&a, sizeof(a));
++}
+ 
+ VirtGpuResourcePtr WindowsVirtGpuDevice::createResource(uint32_t width, uint32_t height,
+                                                         uint32_t stride, uint32_t size,
+                                                         uint32_t virglFormat, uint32_t target,
+                                                         uint32_t bind) {
+-    return nullptr;  // stub constant
++    auto* c = HwgpuConnection::get();
++    uint32_t res = c->newResourceId();
++    vgpu_resource_create_3d cr = {};
++    cr.hdr.type = VGPU_CMD_RESOURCE_CREATE_3D;
++    cr.hdr.ctx_id = mCtxId;
++    cr.resource_id = res;
++    cr.target = target;
++    cr.format = virglFormat;
++    cr.bind = bind;
++    cr.width = width;
++    cr.height = height;
++    cr.depth = 1;
++    cr.array_size = 1;
++    if (c->simple(&cr, sizeof(cr))) return nullptr;
++
++    // The host allocates the backing. The addresses mean nothing here.
++    struct {
++        vgpu_resource_attach_backing a;
++        vgpu_mem_entry e;
++    } __attribute__((packed)) ab = {};
++    ab.a.hdr.type = VGPU_CMD_RESOURCE_ATTACH_BACKING;
++    ab.a.resource_id = res;
++    ab.a.nr_entries = 1;
++    ab.e.length = size;
++    auto r = std::make_shared<WindowsVirtGpuResource>(mCtxId, res, size, stride, false);
++    if (c->simple(&ab, sizeof(ab)) || attach(mCtxId, res)) return nullptr;
++    return r;
+ }
+ 
+ VirtGpuResourcePtr WindowsVirtGpuDevice::createBlob(const struct VirtGpuCreateBlob& blobCreate) {
+-    return nullptr;  // stub constant
++    auto* c = HwgpuConnection::get();
++    if (blobCreate.blobCmdSize) {
++        VirtGpuExecBuffer exec = {};
++        exec.command = blobCreate.blobCmd;
++        exec.command_size = blobCreate.blobCmdSize;
++        if (execBuffer(exec, nullptr)) return nullptr;
++    }
++    uint32_t res = c->newResourceId();
++    vgpu_resource_create_blob cb = {};
++    cb.hdr.type = VGPU_CMD_RESOURCE_CREATE_BLOB;
++    cb.hdr.ctx_id = mCtxId;
++    cb.resource_id = res;
++    cb.blob_mem = blobCreate.blobMem;
++    cb.blob_flags = blobCreate.flags;
++    cb.blob_id = blobCreate.blobId;
++    cb.size = blobCreate.size;
++    if (c->simple(&cb, sizeof(cb))) return nullptr;
++    auto r = std::make_shared<WindowsVirtGpuResource>(mCtxId, res, blobCreate.size, 0, true);
++    if (attach(mCtxId, res)) return nullptr;
++    return r;
+ }
+ 
+ VirtGpuResourcePtr WindowsVirtGpuDevice::importBlob(const struct VirtGpuExternalHandle& handle) {
+-    return nullptr;  // stub constant
++    mesa_loge("hwgpu: importBlob is not supported");
++    return nullptr;
+ }
+ 
+ int WindowsVirtGpuDevice::execBuffer(struct VirtGpuExecBuffer& execbuffer,
+                                      const VirtGpuResource* blob) {
+-    return 0;  // stub constant
++    auto* c = HwgpuConnection::get();
++    // The host may read mapped memory as soon as it runs these commands.
++    c->pushIfNoted();
++    vgpu_submit_3d s = {};
++    s.hdr.type = VGPU_CMD_SUBMIT_3D;
++    s.hdr.ctx_id = mCtxId;
++    if (execbuffer.flags & kRingIdx) {
++        s.hdr.flags |= VGPU_FLAG_INFO_RING_IDX;
++        s.hdr.ring_idx = uint8_t(execbuffer.ring_idx);
++    }
++    s.size = execbuffer.command_size;
++    int ret = c->simple(&s, sizeof(s), execbuffer.command, execbuffer.command_size);
++    if (execbuffer.flags & kFenceOut) {
++        // No sync handles yet. Commands complete in order.
++        execbuffer.handle.osHandle = -1;
++        execbuffer.handle.type = kFenceHandleSyncFd;
++    }
++    return ret;
+ }
+ 
+ VirtGpuDevice* osCreateVirtGpuDevice(enum VirtGpuCapset capset, int32_t descriptor) {
+-    return nullptr;  // stub constant
++    auto* d = new WindowsVirtGpuDevice(capset, descriptor);
++    if (!d->valid()) {
++        delete d;
++        return nullptr;
++    }
++    return d;
+ }
+diff --git a/src/gfxstream/guest/platform/windows/meson.build b/src/gfxstream/guest/platform/windows/meson.build
+index 1f83396..e6d47d2 100644
+--- a/src/gfxstream/guest/platform/windows/meson.build
++++ b/src/gfxstream/guest/platform/windows/meson.build
+@@ -12,5 +12,5 @@ libplatform_virtgpu_windows = static_library(
+     'platform_virtgpu_windows',
+     files_libplatform_virtgpu_windows,
+     cpp_args: gfxstream_guest_args,
+-    include_directories: [inc_platform_virtgpu, inc_src, inc_include],
++    include_directories: [inc_platform_virtgpu, inc_src, inc_include, include_directories('hwgpu')],
+ )
+diff --git a/src/gfxstream/guest/vulkan/meson.build b/src/gfxstream/guest/vulkan/meson.build
+index 8113832..aef3ef6 100644
+--- a/src/gfxstream/guest/vulkan/meson.build
++++ b/src/gfxstream/guest/vulkan/meson.build
+@@ -48,6 +48,12 @@ if host_machine.system() == 'darwin'
+   gfxstream_vk_link_args += '-Wl,-undefined,dynamic_lookup'
+ endif
+ 
++# PE has no deferred lookup either. vk_util.c names the SPIR-V specialization helpers.
++gfxstream_vk_extra_deps = []
++if host_machine.system() == 'windows'
++  gfxstream_vk_extra_deps += idep_vtn
++endif
++
+ lib_vulkan_gfxstream = shared_library(
+     'vulkan_gfxstream',
+     files_vulkan_gfxstream,
+@@ -70,7 +76,7 @@ lib_vulkan_gfxstream = shared_library(
+     ],
+     link_args: [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections] + gfxstream_vk_link_args,
+     link_depends: vulkan_icd_link_depends,
+-    dependencies: gfxstream_deps,
++    dependencies: gfxstream_deps + gfxstream_vk_extra_deps,
+     install: true,
+ )
+ 
+diff --git a/src/gfxstream/guest/vulkan/stubs/GfxStreamRenderControl.cpp b/src/gfxstream/guest/vulkan/stubs/GfxStreamRenderControl.cpp
+index 704e0f3..4b5b991 100644
+--- a/src/gfxstream/guest/vulkan/stubs/GfxStreamRenderControl.cpp
++++ b/src/gfxstream/guest/vulkan/stubs/GfxStreamRenderControl.cpp
+@@ -8,6 +8,11 @@
+ #include <cerrno>
+ 
+ GfxStreamTransportType renderControlGetTransport() {
++#ifdef _WIN32
++    // The HyperWin ring keeps guest copies of mapped memory, so an address-space ring in mapped
++    // memory would never be seen by the phone between syncs. Stream through a pipe resource.
++    return GFXSTREAM_TRANSPORT_VIRTIO_GPU_PIPE;
++#endif
+     return GFXSTREAM_TRANSPORT_VIRTIO_GPU_ADDRESS_SPACE;
+ }
+ 
+diff --git a/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp b/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp
+index 9820279..c241964 100644
+--- a/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp
++++ b/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp
+@@ -34,6 +34,9 @@ CoherentMemory::CoherentMemory(GoldfishAddressSpaceBlockPtr block, uint64_t gpuA
+ #endif  // DETECT_OS_ANDROID
+ 
+ CoherentMemory::~CoherentMemory() {
++    // Let go of the blob mapping before the host frees the memory behind it. A transport that
++    // copies mapped memory (sgpu) would otherwise read the freed host pages.
++    mBlobMapping = nullptr;
+     ResourceTracker::getThreadLocalEncoder()->vkFreeMemorySyncGOOGLE(mDevice, mMemory, nullptr,
+                                                                      false);
+     util_vma_heap_finish(&mHeap);
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index f680ba5..6e23928 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -13,6 +13,7 @@
+ #include <optional>
+ #include <set>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "CommandBufferStagingStream.h"
+ #include "GfxStreamConnectionManager.h"
+diff --git a/src/gfxstream/guest/vulkan_enc/autogenerated/func_table.cpp b/src/gfxstream/guest/vulkan_enc/autogenerated/func_table.cpp
+index 5972142..2cdbbfa 100644
+--- a/src/gfxstream/guest/vulkan_enc/autogenerated/func_table.cpp
++++ b/src/gfxstream/guest/vulkan_enc/autogenerated/func_table.cpp
+@@ -31,6 +31,7 @@
+ #include <cstring>
+ 
+ #include "ResourceTracker.h"
++#include "VirtGpu.h"
+ #include "VkEncoder.h"
+ #include "gfxstream_vk_entrypoints.h"
+ #include "gfxstream_vk_private.h"
+@@ -99,6 +100,7 @@ VkResult gfxstream_vk_EnumerateDeviceLayerProperties(VkPhysicalDevice physicalDe
+ }
+ VkResult gfxstream_vk_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
+                                   VkFence fence) {
++    virtGpuGuestMemoryWillBeRead();
+     MESA_TRACE_SCOPE("vkQueueSubmit");
+     VkResult vkQueueSubmit_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getQueueEncoder(queue);
+@@ -127,6 +129,7 @@ VkResult gfxstream_vk_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkS
+     return vkQueueSubmit_VkResult_return;
+ }
+ VkResult gfxstream_vk_QueueWaitIdle(VkQueue queue) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkQueueWaitIdle");
+     VkResult vkQueueWaitIdle_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getQueueEncoder(queue);
+@@ -135,6 +138,7 @@ VkResult gfxstream_vk_QueueWaitIdle(VkQueue queue) {
+     return vkQueueWaitIdle_VkResult_return;
+ }
+ VkResult gfxstream_vk_DeviceWaitIdle(VkDevice device) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkDeviceWaitIdle");
+     VkResult vkDeviceWaitIdle_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -308,6 +312,7 @@ VkResult gfxstream_vk_ResetFences(VkDevice device, uint32_t fenceCount, const Vk
+     return vkResetFences_VkResult_return;
+ }
+ VkResult gfxstream_vk_GetFenceStatus(VkDevice device, VkFence fence) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkGetFenceStatus");
+     VkResult vkGetFenceStatus_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -318,6 +323,7 @@ VkResult gfxstream_vk_GetFenceStatus(VkDevice device, VkFence fence) {
+ }
+ VkResult gfxstream_vk_WaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences,
+                                     VkBool32 waitAll, uint64_t timeout) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkWaitForFences");
+     VkResult vkWaitForFences_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -612,6 +618,7 @@ void gfxstream_vk_DestroyEvent(VkDevice device, VkEvent event,
+     vkEnc->vkDestroyEvent(device, event, pAllocator, true /* do lock */);
+ }
+ VkResult gfxstream_vk_GetEventStatus(VkDevice device, VkEvent event) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkGetEventStatus");
+     VkResult vkGetEventStatus_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -1360,6 +1367,7 @@ void gfxstream_vk_ResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_
+ }
+ VkResult gfxstream_vk_GetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore,
+                                                uint64_t* pValue) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkGetSemaphoreCounterValue");
+     VkResult vkGetSemaphoreCounterValue_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -1369,6 +1377,7 @@ VkResult gfxstream_vk_GetSemaphoreCounterValue(VkDevice device, VkSemaphore sema
+ }
+ VkResult gfxstream_vk_WaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo,
+                                      uint64_t timeout) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkWaitSemaphores");
+     VkResult vkWaitSemaphores_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -1540,6 +1549,7 @@ void gfxstream_vk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineSt
+ }
+ VkResult gfxstream_vk_QueueSubmit2(VkQueue queue, uint32_t submitCount,
+                                    const VkSubmitInfo2* pSubmits, VkFence fence) {
++    virtGpuGuestMemoryWillBeRead();
+     MESA_TRACE_SCOPE("vkQueueSubmit2");
+     VkResult vkQueueSubmit2_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getQueueEncoder(queue);
+@@ -2328,6 +2338,7 @@ void gfxstream_vk_CmdDrawIndexedIndirectCountKHR(VkCommandBuffer commandBuffer,
+ #ifdef VK_KHR_timeline_semaphore
+ VkResult gfxstream_vk_GetSemaphoreCounterValueKHR(VkDevice device, VkSemaphore semaphore,
+                                                   uint64_t* pValue) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkGetSemaphoreCounterValueKHR");
+     VkResult vkGetSemaphoreCounterValueKHR_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -2337,6 +2348,7 @@ VkResult gfxstream_vk_GetSemaphoreCounterValueKHR(VkDevice device, VkSemaphore s
+ }
+ VkResult gfxstream_vk_WaitSemaphoresKHR(VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo,
+                                         uint64_t timeout) {
++    VirtGpuHostWroteScope hostWrote;
+     MESA_TRACE_SCOPE("vkWaitSemaphoresKHR");
+     VkResult vkWaitSemaphoresKHR_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getThreadLocalEncoder();
+@@ -2502,6 +2514,7 @@ void gfxstream_vk_CmdWriteTimestamp2KHR(VkCommandBuffer commandBuffer, VkPipelin
+ }
+ VkResult gfxstream_vk_QueueSubmit2KHR(VkQueue queue, uint32_t submitCount,
+                                       const VkSubmitInfo2* pSubmits, VkFence fence) {
++    virtGpuGuestMemoryWillBeRead();
+     MESA_TRACE_SCOPE("vkQueueSubmit2KHR");
+     VkResult vkQueueSubmit2KHR_VkResult_return = (VkResult)0;
+     auto vkEnc = gfxstream::vk::ResourceTracker::getQueueEncoder(queue);
