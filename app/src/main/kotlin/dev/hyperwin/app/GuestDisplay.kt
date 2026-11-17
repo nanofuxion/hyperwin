@@ -125,7 +125,8 @@ class GuestDisplay(
                 if (WindowBridge.nativePresent(sharedWindow.buffer) == 1 && ++draws == 2) onLive()
                 // One pass per screen refresh of the phone, less the time the pass took.
                 nextFrame = maxOf(nextFrame + (1_000_000_000L / refreshHz).toLong(), System.nanoTime() + 1_000_000L)
-                val wait = nextFrame - System.nanoTime()
+                // Never negative: a late pass (the phone was busy) would make Thread.sleep throw.
+                val wait = (nextFrame - System.nanoTime()).coerceAtLeast(0L)
                 Thread.sleep(wait / 1_000_000L, (wait % 1_000_000L).toInt())
             }
         } catch (_: InterruptedException) {

@@ -78,6 +78,16 @@
  * (irqs << 8 | routes, or a negative stage), [2] hwpci stage, [3] hwpci children found. */
 #define HW_DIAG 0xA00000u
 
+/* Processor performance registers for the processor SSDT (guest/efi/cpu_acpi.c). Windows only
+ * takes them through a PCC mailbox, which this page is: signature u32, command u16, status u16,
+ * then the registers. The doorbell is the status word itself, so ringing it completes the
+ * command at once and nobody has to answer. In the register space: the reference counter (u64,
+ * the host advances it) at +0, its copy the delivered counter at +8, then per CPU n desired
+ * performance at +16 + 16n and performance-limited flags at +24 + 16n. */
+#define HW_CPPC 0xB00000u
+#define HW_CPPC_REGS (HW_CPPC + 8u)
+#define HW_CPPC_MAX_CPUS 64u
+
 #define HW_GUEST_FOUND 1u
 #define HW_GUEST_FRAME 2u
 #define HW_GUEST_TPM   4u

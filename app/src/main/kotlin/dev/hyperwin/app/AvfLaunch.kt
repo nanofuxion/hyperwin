@@ -207,6 +207,7 @@ object AvfLaunch {
             sharedWindow?.close()
             sharedWindow = window
                 startDebugTap(window, File(dir, "frame.bgra"))
+            startCppcCounter(window)
             val report = boot(
                 ctx,
                 GuestBoot.setupImage(firmware, listOf(machine.disk)),
@@ -247,6 +248,7 @@ object AvfLaunch {
         sharedWindow?.close()
         sharedWindow = window
         startDebugTap(window, File(dir, "frame.bgra"))
+            startCppcCounter(window)
         val report = boot(
             ctx,
             GuestBoot.setupImage(firmware, listOf(esp, media)),
@@ -288,6 +290,22 @@ object AvfLaunch {
             val cause = generateSequence(e) { it.cause }.last()
             fail("Could not stop the VM: ${cause.message ?: cause.javaClass.simpleName}")
         }
+    }
+
+    /**
+     * The processor SSDT's reference and delivered performance counters (include/hw_abi.h HW_CPPC)
+     * both read one value in the window. Windows checks that they run, so it advances in step with
+     * time; equal counters tell Windows the processor runs at its rated speed.
+     */
+    private fun startCppcCounter(window: AvfPlan.SharedWindow) {
+        Thread({
+            val b = window.buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+            while (sharedWindow === window) {
+                val now = System.nanoTime() / 1000
+                runCatching { b.putLong(0xB00008, now); b.putLong(0xB00010, now) }   // HW_CPPC_REGS +0, +8
+                Thread.sleep(5)                     // Windows samples them every few tens of ms
+            }
+        }, "hw-cppc").apply { isDaemon = true }.start()
     }
 
     /** Guest debug channel: the guest writes a PC ring at window offset 0x7f00000; log it when it changes. */

@@ -16,7 +16,10 @@ $LINK -subsystem:efi_boot_service_driver -entry:StandaloneCompatEntry -out:"$out
 # Loader (first boot file) and display driver. qemu_ring.c stands in for the parts COMPAT.EFI carries.
 $CC -c guest/efi/setup_boot.c -o "$out/setup_boot.obj"
 $CC -c guest/efi/pci_acpi.c -o "$out/pci_acpi.obj"
-$LINK -subsystem:efi_application -entry:SetupBootEntry -out:"$out/BOOTAA64.EFI" "$out/setup_boot.obj" "$out/pci_acpi.obj"
+iasl -p "$out/osc_ssdt" guest/efi/osc_ssdt.asl >/dev/null
+python3 tools/efi/embed_aml.py "$out/osc_ssdt.h" HyperwinOscSsdt="$out/osc_ssdt.aml"
+$CC -c guest/efi/cpu_acpi.c -o "$out/cpu_acpi.obj"
+$LINK -subsystem:efi_application -entry:SetupBootEntry -out:"$out/BOOTAA64.EFI" "$out/setup_boot.obj" "$out/pci_acpi.obj" "$out/cpu_acpi.obj"
 $CC -c guest/efi/gop_driver.c -o "$out/gop.obj"
 $CC -c guest/efi/qemu_ring.c -o "$out/qemu_ring.obj"
 $LINK -subsystem:efi_boot_service_driver -entry:GopDriverEntry -out:"$out/GOP.EFI" "$out/gop.obj" "$out/qemu_ring.obj"

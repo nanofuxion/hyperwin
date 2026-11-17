@@ -102,6 +102,7 @@ static uint64_t start_on_device(void *bs, void *parent, void *handle, const uint
 }
 
 extern int64_t HyperwinInstallPciSsdt(void *system);
+extern int64_t HyperwinInstallCpuSsdt(void *system);
 
 uint64_t SetupBootEntry(void *image, void *system)
 {
@@ -155,6 +156,7 @@ uint64_t SetupBootEntry(void *image, void *system)
     {
         volatile uint32_t *diag = (volatile uint32_t *)(HW_WINDOW_PA + HW_DIAG);
         diag[1] = (uint32_t)HyperwinInstallPciSsdt(system);
+        diag[127] = (uint32_t)HyperwinInstallCpuSsdt(system);   /* processors described, or < 0 */
     }
     /* A prepared machine disk carries Windows on this same disk. */
     {
