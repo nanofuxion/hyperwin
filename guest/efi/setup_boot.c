@@ -102,6 +102,8 @@ static uint64_t start_on_device(void *bs, void *parent, void *handle, const uint
     return bs_fn(bs, 23)((uint64_t)loaded, 0, 0, 0, 0, 0);
 }
 
+extern int64_t HyperwinInstallPciSsdt(void *system);
+
 uint64_t SetupBootEntry(void *image, void *system)
 {
     static const uint8_t li_guid[16] = {
@@ -120,6 +122,10 @@ uint64_t SetupBootEntry(void *image, void *system)
     };
     static const uint16_t noprompt_path[] = {
         '\\','E','F','I','\\','B','O','O','T','\\','C','D','B','O','O','T','N','P','.','E','F','I',0
+    };
+    static const uint16_t bootmgfw_path[] = {
+        '\\','E','F','I','\\','M','i','c','r','o','s','o','f','t','\\','B','o','o','t','\\',
+        'b','o','o','t','m','g','f','w','.','e','f','i',0
     };
     static const uint16_t win_path[] = {
         '\\','E','F','I','\\','B','O','O','T','\\','B','O','O','T','A','A','6','4','.','E','F','I',0
@@ -148,7 +154,19 @@ uint64_t SetupBootEntry(void *image, void *system)
     start_path(bs, image, ours, gop_path);
     status = start_path(bs, image, ours, compat_path);
     if (status) return status;
+    {
+        volatile uint32_t *diag = (volatile uint32_t *)(HW_WINDOW_PA + HW_DIAG);
+        diag[1] = (uint32_t)HyperwinInstallPciSsdt(system);
+    }
     if (has_window) paint(0xffc0a020u);
+    /* A prepared machine disk carries Windows on this same disk. */
+    {
+        void *probe = 0;
+        if (!proto_fn(ours, 0)((uint64_t)ours, (uint64_t)&probe, (uint64_t)bootmgfw_path, 1, 0, 0) && probe) {
+            proto_fn(probe, 1)((uint64_t)probe, 0, 0, 0, 0, 0);
+            if (!start_on_device(bs, image, device, bootmgfw_path)) return 0;
+        }
+    }
     status = bs_fn(bs, 36)(2, (uint64_t)fs_guid, 0, (uint64_t)&count, (uint64_t)&handles, 0);
     if (status || !handles) return status;
     for (i = 0; i < count; i++) {

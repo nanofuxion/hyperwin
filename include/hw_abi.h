@@ -27,6 +27,8 @@
 /* Guest listens. The app opens it with VirtualMachine.connectVsock. */
 #define HW_VSOCK_PORT 5601
 #define HW_VSOCK_PORT_FILES 5602
+/* Guest listens; the app connects and sends framed HID input reports (length byte, report). */
+#define HW_VSOCK_PORT_INPUT 5650
 #define HW_VSOCK_CID_HOST 2
 
 /* File mailbox. The guest asks; the host reads its own files and writes the answer.
@@ -37,6 +39,10 @@
 #define HW_FILE_RESP (32u * 1024u)
 #define HW_FILE_STAT 1u
 #define HW_FILE_READ 2u
+
+/* Guest diagnostics, read by the host debug tap. [0] magic, [1] loader PCI SSDT result
+ * (irqs << 8 | routes, or a negative stage), [2] hwpci stage, [3] hwpci children found. */
+#define HW_DIAG 0xA00000u
 
 #define HW_GUEST_FOUND 1u
 #define HW_GUEST_FRAME 2u

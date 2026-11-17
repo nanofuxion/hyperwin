@@ -18,11 +18,6 @@ object AvfLaunch {
     private const val PKG = "android.system.virtualmachine."
     private const val NAME = "hyperwin"
     private val keyboardLock = Any()
-    private val letterEvdevCodes = intArrayOf(
-        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50,
-        49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44,
-    )
-    private val digitEvdevCodes = intArrayOf(11, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 
     enum class TextSendFailure { GUEST_UNAVAILABLE, UNSUPPORTED_CHARACTER, INPUT_REJECTED }
     data class TextSendResult(
@@ -55,17 +50,10 @@ object AvfLaunch {
     @Volatile var sharedWindow: AvfPlan.SharedWindow? = null
         private set
 
-    fun touch(event: android.view.MotionEvent): Boolean = send("sendMultiTouchEvent", event)
-
-    fun mouse(event: android.view.MotionEvent): Boolean = send("sendMouseEvent", event)
-
+    /** AVF drops useKeyboard/useMouse, so input goes to the guest's hwvsinput.sys over vsock. */
     fun key(event: KeyEvent): Boolean = synchronized(keyboardLock) {
-        val vm = machine ?: return false
-        val guestEvent = event.withGuestScanCode() ?: return false
-        runCatching {
-            // AVF accepts the Android KeyEvent and reads its Linux scan code.
-            vm.javaClass.getMethod("sendKeyEvent", KeyEvent::class.java).invoke(vm, guestEvent) as Boolean
-        }.getOrDefault(false)
+        if (machine == null) return false
+        VsockInput.key(event)
     }
 
     /** Sends basic Android IME text as guest key presses for touch-only phones. */
@@ -166,93 +154,52 @@ object AvfLaunch {
         }
     }
 
-    /** Software and some virtual keyboards report scanCode=0; provide their evdev equivalent. */
-    private fun KeyEvent.withGuestScanCode(): KeyEvent? {
-        if (scanCode != 0) return this
-        val code = evdevCode(keyCode) ?: return null
-        return KeyEvent(
-            downTime, eventTime, action, keyCode, repeatCount, metaState,
-            deviceId, code, flags, source,
-        )
-    }
-
-    private fun evdevCode(keyCode: Int): Int? {
-        if (keyCode in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z) {
-            return letterEvdevCodes[keyCode - KeyEvent.KEYCODE_A]
-        }
-        if (keyCode in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) {
-            return digitEvdevCodes[keyCode - KeyEvent.KEYCODE_0]
-        }
-        if (keyCode in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F10) {
-            return 59 + keyCode - KeyEvent.KEYCODE_F1
-        }
-        return when (keyCode) {
-            KeyEvent.KEYCODE_ESCAPE -> 1
-            KeyEvent.KEYCODE_MINUS -> 12
-            KeyEvent.KEYCODE_EQUALS -> 13
-            KeyEvent.KEYCODE_DEL -> 14
-            KeyEvent.KEYCODE_TAB -> 15
-            KeyEvent.KEYCODE_LEFT_BRACKET -> 26
-            KeyEvent.KEYCODE_RIGHT_BRACKET -> 27
-            KeyEvent.KEYCODE_ENTER -> 28
-            KeyEvent.KEYCODE_CTRL_LEFT -> 29
-            KeyEvent.KEYCODE_SEMICOLON -> 39
-            KeyEvent.KEYCODE_APOSTROPHE -> 40
-            KeyEvent.KEYCODE_GRAVE -> 41
-            KeyEvent.KEYCODE_SHIFT_LEFT -> 42
-            KeyEvent.KEYCODE_BACKSLASH -> 43
-            KeyEvent.KEYCODE_COMMA -> 51
-            KeyEvent.KEYCODE_PERIOD -> 52
-            KeyEvent.KEYCODE_SLASH -> 53
-            KeyEvent.KEYCODE_SHIFT_RIGHT -> 54
-            KeyEvent.KEYCODE_ALT_LEFT -> 56
-            KeyEvent.KEYCODE_SPACE -> 57
-            KeyEvent.KEYCODE_CAPS_LOCK -> 58
-            KeyEvent.KEYCODE_F11 -> 87
-            KeyEvent.KEYCODE_F12 -> 88
-            KeyEvent.KEYCODE_NUMPAD_ENTER -> 96
-            KeyEvent.KEYCODE_CTRL_RIGHT -> 97
-            KeyEvent.KEYCODE_ALT_RIGHT -> 100
-            KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_HOME -> 102
-            KeyEvent.KEYCODE_DPAD_UP -> 103
-            KeyEvent.KEYCODE_PAGE_UP -> 104
-            KeyEvent.KEYCODE_DPAD_LEFT -> 105
-            KeyEvent.KEYCODE_DPAD_RIGHT -> 106
-            KeyEvent.KEYCODE_MOVE_END -> 107
-            KeyEvent.KEYCODE_DPAD_DOWN -> 108
-            KeyEvent.KEYCODE_PAGE_DOWN -> 109
-            KeyEvent.KEYCODE_INSERT -> 110
-            KeyEvent.KEYCODE_FORWARD_DEL -> 111
-            KeyEvent.KEYCODE_META_LEFT -> 125
-            KeyEvent.KEYCODE_META_RIGHT -> 126
-            KeyEvent.KEYCODE_MENU -> 127
-            else -> null
-        }
-    }
-
     private data class GuestStroke(val keyCode: Int, val shift: Boolean = false)
-
-    private fun send(method: String, event: android.view.MotionEvent): Boolean {
-        val vm = machine ?: return false
-        return runCatching {
-            vm.javaClass.getMethod(method, android.view.MotionEvent::class.java).invoke(vm, event) as Boolean
-        }.getOrDefault(false)
-    }
 
     /** edk2-gunyah, the setup ESP, and the tiny11 ISO. Same shape as the QEMU boot that reached Windows Setup. */
     fun bootWindows(
         ctx: Context,
         onVmStarted: () -> Unit = {},
         onVmStopped: () -> Unit = {},
+        machine: Machine? = Machine.active(ctx),
         onConsole: (String) -> Unit,
     ): String {
         val dir = File(ctx.filesDir, "win").apply { mkdirs() }
         val firmware = File(dir, "edk2-gunyah.fd")
+        copyAsset(ctx, "edk2-gunyah.fd", firmware)
+        if (machine != null && machine.prepared) {
+            val window = AvfPlan.createWindow(ByteArray(0))
+            sharedWindow?.close()
+            sharedWindow = window
+                startDebugTap(window, File(dir, "frame.bgra"))
+            val report = boot(
+                ctx,
+                GuestBoot.setupImage(firmware, listOf(machine.disk)),
+                keep = true,
+                memoryMb = machine.memoryMb + AvfPlan.WINDOW_SIZE_MIB,
+                cpus = machine.cpuCount,
+                expect = "HYPERWIN GOP",
+                sharedWindow = window,
+                onVmStarted = onVmStarted,
+                onVmStopped = onVmStopped,
+                onConsole = onConsole,
+            )
+            if (!report.startsWith("VM running;")) {
+                sharedWindow = null
+                window.close()
+            }
+            return report
+        }
         val esp = File(dir, "setup-esp.img")
         val iso = File(dir, "tiny11.iso")
-        copyAsset(ctx, "edk2-gunyah.fd", firmware)
         copyAsset(ctx, "setup-esp.img", esp)
-        if (!iso.isFile || iso.length() == 0L) {
+        /* Driver bring-up only: a Windows PE disk staged by adb replaces the ISO. */
+        val peStaged = File("/data/local/tmp/hyperwin/pe.img")
+        val pe = File(dir, "pe.img")
+        if (!peStaged.isFile) pe.delete()
+        else if (peStaged.length() != pe.length() || peStaged.lastModified() > pe.lastModified()) peStaged.copyTo(pe, overwrite = true)
+        val media = if (pe.isFile) pe else iso
+        if (media === iso && (!iso.isFile || iso.length() == 0L)) {
             val staged = File("/data/local/tmp/tiny11-noprompt.iso")
             if (!staged.isFile) {
                 return fail("Windows ISO is not staged at ${staged.absolutePath}")
@@ -260,14 +207,14 @@ object AvfLaunch {
             staged.copyTo(iso, overwrite = true)
         }
         GuestBoot.requireAligned(esp)
-        GuestBoot.requireAligned(iso)
+        GuestBoot.requireAligned(media)
         val window = AvfPlan.createWindow(ByteArray(0))
         sharedWindow?.close()
         sharedWindow = window
         startDebugTap(window, File(dir, "frame.bgra"))
         val report = boot(
             ctx,
-            GuestBoot.setupImage(firmware, listOf(esp, iso)),
+            GuestBoot.setupImage(firmware, listOf(esp, media)),
             keep = true,
             memoryMb = AvfPlan.WINDOWS_VM_MEMORY_MIB,
             expect = "HYPERWIN GOP",
@@ -294,6 +241,7 @@ object AvfLaunch {
         return try {
             vm.javaClass.getMethod("stop").invoke(vm)
             machine = null
+            VsockInput.stop()
             runCatching { onVmStopped() }
             sharedWindow?.let { window ->
                 sharedWindow = null
@@ -314,6 +262,7 @@ object AvfLaunch {
             var lastCount = -1L
             var lastMarks = ""
             var lastWindow = ""
+            var lastDiag = ""
             while (sharedWindow === window) {
                 runCatching {
                     val magic = ByteArray(8).also { for (i in 0 until 8) it[i] = b.get(i) }.decodeToString()
@@ -329,6 +278,8 @@ object AvfLaunch {
                     val marks = StringBuilder()
                     for (i in 0 until 20) marks.append(java.lang.Long.toHexString(b.getLong(base + 0x100 + 8 * i))).append(' ')
                     if (marks.toString() != lastMarks) { lastMarks = marks.toString(); Log.i("HyperWinDbg", "marks " + lastMarks) }
+                    val diag = "diag " + (0 until 128).joinToString(" ") { Integer.toHexString(b.getInt(0xA00000 + 4 * it)) }
+                    if (diag != lastDiag) { lastDiag = diag; Log.i("HyperWinDbg", diag) }
                     if (b.getLong(base) == 0x1111222233334444L && lastCount != 1L) {
                         lastCount = 1L
                         fun h(o: Int) = java.lang.Long.toHexString(b.getLong(base + o))
@@ -357,6 +308,7 @@ object AvfLaunch {
         custom: Any,
         keep: Boolean,
         memoryMb: Int,
+        cpus: Int = 1,
         expect: String,
         sharedWindow: AvfPlan.SharedWindow? = null,
         onVmStarted: () -> Unit = {},
@@ -371,6 +323,7 @@ object AvfLaunch {
             val cfg = cfgClass.getConstructor(Context::class.java).newInstance(ctx)
             cfgClass.getMethod("setCustomImageConfig", custom.javaClass).invoke(cfg, custom)
             cfgClass.getMethod("setMemoryBytes", Long::class.javaPrimitiveType).invoke(cfg, memoryMb.toLong() shl 20)
+            if (cpus > 1) cfgClass.getMethod("setCpuTopology", Int::class.javaPrimitiveType).invoke(cfg, 1)
             cfgClass.getMethod("setDebugLevel", Int::class.javaPrimitiveType).invoke(cfg, 1)
             cfgClass.getMethod("setProtectedVm", Boolean::class.javaPrimitiveType).invoke(cfg, false)
             cfgClass.getMethod("setVmOutputCaptured", Boolean::class.javaPrimitiveType).invoke(cfg, true)
@@ -443,6 +396,7 @@ object AvfLaunch {
                 runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, NAME) }
             } else {
                 machine = vm
+                VsockInput.start(vm)
             }
             val result = done.get()?.let { "$it\n$tail" }
                 ?: if (keep) "VM running; Windows desktop not yet verified\n$tail"
@@ -464,6 +418,7 @@ object AvfLaunch {
 
     private fun handleVmStopped(window: AvfPlan.SharedWindow?, onVmStopped: () -> Unit) {
         machine = null
+        VsockInput.stop()
         runCatching { onVmStopped() }
         if (window != null && sharedWindow === window) {
             sharedWindow = null

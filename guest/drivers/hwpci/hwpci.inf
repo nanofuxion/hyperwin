@@ -1,0 +1,45 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Mfg%
+DriverVer=11/16/2026,1.0.0.0
+CatalogFile=hwpci.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[SourceDisksNames]
+1=%Disk%
+
+[SourceDisksFiles]
+hwpci.sys=1
+
+[Manufacturer]
+%Mfg%=HyperWin,NTarm64
+
+[HyperWin.NTarm64]
+%Desc%=hwpci_inst,ACPI\HWPC0001
+
+[hwpci_inst.NT]
+CopyFiles=hwpci_copy
+
+[hwpci_copy]
+hwpci.sys
+
+[hwpci_inst.NT.Services]
+AddService=hwpci,0x00000002,hwpci_service
+
+[hwpci_service]
+DisplayName=%Desc%
+ServiceType=1
+StartType=0
+ErrorControl=1
+LoadOrderGroup="Boot Bus Extender"
+ServiceBinary=%12%\hwpci.sys
+
+[Strings]
+Mfg="HyperWin"
+Disk="HyperWin driver disk"
+Desc="HyperWin PCI CAM bus"
