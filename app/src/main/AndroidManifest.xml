@@ -22,5 +22,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- The GPU renderer and its Vulkan driver, apart from the VM's owner (HwGpu.kt). -->
+        <service android:name=".GpuService" android:process=":gpu" android:exported="false" />
     </application>
 </manifest>

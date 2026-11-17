@@ -206,14 +206,14 @@ object AvfLaunch {
             val window = AvfPlan.createWindow(ByteArray(0), width, height)
             sharedWindow?.close()
             sharedWindow = window
-            HwGpu.start(window, width, height)
+            HwGpu.start(ctx, window, width, height)
             startDebugTap(window, File(dir, "frame.bgra"))
             startCppcCounter(window)
             val report = boot(
                 ctx,
                 GuestBoot.setupImage(firmware, listOf(machine.disk)),
                 keep = true,
-                memoryMb = machine.memoryMb + AvfPlan.WINDOW_SIZE_MIB,
+                memoryMb = machine.memoryMb + AvfPlan.SHARED_MIB,
                 cpus = machine.cpuCount,
                 expect = "HYPERWIN GOP",
                 sharedWindow = window,
@@ -248,7 +248,7 @@ object AvfLaunch {
         val window = AvfPlan.createWindow(ByteArray(0))
         sharedWindow?.close()
         sharedWindow = window
-        HwGpu.start(window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
+        HwGpu.start(ctx, window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
         startDebugTap(window, File(dir, "frame.bgra"))
         startCppcCounter(window)
         val report = boot(

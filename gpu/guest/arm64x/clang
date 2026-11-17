@@ -1,0 +1,9 @@
+#!/bin/sh
+# Compiler for ARM64X DLLs: -marm64x builds each file as ARM64 and as ARM64EC and links one hybrid
+# image, which both ARM64 processes and x64 processes under emulation load. Clang refuses the flag
+# when only preprocessing, so it is left off then. clang++ is a link to this script.
+T=$(cd "$(dirname "$0")/../../../build/third_party/win/llvm-mingw/bin" && pwd)
+cc=$T/arm64ec-w64-mingw32-clang
+case $0 in *++) cc=$cc++ ;; esac
+for a; do case $a in -E|-M|-MM) exec "$cc" "$@" ;; esac; done
+exec "$cc" -marm64x "$@"

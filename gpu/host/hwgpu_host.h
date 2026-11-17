@@ -13,8 +13,9 @@ extern "C" {
 // Lays out the rings in the window, starts gfxstream once per process and a thread that serves
 // every channel. renderer_flags are STREAM_RENDERER_FLAGS_* bits. Returns 0 or a negative errno.
 // Call after hw_window_init and before the guest boots.
-int hwgpu_host_start(void* window, size_t window_bytes, uint32_t renderer_flags, uint32_t width,
-                     uint32_t height);
+// heap: the shared GPU heap (HW_HEAP_PA in the guest), or null to keep mapped memory in step by copying.
+int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_bytes, uint32_t renderer_flags,
+                     uint32_t width, uint32_t height);
 // Stops the thread and frees what every guest process made. The renderer stays up.
 void hwgpu_host_stop(void);
 

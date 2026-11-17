@@ -34,8 +34,6 @@ android {
                 "**/ring_test",
                 "**/bctest",
                 "**/scaledtest",
-                "**/libvulkan_*.so",
-                "**/libbcn_layer.so",
             )
         }
     }

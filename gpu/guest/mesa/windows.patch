@@ -1,7 +1,16 @@
 diff --git a/src/gfxstream/aemu/ring_buffer.cpp b/src/gfxstream/aemu/ring_buffer.cpp
-index 576bc5a..665a93c 100644
+index 576bc5a..7a71e07 100644
 --- a/src/gfxstream/aemu/ring_buffer.cpp
 +++ b/src/gfxstream/aemu/ring_buffer.cpp
+@@ -12,7 +12,7 @@
+ #include <sys/time.h>
+ #endif
+ 
+-#ifdef __x86_64__
++#if defined(__x86_64__) && !defined(__arm64ec__)
+ #include <emmintrin.h>
+ #endif
+ 
 @@ -321,7 +321,7 @@ long ring_buffer_view_read(struct ring_buffer* r, struct ring_buffer_view* v, vo
  
  void ring_buffer_yield() {
@@ -11,6 +20,33 @@ index 576bc5a..665a93c 100644
  #else
      sched_yield();
  #endif
+@@ -354,7 +354,7 @@ bool ring_buffer_wait_write(const struct ring_buffer* r, const struct ring_buffe
+     bool can_write = v ? ring_buffer_view_can_write(r, v, bytes) : ring_buffer_can_write(r, bytes);
+ 
+     while (!can_write) {
+-#ifdef __x86_64
++#if defined(__x86_64) && !defined(__arm64ec__)
+         _mm_pause();
+ #endif
+         curr_wait_us = ring_buffer_curr_us() - start_us;
+@@ -386,7 +386,7 @@ bool ring_buffer_wait_read(const struct ring_buffer* r, const struct ring_buffer
+ 
+     while (!can_read) {
+         // TODO(bohu): find aarch64 equivalent
+-#ifdef __x86_64
++#if defined(__x86_64) && !defined(__arm64ec__)
+         _mm_pause();
+ #endif
+         curr_wait_us = ring_buffer_curr_us() - start_us;
+@@ -470,7 +470,7 @@ uint32_t ring_buffer_read_fully_with_abort(struct ring_buffer* r, struct ring_bu
+     uint8_t* dst = (uint8_t*)data;
+ 
+     while (processed < bytes) {
+-#ifdef __x86_64
++#if defined(__x86_64) && !defined(__arm64ec__)
+         _mm_pause();
+ #endif
+         if (bytes - processed < candidate_step) {
 diff --git a/src/gfxstream/guest/platform/VirtGpu.cpp b/src/gfxstream/guest/platform/VirtGpu.cpp
 index cdb4369..530a66c 100644
 --- a/src/gfxstream/guest/platform/VirtGpu.cpp
@@ -61,18 +97,19 @@ index dd98ef4..2e388f4 100644
  
  }  // namespace gfxstream
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
-index 476a2cd..a50b823 100644
+index 476a2cd..be861a4 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
-@@ -3,15 +3,80 @@
+@@ -3,15 +3,95 @@
   * SPDX-License-Identifier: MIT
   */
  
 +// Windows VirtGpu backend for HyperWin: SweetCider's sgpu requests (virtio-gpu control commands,
 +// sgpu_proto.h) carried through a byte ring in RAM shared with the Android host (hwgpu_ring.h).
 +// hwgpu.sys maps this process's channel into it (hwgpu_ioctl.h); after that no system call sits
-+// between the encoder and the phone. Mapped blobs are guest copies kept in step with the host's:
-+// guest changes go out before a queue submit, host changes come back after a wait for the GPU.
++// between the encoder and the phone. Mapped blobs are the phone's memory itself when the phone put
++// them in the shared heap (hwgpu.sys maps them in); otherwise guest copies kept in step with the
++// host's: guest changes go out before a queue submit, host changes come back after a GPU wait.
 +
  #pragma once
  
@@ -84,6 +121,13 @@ index 476a2cd..a50b823 100644
 +
  #include "VirtGpu.h"
  
++struct HwgpuStats {
++    std::mutex lock;
++    uint64_t since, calls, us, to_host, to_host_us, from_host, from_host_us, again, again_us;
++};
++void hwgpu_stat(uint32_t type, uint64_t us);
++uint64_t hwgpu_now_us();
++
 +class HwgpuConnection {
 +   public:
 +    // The process-wide connection, opened on first use.
@@ -95,6 +139,8 @@ index 476a2cd..a50b823 100644
 +                              size_t tail_len = 0);
 +    // call() for commands answered with OK_NODATA. Returns 0 or -EIO.
 +    int simple(const void* req, size_t len, const void* tail = nullptr, size_t tail_len = 0);
++    // Sends a request flagged SGPU_FLAG_NO_REPLY without waiting. Returns 0 or -EIO.
++    int post(const void* req, size_t len, const void* tail = nullptr, size_t tail_len = 0);
 +
 +    // One host context per process, id HWGPU_CTX(slot). Created on first use, with Vulkan when
 +    // the first device names no capset.
@@ -112,10 +158,14 @@ index 476a2cd..a50b823 100644
 +    void notePush() { mPush.store(true); }
 +    void pushIfNoted();
 +
++    // Maps a heap range the phone granted this channel (hwgpu.sys), or returns null.
++    void* mapHeap(uint64_t offset, uint64_t size);
++    void unmapHeap(void* p);
++
 +   private:
 +    // The \\.\HwGpu handle stays open for the life of the process; closing it frees the channel.
-+    HwgpuConnection(void* chan, uint32_t slot, uint32_t generation)
-+        : mChan(chan), mSlot(slot), mGeneration(generation) {}
++    HwgpuConnection(void* dev, void* chan, uint32_t slot, uint32_t generation)
++        : mDev(dev), mChan(chan), mSlot(slot), mGeneration(generation) {}
 +    bool hello();
 +    std::vector<uint8_t> callLocked(const void* req, size_t len, const void* tail,
 +                                    size_t tail_len);
@@ -125,6 +175,7 @@ index 476a2cd..a50b823 100644
 +        std::vector<uint8_t> last;  // contents at the last sync
 +    };
 +
++    void* mDev;  // the \\.\HwGpu handle
 +    void* mChan;
 +    uint32_t mSlot;
 +    uint32_t mGeneration;
@@ -147,7 +198,7 @@ index 476a2cd..a50b823 100644
      ~WindowsVirtGpuResource();
  
      void intoRaw() override;
-@@ -27,13 +92,16 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
+@@ -27,13 +107,17 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
      int transferToHost(uint32_t x, uint32_t y, uint32_t w, uint32_t h) override;
  
     private:
@@ -165,10 +216,11 @@ index 476a2cd..a50b823 100644
 +    bool mBlob;
 +    bool mMapped = false;
 +    uint8_t* mLocal = nullptr;  // page-aligned guest copy
++    uint8_t* mShared = nullptr; // or the heap memory itself, mapped by hwgpu.sys: nothing to copy
  };
  
  class WindowsVirtGpuResourceMapping : public VirtGpuResourceMapping {
-@@ -54,19 +122,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
+@@ -54,19 +138,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
      WindowsVirtGpuDevice(enum VirtGpuCapset capset, int fd = -1);
      virtual ~WindowsVirtGpuDevice();
  
@@ -196,10 +248,10 @@ index 476a2cd..a50b823 100644
      struct VirtGpuCaps mCaps;
  };
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp
-index 9113d96..8edda7e 100644
+index 9113d96..39ea41a 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuBlob.cpp
-@@ -3,44 +3,139 @@
+@@ -3,44 +3,171 @@
   * SPDX-License-Identifier: MIT
   */
  
@@ -230,7 +282,8 @@ index 9113d96..8edda7e 100644
 -    mResourceHandle = INVALID_DESCRIPTOR;
 +WindowsVirtGpuResource::~WindowsVirtGpuResource() {
 +    auto* c = HwgpuConnection::get();
-+    if (c && mMapped) c->removeMirror(mResourceHandle);
++    if (c && mShared) c->unmapHeap(mShared);  // before the host may give the memory to another
++    else if (c && mMapped) c->removeMirror(mResourceHandle);
 +    if (c && mResourceHandle) {
 +        vgpu_resource_unref u = {};
 +        u.hdr.type = VGPU_CMD_RESOURCE_UNREF;
@@ -250,20 +303,16 @@ index 9113d96..8edda7e 100644
  
  uint64_t WindowsVirtGpuResource::getSize() const { return mSize; }
  
--VirtGpuResourceMappingPtr WindowsVirtGpuResource::createMapping() {
--    return nullptr;  // stub constant
 +uint8_t* WindowsVirtGpuResource::local() {
 +    if (!mLocal)
 +        mLocal = static_cast<uint8_t*>(
 +            VirtualAlloc(nullptr, size_t(mSize), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 +    return mLocal;
- }
- 
--int WindowsVirtGpuResource::exportBlob(struct VirtGpuExternalHandle& handle) {
--    return 0;  // stub constant
-+VirtGpuResourceMappingPtr WindowsVirtGpuResource::createMapping() {
-+    uint8_t* p = local();
-+    if (!p) return nullptr;
++}
++
+ VirtGpuResourceMappingPtr WindowsVirtGpuResource::createMapping() {
+-    return nullptr;  // stub constant
++    if (mShared) return std::make_shared<WindowsVirtGpuResourceMapping>(shared_from_this(), mShared, mSize);
 +    if (mBlob && !mMapped) {
 +        auto* c = HwgpuConnection::get();
 +        vgpu_map_blob m = {};
@@ -271,11 +320,22 @@ index 9113d96..8edda7e 100644
 +        m.hdr.ctx_id = mCtxId;
 +        m.resource_id = mResourceHandle;
 +        auto r = c->call(&m, sizeof(m));
++        if (r.size() >= sizeof(sgpu_resp_map_heap) &&
++            reinterpret_cast<vgpu_hdr*>(r.data())->type == SGPU_RESP_OK_MAP_HEAP) {
++            // The phone's memory itself, shared: map it, and there is nothing to keep in step.
++            const auto* h = reinterpret_cast<const sgpu_resp_map_heap*>(r.data());
++            mShared = static_cast<uint8_t*>(c->mapHeap(h->offset, h->size));
++            if (!mShared) return nullptr;
++            mMapped = true;
++            return std::make_shared<WindowsVirtGpuResourceMapping>(shared_from_this(), mShared, mSize);
++        }
 +        if (r.size() < sizeof(vgpu_hdr) ||
 +            reinterpret_cast<vgpu_hdr*>(r.data())->type != VGPU_RESP_OK_MAP_INFO) {
 +            mesa_loge("hwgpu: map of resource %u failed", mResourceHandle);
 +            return nullptr;
 +        }
++        uint8_t* p = local();
++        if (!p) return nullptr;
 +        // Start from the host's contents, then keep the copy in step. Stay well under the rx ring.
 +        for (uint64_t off = 0; off < mSize;) {
 +            uint32_t n = uint32_t(std::min<uint64_t>(mSize - off, HWGPU_RX_BYTES / 2));
@@ -296,16 +356,33 @@ index 9113d96..8edda7e 100644
 +        c->addMirror(mResourceHandle, p, size_t(mSize));
 +        mMapped = true;
 +    }
++    uint8_t* p = local();
++    if (!p) return nullptr;
 +    return std::make_shared<WindowsVirtGpuResourceMapping>(shared_from_this(), p, mSize);
  }
  
--int WindowsVirtGpuResource::wait() {
+-int WindowsVirtGpuResource::exportBlob(struct VirtGpuExternalHandle& handle) {
 -    return 0;  // stub constant
 +int WindowsVirtGpuResource::exportBlob(struct VirtGpuExternalHandle& handle) { return -EINVAL; }
 +
 +// Commands complete in order on the host, so there is nothing to wait for.
 +int WindowsVirtGpuResource::wait() { return 0; }
 +
++// At least us microseconds: short waits yield the core while watching the clock, longer ones use
++// hwgpu_pause's high-resolution timer.
++static void wait_us(unsigned us) {
++    if (us >= 1000) return hwgpu_pause(us);
++    LARGE_INTEGER f, start, now;
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&start);
++    do {
++        SwitchToThread();
++        QueryPerformanceCounter(&now);
++    } while (uint64_t(now.QuadPart - start.QuadPart) * 1000000ull < uint64_t(us) * uint64_t(f.QuadPart));
+ }
+ 
+-int WindowsVirtGpuResource::wait() {
+-    return 0;  // stub constant
 +int WindowsVirtGpuResource::transfer(bool toHost, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 +    uint8_t* p = local();
 +    if (!p) return -ENOMEM;
@@ -331,17 +408,23 @@ index 9113d96..8edda7e 100644
 +    req.len = uint32_t(len);
 +    if (toHost) {
 +        c->pushIfNoted();
-+        return c->simple(&req, sizeof(req), p + off, size_t(len));
++        // Nothing comes back for a write: the next reply read belongs to the next call.
++        req.t.hdr.flags |= SGPU_FLAG_NO_REPLY;
++        return c->post(&req, sizeof(req), p + off, size_t(len));
 +    }
 +    // A pipe with nothing to read yet answers AGAIN. Ask again, backing off, without holding
 +    // the connection, so other threads keep streaming while this one waits on the host.
 +    std::vector<uint8_t> r;
-+    for (unsigned backoff = 50;; backoff = std::min(backoff * 2, 2000u)) {
++    // Each try is a request the phone answers, so tries are spaced in real time: 50 us at first,
++    // doubling to 250 us. (Sleep() would round these up to the system timer, often 15.6 ms.)
++    for (unsigned backoff = 50;; backoff = std::min(backoff * 2, 250u)) {
 +        r = c->call(&req, sizeof(req));
 +        if (r.size() != sizeof(vgpu_hdr) ||
 +            reinterpret_cast<vgpu_hdr*>(r.data())->type != SGPU_RESP_AGAIN)
 +            break;
-+        hwgpu_pause(backoff);
++        uint64_t t0 = hwgpu_now_us();
++        wait_us(backoff);
++        hwgpu_stat(SGPU_RESP_AGAIN, hwgpu_now_us() - t0);
 +    }
 +    if (r.size() != sizeof(sgpu_resp_data) + len ||
 +        reinterpret_cast<sgpu_resp_data*>(r.data())->hdr.type != SGPU_RESP_OK_DATA)
@@ -360,10 +443,10 @@ index 9113d96..8edda7e 100644
 +    return transfer(false, x, y, w, h);
  }
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-index 9d8b83b..930deaa 100644
+index 9d8b83b..2699357 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-@@ -3,37 +3,378 @@
+@@ -3,37 +3,455 @@
   * SPDX-License-Identifier: MIT
   */
  
@@ -376,6 +459,8 @@ index 9d8b83b..930deaa 100644
 +#include "hwgpu_ioctl.h"
 +#include "hwgpu_ring.h"
 +#include "sgpu_proto.h"
++#include <stdio.h>
++#include <stdlib.h>
 +#include "util/log.h"
 +
 +HwgpuConnection* HwgpuConnection::get() {
@@ -399,7 +484,7 @@ index 9d8b83b..930deaa 100644
 +        void* chan = reinterpret_cast<void*>(uintptr_t(out.chan));
 +        // The phone answers within one pass of its loop; give it a few seconds.
 +        for (int i = 0; i < 3000 && !hwgpu_alive(hwgpu_chan_ctl(chan), out.generation); i++) Sleep(1);
-+        auto* c = new HwgpuConnection(chan, out.slot, out.generation);
++        auto* c = new HwgpuConnection(dev, chan, out.slot, out.generation);
 +        if (!hwgpu_alive(hwgpu_chan_ctl(chan), out.generation) || !c->hello()) {
 +            mesa_loge("hwgpu: the phone did not answer on channel %u", out.slot);
 +            CloseHandle(dev);
@@ -432,10 +517,67 @@ index 9d8b83b..930deaa 100644
 +    return {};
 +}
 +
++// HWGPU_STATS=<file> in the environment: every 2 s, how the round trips to the phone were spent,
++// appended to that file.
++HwgpuStats g_hwgpu_stats;
++
++static uint64_t qpc_us() {
++    static LARGE_INTEGER f;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    LARGE_INTEGER n;
++    QueryPerformanceCounter(&n);
++    return uint64_t(n.QuadPart) * 1000000ull / uint64_t(f.QuadPart);
++}
++
++void hwgpu_stat(uint32_t type, uint64_t us) {
++    static const char* path = getenv("HWGPU_STATS");
++    if (!path) return;
++    auto& s = g_hwgpu_stats;
++    std::lock_guard<std::mutex> l(s.lock);
++    s.calls++;
++    s.us += us;
++    if (type == VGPU_CMD_TRANSFER_TO_HOST_3D) s.to_host++, s.to_host_us += us;
++    if (type == VGPU_CMD_TRANSFER_FROM_HOST_3D) s.from_host++, s.from_host_us += us;
++    if (type == SGPU_RESP_AGAIN) s.again++, s.again_us += us;
++    uint64_t now = qpc_us();
++    if (!s.since) s.since = now;
++    if (now - s.since >= 2000000) {
++        if (FILE* f = fopen(path, "a")) {
++            fprintf(f, "%llu ms: %llu calls %llu us | to_host %llu %llu us | from_host %llu %llu us | again %llu, waited %llu us\n",
++                    (unsigned long long)((now - s.since) / 1000), (unsigned long long)s.calls, (unsigned long long)s.us,
++                    (unsigned long long)s.to_host, (unsigned long long)s.to_host_us, (unsigned long long)s.from_host,
++                    (unsigned long long)s.from_host_us, (unsigned long long)s.again, (unsigned long long)s.again_us);
++            fclose(f);
++        }
++        s.calls = s.us = s.to_host = s.to_host_us = s.from_host = s.from_host_us = s.again = s.again_us = 0;
++        s.since = now;
++    }
++}
++
++uint64_t hwgpu_now_us() { return qpc_us(); }
++
 +std::vector<uint8_t> HwgpuConnection::call(const void* req, size_t len, const void* tail,
 +                                           size_t tail_len) {
 +    std::lock_guard<std::recursive_mutex> l(mLock);
-+    return callLocked(req, len, tail, tail_len);
++    uint64_t t0 = qpc_us();
++    auto r = callLocked(req, len, tail, tail_len);
++    hwgpu_stat(reinterpret_cast<const vgpu_hdr*>(req)->type, qpc_us() - t0);
++    return r;
++}
++
++int HwgpuConnection::post(const void* req, size_t len, const void* tail, size_t tail_len) {
++    std::lock_guard<std::recursive_mutex> l(mLock);
++    if (mBroken) return -EIO;
++    uint64_t t0 = qpc_us();
++    uint32_t n = uint32_t(len + tail_len);
++    bool ok = hwgpu_write_all(mChan, mGeneration, 1, &n, sizeof(n)) &&
++              hwgpu_write_all(mChan, mGeneration, 1, req, len) &&
++              (!tail_len || hwgpu_write_all(mChan, mGeneration, 1, tail, tail_len));
++    hwgpu_stat(reinterpret_cast<const vgpu_hdr*>(req)->type, qpc_us() - t0);
++    if (ok) return 0;
++    mesa_loge("hwgpu: channel %u lost", mSlot);
++    mBroken = true;
++    return -EIO;
 +}
 +
 +int HwgpuConnection::simple(const void* req, size_t len, const void* tail, size_t tail_len) {
@@ -500,6 +642,24 @@ index 9d8b83b..930deaa 100644
 +        mCapsets[info.capset_id].assign(rc.begin() + sizeof(vgpu_hdr), rc.end());
 +    }
 +    return true;
++}
++
++void* HwgpuConnection::mapHeap(uint64_t offset, uint64_t size) {
++    hwgpu_map_in in = {offset, size};
++    hwgpu_map_out out = {};
++    DWORD got = 0;
++    if (!DeviceIoControl(mDev, IOCTL_HWGPU_MAP, &in, sizeof(in), &out, sizeof(out), &got, nullptr) ||
++        got != sizeof(out)) {
++        mesa_loge("hwgpu: heap map at 0x%llx failed (error %lu)", (unsigned long long)offset, GetLastError());
++        return nullptr;
++    }
++    return reinterpret_cast<void*>(uintptr_t(out.user));
++}
++
++void HwgpuConnection::unmapHeap(void* p) {
++    hwgpu_map_out in = {uint64_t(uintptr_t(p))};
++    DWORD got = 0;
++    DeviceIoControl(mDev, IOCTL_HWGPU_UNMAP, &in, sizeof(in), nullptr, 0, &got, nullptr);
 +}
 +
 +void HwgpuConnection::addMirror(uint32_t resourceId, uint8_t* local, size_t size) {
@@ -965,11 +1125,154 @@ index 5972142..2cdbbfa 100644
      MESA_TRACE_SCOPE("vkQueueSubmit2KHR");
      VkResult vkQueueSubmit2KHR_VkResult_return = (VkResult)0;
      auto vkEnc = gfxstream::vk::ResourceTracker::getQueueEncoder(queue);
+diff --git a/src/util/blake3/blake3_impl.h b/src/util/blake3/blake3_impl.h
+index 0dd387c..64660bf 100644
+--- a/src/util/blake3/blake3_impl.h
++++ b/src/util/blake3/blake3_impl.h
+@@ -38,7 +38,7 @@ enum blake3_flags {
+ #define NOEXCEPT
+ #endif
+ 
+-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
++#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC) && !defined(__arm64ec__)
+ #define IS_X86
+ #define IS_X86_64
+ #endif
+diff --git a/src/util/detect_arch.h b/src/util/detect_arch.h
+index e32de8d..8e35677 100644
+--- a/src/util/detect_arch.h
++++ b/src/util/detect_arch.h
+@@ -58,9 +58,10 @@
+ #define DETECT_ARCH_X86 1
+ #endif
+ 
+-#if defined(__x86_64__) /* gcc */ || \
++/* ARM64EC compilers also claim x86_64 for the x64 ABI; the code is ARM64. */
++#if !defined(__arm64ec__) && (defined(__x86_64__) /* gcc */ || \
+     ((defined(_M_X64) || defined(_M_AMD64)) && !defined(_M_ARM64EC)) /* msvc */ || \
+-    defined(__x86_64) /* Sun cc */
++    defined(__x86_64) /* Sun cc */)
+ #define DETECT_ARCH_X86_64 1
+ #endif
+ 
+@@ -87,7 +88,7 @@
+ #define DETECT_ARCH_ARM 1
+ #endif
+ 
+-#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
++#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__arm64ec__)
+ #define DETECT_ARCH_AARCH64 1
+ #endif
+ 
+diff --git a/src/vulkan/util/vk_dispatch_table_gen.py b/src/vulkan/util/vk_dispatch_table_gen.py
+index c2776d2..994cc14 100644
+--- a/src/vulkan/util/vk_dispatch_table_gen.py
++++ b/src/vulkan/util/vk_dispatch_table_gen.py
+@@ -65,7 +65,7 @@ TEMPLATE_H = Template(COPYRIGHT + """\
+ extern "C" {
+ #endif
+ 
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__)
+ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void);
+ #endif
+ 
+@@ -567,7 +567,7 @@ vk_device_entrypoint_is_enabled(int index, uint32_t core_version,
+    }
+ }
+ 
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__)
+ VKAPI_ATTR void VKAPI_CALL vk_entrypoint_stub(void)
+ {
+    UNREACHABLE("Entrypoint not implemented");
+@@ -609,7 +609,7 @@ void vk_${type}_dispatch_table_from_entrypoints(
+     if (overwrite) {
+         memset(dispatch_table, 0, sizeof(*dispatch_table));
+         for (unsigned i = 0; i < ARRAY_SIZE(${type}_compaction_table); i++) {
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__)
+             assert(entry[i] != NULL);
+             if (vk_function_is_stub(entry[i]))
+ #else
+@@ -623,7 +623,7 @@ void vk_${type}_dispatch_table_from_entrypoints(
+     } else {
+         for (unsigned i = 0; i < ARRAY_SIZE(${type}_compaction_table); i++) {
+             unsigned disp_index = ${type}_compaction_table[i];
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || defined(__arm64ec__)
+             assert(entry[i] != NULL);
+             if (disp[disp_index] == NULL && !vk_function_is_stub(entry[i]))
+ #else
+diff --git a/src/vulkan/util/vk_entrypoints_gen.py b/src/vulkan/util/vk_entrypoints_gen.py
+index 9dbe00e..7cdc530 100644
+--- a/src/vulkan/util/vk_entrypoints_gen.py
++++ b/src/vulkan/util/vk_entrypoints_gen.py
+@@ -59,7 +59,9 @@ extern "C" {
+  * On MSVC, weak symbols are not well supported, so we use the functionally
+  * equivalent /alternatename.
+  */
+-#if !defined(_MSC_VER) && defined(VK_ENTRY_USE_WEAK)
++/* ARM64EC (the x64 half of an ARM64X DLL) takes the /alternatename route too: lld resolves its weak
++ * symbols to NULL even when they are defined. */
++#if !defined(_MSC_VER) && !defined(__arm64ec__) && defined(VK_ENTRY_USE_WEAK)
+ #define VK_ENTRY_WEAK __attribute__ ((weak))
+ #else
+ #define VK_ENTRY_WEAK
+@@ -174,7 +176,9 @@ TEMPLATE_C = Template(COPYRIGHT + """
+ #ifdef ${e.guard}
+     % endif
+     % for p in prefixes:
+-#ifdef _MSC_VER
++#if defined(__arm64ec__) && !defined(_MSC_VER)
++    __asm__(".section .drectve,\\"yn\\"\\n.ascii \\" /alternatename:${p}_${e.name}=vk_entrypoint_stub /alternatename:#${p}_${e.name}=#vk_entrypoint_stub\\"\\n.text");
++#elif defined(_MSC_VER)
+ #ifdef _M_IX86
+       % for args_size in [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 60, 104]:
+     #pragma comment(linker, "/alternatename:_${p}_${e.name}@${args_size}=_vk_entrypoint_stub@0")
+@@ -209,7 +213,7 @@ const struct vk_${type}_entrypoint_table ${p}_${type}_entrypoints = {
+     % endif
+     .${e.name} = ${p}_${e.name},
+     % if e.guard is not None:
+-#elif defined(_MSC_VER)
++#elif defined(_MSC_VER) || defined(__arm64ec__)
+     .${e.name} = (PFN_vkVoidFunction)vk_entrypoint_stub,
+ #endif // ${e.guard}
+     % endif
+@@ -226,7 +230,7 @@ const struct vk_${type}_entrypoint_table ${tmpl_prefix}_${type}_entrypoints_${en
+     % endif
+     .${e.name} = ${tmpl_prefix}_${e.name}${v},
+     % if e.guard is not None:
+-#elif defined(_MSC_VER)
++#elif defined(_MSC_VER) || defined(__arm64ec__)
+     .${e.name} = (PFN_vkVoidFunction)vk_entrypoint_stub,
+ #endif // ${e.guard}
+     % endif
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 0622857..98d1b61 100644
+index 0622857..d338e36 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
-@@ -401,6 +401,9 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+@@ -368,6 +368,10 @@ wsi_win32_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+    get_sorted_vk_formats(wsi_device, sorted_formats);
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
++      /* The software path copies pixels into a BGRA DIB as they are, so RGBA would show with red
++       * and blue swapped. Apps that want RGBA render to BGRA through a blit instead. */
++      if (wsi_device->sw && sorted_formats[i] == VK_FORMAT_R8G8B8A8_UNORM)
++         continue;
+       vk_outarray_append_typed(VkSurfaceFormatKHR, &out, f) {
+          f->format = sorted_formats[i];
+          f->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+@@ -390,6 +394,8 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+    get_sorted_vk_formats(wsi_device, sorted_formats);
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
++      if (wsi_device->sw && sorted_formats[i] == VK_FORMAT_R8G8B8A8_UNORM)
++         continue;
+       vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, f) {
+          assert(f->sType == VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR);
+          f->surfaceFormat.format = sorted_formats[i];
+@@ -401,6 +407,9 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
  }
  
  static const VkPresentModeKHR present_modes_gdi[] = {

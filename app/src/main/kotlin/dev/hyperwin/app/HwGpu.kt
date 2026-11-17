@@ -1,53 +1,285 @@
 package dev.hyperwin.app
 
+import android.app.Service
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
+import android.os.Process
+import android.os.SharedMemory
 import android.util.Log
+import java.io.File
+import java.util.zip.ZipInputStream
 
 /**
- * Host side of the GPU rings: loads libhwgpu.so and starts the gfxstream renderer thread that
- * serves every guest channel in the shared window.  The app calls [start] before the VM boots
- * and [stop] when the VM exits.
+ * Host side of the GPU rings. The gfxstream renderer, and the Vulkan driver it loads, run in a
+ * process of their own ([GpuService], ":gpu"), which maps the same shared window. gfxstream loads
+ * its driver once per process, so changing the driver means a new renderer process. Windows keeps
+ * running across that: programs using the GPU at that moment lose it, and ones started after get
+ * the new driver. A renderer crash does not take Windows down either; the system restarts the
+ * service and [connection] hands it the window again.
  */
 object HwGpu {
     private const val TAG = "HwGpu"
-    private var loaded = false
+    private const val STACK = "gpuStack"   // preference: one "1|id" or "0|id" line per entry, top first
+    private const val OLD_DRIVER = "gpuDriver"
+    const val PHONE = "phone"
+
+    /**
+     * What the app carries. Fixes are wrappers (gpu/host/icd) that sit on top of a driver and can
+     * be stacked; a driver is what the GPU work finally reaches, the phone's own or one added from
+     * a file, and exactly one is on.
+     */
+    val BUILT_IN = linkedMapOf(
+        "vortek" to "Vortek",
+        "bcn" to "BC textures",
+        PHONE to "Phone default",
+    )
+    private val FIX_LIBS = mapOf("vortek" to "libvulkan_vortek.so", "bcn" to "libvulkan_bcn.so")
+
+    data class Entry(val id: String, val on: Boolean) {
+        val fix get() = id in FIX_LIBS
+        val builtIn get() = id in BUILT_IN
+        val label get() = BUILT_IN[id] ?: id.removeSuffix(".so")
+    }
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences("hyperwin", Context.MODE_PRIVATE)
+
+    /** The stack, top first: saved order, then anything new (an added file, a new built-in). */
+    fun stack(ctx: Context): List<Entry> {
+        val p = prefs(ctx)
+        val saved = p.getString(STACK, null)?.lines()?.filter { it.length > 2 }?.map { Entry(it.substring(2), it[0] == '1') }
+            ?: when (val old = p.getString(OLD_DRIVER, null)) {  // the single-choice setting this replaced
+                null -> listOf(Entry("vortek", true))
+                "vortek", "bcn" -> listOf(Entry(old, true))
+                "" -> listOf(Entry(PHONE, true))
+                else -> listOf(Entry(old, true))
+            }
+        val files = drivers(ctx).map { it.name }.toSet()
+        val list = saved.filter { it.builtIn || it.id in files }.distinctBy { it.id }.toMutableList()
+        for (id in BUILT_IN.keys + files) if (list.none { it.id == id }) list += Entry(id, false)
+        // Exactly one driver on: the first one switched on, else the phone's.
+        val driver = list.firstOrNull { !it.fix && it.on }?.id ?: PHONE
+        // Fixes always sit above the drivers, as they run.
+        return list.filter { it.fix } + list.filter { !it.fix }.map { it.copy(on = it.id == driver) }
+    }
+
+    fun saveStack(ctx: Context, list: List<Entry>) {
+        prefs(ctx).edit().putString(STACK, list.joinToString("\n") { (if (it.on) "1|" else "0|") + it.id }).apply()
+    }
+
+    /** Switches [id] on as the driver; the other drivers go off. */
+    fun useDriver(ctx: Context, id: String) {
+        saveStack(ctx, stack(ctx).map { if (it.fix) it else it.copy(on = it.id == id) })
+    }
+
+    /** Drops a driver added from a file. The phone's driver takes over if it was the one on. */
+    fun deleteDriver(ctx: Context, id: String) {
+        File(driverDir(ctx), id).delete()
+        saveStack(ctx, stack(ctx))
+    }
+
+    private var ctx: Context? = null
+    private var window: AvfPlan.SharedWindow? = null
+    private var width = 0
+    private var height = 0
+    private var bound = false
     @Volatile var running = false
         private set
 
-    private fun ensureLoaded(): Boolean {
-        if (loaded) return true
-        // A build without gpu/work/android (gpu/host/build-android.sh) still runs Windows, without a GPU.
-        loaded = runCatching {
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            val w = window ?: return
+            val c = ctx ?: return
+            val msg = Message.obtain(null, GpuService.START).apply {
+                data = Bundle().apply {
+                    putParcelable("window", w.memory)
+                    putParcelable("heap", w.heap)
+                    putInt("width", width)
+                    putInt("height", height)
+                    putBundle("env", env(c))
+                }
+            }
+            runCatching { Messenger(binder).send(msg) }.onFailure { Log.e(TAG, "renderer did not take the window", it) }
+            running = true
+            Log.i(TAG, "renderer process connected: ${describe(c)}")
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            // Died, most likely in the driver. The system would start it again only after a growing
+            // delay, so bind afresh at once; Windows programs waiting on the GPU then get errors
+            // instead of hanging.
+            running = false
+            Log.w(TAG, "renderer process ended, starting another")
+            Handler(Looper.getMainLooper()).postDelayed({ restart() }, 500)
+        }
+
+        override fun onBindingDied(name: ComponentName) = restart()
+    }
+
+    fun start(context: Context, window: AvfPlan.SharedWindow, width: Int, height: Int) {
+        ctx = context.applicationContext
+        this.window = window
+        this.width = width
+        this.height = height
+        bind()
+    }
+
+    fun stop() {
+        window = null
+        unbind()
+        running = false
+    }
+
+    /** A new renderer with the current driver settings, under the running Windows. */
+    fun restart() {
+        if (window == null) return
+        unbind()
+        bind()
+    }
+
+    private fun bind() {
+        val c = ctx ?: return
+        if (bound) return
+        bound = c.bindService(Intent(c, GpuService::class.java), connection, Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT)
+        if (!bound) Log.e(TAG, "could not start the renderer process")
+    }
+
+    private fun unbind() {
+        if (!bound) return
+        bound = false
+        runCatching { ctx?.unbindService(connection) }
+    }
+
+    fun driverDir(ctx: Context) = File(ctx.filesDir, "drivers").apply { mkdirs() }
+
+    /** Vulkan drivers added from files, such as Turnip builds for Adreno GPUs. */
+    fun drivers(ctx: Context) = driverDir(ctx).listFiles { f -> f.name.endsWith(".so") }.orEmpty().sortedBy { it.name }
+
+    /**
+     * Copies a driver in: a .so, or a .zip holding one (the AdrenoTools layout, where meta.json's
+     * libraryName names it). Returns the file name, or null when there was no driver in it.
+     */
+    fun importDriver(ctx: Context, uri: Uri): String? {
+        val name = ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(android.provider.OpenableColumns.DISPLAY_NAME)) else null
+        } ?: uri.lastPathSegment ?: "driver"
+        val dir = driverDir(ctx)
+        if (name.endsWith(".so")) {
+            val out = File(dir, File(name).name)
+            ctx.contentResolver.openInputStream(uri)!!.use { i -> out.outputStream().use { i.copyTo(it) } }
+            return out.name
+        }
+        // A zip: read meta.json first if present, else take the first .so.
+        var wanted: String? = null
+        ZipInputStream(ctx.contentResolver.openInputStream(uri)!!).use { z ->
+            generateSequence { z.nextEntry }.firstOrNull { it.name.endsWith("meta.json") }?.let {
+                wanted = Regex("\"libraryName\"\\s*:\\s*\"([^\"]+)\"").find(z.readBytes().decodeToString())?.groupValues?.get(1)
+            }
+        }
+        ZipInputStream(ctx.contentResolver.openInputStream(uri)!!).use { z ->
+            val entry = generateSequence { z.nextEntry }.firstOrNull { e ->
+                !e.isDirectory && e.name.endsWith(".so") && (wanted == null || File(e.name).name == wanted)
+            } ?: return null
+            val base = name.removeSuffix(".zip").replace(Regex("[^A-Za-z0-9._-]"), "_")
+            val out = File(dir, "$base.so")
+            out.outputStream().use { z.copyTo(it) }
+            return out.name
+        }
+    }
+
+    /** "Vortek over Phone default": the fixes that are on, top first, then the driver. */
+    fun describe(ctx: Context): String {
+        val on = stack(ctx).filter { it.on }
+        val fixes = on.filter { it.fix }.joinToString(" + ") { it.label }
+        val driver = on.first { !it.fix }.label
+        return if (fixes.isEmpty()) driver else "$fixes over $driver"
+    }
+
+    /** What the renderer process sets before gfxstream loads its driver. */
+    private fun env(ctx: Context): Bundle {
+        val on = stack(ctx).filter { it.on }
+        val fixes = on.filter { it.fix }.map { FIX_LIBS.getValue(it.id) }
+        val driver = on.first { !it.fix }.id.let { if (it == PHONE) null else File(driverDir(ctx), it) }
+        return Bundle().apply {
+            // gfxstream opens the top wrapper as its Vulkan loader. Each wrapper opens the next one
+            // in HWGPU_VK_CHAIN, and the last opens HWGPU_VK_DRIVER, or the phone's libvulkan.so.
+            when {
+                fixes.isNotEmpty() -> {
+                    putString("ANDROID_EMU_VK_LOADER_PATH", fixes.first())
+                    putString("HWGPU_VK_CHAIN", fixes.joinToString(":"))
+                }
+                driver != null -> putString("ANDROID_EMU_VK_LOADER_PATH", "libvulkan_passthrough.so")
+            }
+            if (driver != null) putString("HWGPU_VK_DRIVER", driver.absolutePath)
+            // adb shell setprop log.tag.hwgpu DEBUG: the server logs every guest request.
+            if (Log.isLoggable("hwgpu", Log.DEBUG)) putString("HWGPU_TRACE", "1")
+        }
+    }
+}
+
+/** The renderer process. It lives while the app is bound to it, and exits when unbound. */
+class GpuService : Service() {
+    companion object {
+        const val START = 1
+        private const val TAG = "HwGpu"
+        /** STREAM_RENDERER_FLAGS_* (gfxstream virtio-gpu-gfxstream-renderer.h), as ring_test uses. */
+        private const val USE_SURFACELESS = 1 shl 3
+        private const val USE_VK = 1 shl 5
+    }
+
+    private var memory: SharedMemory? = null
+    // Held for the life of the process: the mapping goes away when its buffer is collected.
+    private var mapped: java.nio.ByteBuffer? = null
+    private var heapMemory: SharedMemory? = null
+    private var mappedHeap: java.nio.ByteBuffer? = null
+    private var started = false
+
+    private val messenger = Messenger(Handler(Looper.getMainLooper()) { msg ->
+        if (msg.what == START && !started) start(msg.data)
+        true
+    })
+
+    private fun start(data: Bundle) {
+        val shm = data.getParcelable("window", SharedMemory::class.java) ?: return
+        data.getBundle("env")?.let { env -> env.keySet().forEach { android.system.Os.setenv(it, env.getString(it), true) } }
+        val loaded = runCatching {
             System.loadLibrary("gfxstream_backend")
             System.loadLibrary("hwgpu")
         }.onFailure { Log.e(TAG, "GPU libraries missing from this build", it) }.isSuccess
-        return loaded
-    }
-
-    /** STREAM_RENDERER_FLAGS_* (gfxstream virtio-gpu-gfxstream-renderer.h), as ring_test uses. */
-    private const val USE_SURFACELESS = 1 shl 3
-    private const val USE_VK = 1 shl 5
-
-    fun start(window: AvfPlan.SharedWindow, width: Int, height: Int) {
-        if (!ensureLoaded()) return
-        // adb shell setprop log.tag.hwgpu DEBUG: the server logs every guest request.
-        if (Log.isLoggable("hwgpu", Log.DEBUG)) android.system.Os.setenv("HWGPU_TRACE", "1", true)
-        else android.system.Os.unsetenv("HWGPU_TRACE")
-        val rc = nativeStart(window.buffer, USE_VK or USE_SURFACELESS, width, height)
+        if (!loaded) return
+        memory = shm
+        val map = shm.mapReadWrite().also { mapped = it }
+        val heap = data.getParcelable("heap", SharedMemory::class.java)
+        heapMemory = heap
+        val heapMap = heap?.let { runCatching { it.mapReadWrite() }.onFailure { e -> Log.e(TAG, "GPU heap not mapped", e) }.getOrNull() }
+        mappedHeap = heapMap
+        val rc = nativeStart(map, heapMap, USE_VK or USE_SURFACELESS, data.getInt("width"), data.getInt("height"))
         if (rc != 0) {
             Log.e(TAG, "nativeStart failed ($rc)")
             return
         }
-        running = true
-        Log.i(TAG, "renderer started ${width}x${height}")
+        started = true
+        Log.i(TAG, "renderer started ${data.getInt("width")}x${data.getInt("height")}, " +
+            "loader ${System.getenv("ANDROID_EMU_VK_LOADER_PATH") ?: "phone"}, driver ${System.getenv("HWGPU_VK_DRIVER") ?: "phone"}")
     }
 
-    fun stop() {
-        if (!running) return
-        nativeStop()
-        running = false
+    override fun onBind(intent: Intent): IBinder = messenger.binder
+
+    override fun onDestroy() {
+        if (started) nativeStop()
         Log.i(TAG, "renderer stopped")
+        // The driver cannot be unloaded and gfxstream cannot start twice in one process.
+        Process.killProcess(Process.myPid())
     }
 
-    private external fun nativeStart(window: java.nio.ByteBuffer, flags: Int, width: Int, height: Int): Int
+    private external fun nativeStart(window: java.nio.ByteBuffer, heap: java.nio.ByteBuffer?, flags: Int, width: Int, height: Int): Int
     private external fun nativeStop()
 }

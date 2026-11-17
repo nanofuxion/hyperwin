@@ -18,14 +18,25 @@
 #define MdlMappingNoExecute 0x40000000
 #endif
 
+#define MAX_VIEWS 256u
+
+/* One heap range mapped into the process. */
+struct view {
+    PMDL mdl;
+    PVOID user;
+    uint64_t offset, size;
+};
+
 struct open_ctx {
     int slot;           /* -1 until IOCTL_HWGPU_OPEN */
     PMDL mdl;
     PVOID user;         /* mapping in the process that asked */
     PEPROCESS process;
+    struct view views[MAX_VIEWS];
 };
 
 static PVOID g_ring;    /* kernel mapping of the ring area, offset HWGPU_RING_OFF in the window */
+static PVOID g_heap;    /* kernel mapping of the shared heap, HW_HEAP_PA, or NULL */
 static FAST_MUTEX g_lock;
 
 /* The window base the ring helpers expect, so offsets inside hwgpu_ring.h line up. */
@@ -37,6 +48,78 @@ static NTSTATUS done(PIRP irp, NTSTATUS st, ULONG_PTR info)
     irp->IoStatus.Information = info;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return st;
+}
+
+/* Maps one heap range into the current process. User mappings raise instead of failing. */
+static PVOID map_user(PVOID kernel, uint64_t size, PMDL *out)
+{
+    PMDL mdl = IoAllocateMdl(kernel, (ULONG)size, FALSE, FALSE, NULL);
+    if (!mdl) return NULL;
+    MmBuildMdlForNonPagedPool(mdl);
+    PVOID user = NULL;
+    __try {
+        user = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE,
+                                            NormalPagePriority | MdlMappingNoExecute);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        user = NULL;
+    }
+    if (!user) {
+        IoFreeMdl(mdl);
+        return NULL;
+    }
+    *out = mdl;
+    return user;
+}
+
+static void unmap_view(struct open_ctx *c, struct view *v)
+{
+    if (v->user && c->process == PsGetCurrentProcess()) MmUnmapLockedPages(v->user, v->mdl);
+    if (v->mdl) IoFreeMdl(v->mdl);
+    RtlZeroMemory(v, sizeof(*v));
+}
+
+/* A range the phone granted this handle's channel, matched exactly. */
+static int granted(struct open_ctx *c, uint64_t offset, uint64_t size)
+{
+    struct hwgpu_ctl *ctl = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off((uint32_t)c->slot));
+    for (uint32_t i = 0; i < HWGPU_GRANTS; i++) {
+        uint64_t g = __atomic_load_n(&ctl->grant[i].size, __ATOMIC_ACQUIRE);
+        if (g && g == size && ctl->grant[i].offset == offset) return 1;
+    }
+    return 0;
+}
+
+static NTSTATUS map_heap(struct open_ctx *c, const struct hwgpu_map_in *in, struct hwgpu_map_out *out)
+{
+    if (c->slot < 0 || !g_heap) return STATUS_DEVICE_NOT_READY;
+    if (!in->size || (in->offset | in->size) & 0xfff || in->offset > HW_HEAP_SIZE ||
+        in->size > HW_HEAP_SIZE - in->offset || in->size > 0xfffff000ull)
+        return STATUS_INVALID_PARAMETER;
+    if (!granted(c, in->offset, in->size)) return STATUS_ACCESS_DENIED;
+    struct view *v = NULL;
+    for (uint32_t i = 0; i < MAX_VIEWS && !v; i++)
+        if (!c->views[i].user) v = &c->views[i];
+    if (!v) return STATUS_INSUFFICIENT_RESOURCES;
+    PMDL mdl = NULL;
+    PVOID user = map_user((UCHAR *)g_heap + in->offset, in->size, &mdl);
+    if (!user) return STATUS_INSUFFICIENT_RESOURCES;
+    v->mdl = mdl;
+    v->user = user;
+    v->offset = in->offset;
+    v->size = in->size;
+    out->user = (uint64_t)(ULONG_PTR)user;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unmap_heap(struct open_ctx *c, const struct hwgpu_map_out *in)
+{
+    for (uint32_t i = 0; i < MAX_VIEWS; i++) {
+        if (c->views[i].user && (uint64_t)(ULONG_PTR)c->views[i].user == in->user) {
+            unmap_view(c, &c->views[i]);
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_INVALID_PARAMETER;
 }
 
 static NTSTATUS on_create(PDEVICE_OBJECT dev, PIRP irp)
@@ -58,6 +141,9 @@ static NTSTATUS on_cleanup(PDEVICE_OBJECT dev, PIRP irp)
     struct open_ctx *c = IoGetCurrentIrpStackLocation(irp)->FileObject->FsContext;
     ExAcquireFastMutex(&g_lock);
     if (c && c->slot >= 0) {
+        /* Heap views first: the phone may hand their memory to someone else once the channel is free. */
+        for (uint32_t i = 0; i < MAX_VIEWS; i++)
+            if (c->views[i].user) unmap_view(c, &c->views[i]);
         if (c->user && c->process == PsGetCurrentProcess()) MmUnmapLockedPages(c->user, c->mdl);
         IoFreeMdl(c->mdl);
         hwgpu_release(window(), (uint32_t)c->slot);
@@ -119,20 +205,48 @@ static NTSTATUS on_ioctl(PDEVICE_OBJECT dev, PIRP irp)
 {
     (void)dev;
     PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
-    if (s->Parameters.DeviceIoControl.IoControlCode != IOCTL_HWGPU_OPEN)
-        return done(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
-    if (s->Parameters.DeviceIoControl.OutputBufferLength < sizeof(struct hwgpu_open_out))
-        return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
-    /* The mapping goes into the current process, so only take calls made from user mode directly. */
+    ULONG code = s->Parameters.DeviceIoControl.IoControlCode;
+    ULONG in_len = s->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG out_len = s->Parameters.DeviceIoControl.OutputBufferLength;
+    PVOID buf = irp->AssociatedIrp.SystemBuffer;
+    struct open_ctx *c = s->FileObject->FsContext;
+    /* Mappings go into the current process, so only take calls made from user mode directly. */
     if (irp->RequestorMode != UserMode) return done(irp, STATUS_ACCESS_DENIED, 0);
-    struct hwgpu_open_out out;
-    RtlZeroMemory(&out, sizeof(out));
-    ExAcquireFastMutex(&g_lock);
-    NTSTATUS st = open_channel(s->FileObject->FsContext, &out);
-    ExReleaseFastMutex(&g_lock);
-    if (!NT_SUCCESS(st)) return done(irp, st, 0);
-    RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, &out, sizeof(out));
-    return done(irp, STATUS_SUCCESS, sizeof(out));
+    if (code == IOCTL_HWGPU_OPEN) {
+        if (out_len < sizeof(struct hwgpu_open_out)) return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        struct hwgpu_open_out out;
+        RtlZeroMemory(&out, sizeof(out));
+        ExAcquireFastMutex(&g_lock);
+        NTSTATUS st = open_channel(c, &out);
+        ExReleaseFastMutex(&g_lock);
+        if (!NT_SUCCESS(st)) return done(irp, st, 0);
+        RtlCopyMemory(buf, &out, sizeof(out));
+        return done(irp, STATUS_SUCCESS, sizeof(out));
+    }
+    if (code == IOCTL_HWGPU_MAP) {
+        if (in_len < sizeof(struct hwgpu_map_in) || out_len < sizeof(struct hwgpu_map_out))
+            return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        struct hwgpu_map_in in;
+        struct hwgpu_map_out out;
+        RtlCopyMemory(&in, buf, sizeof(in));
+        RtlZeroMemory(&out, sizeof(out));
+        ExAcquireFastMutex(&g_lock);
+        NTSTATUS st = c->process == PsGetCurrentProcess() ? map_heap(c, &in, &out) : STATUS_ACCESS_DENIED;
+        ExReleaseFastMutex(&g_lock);
+        if (!NT_SUCCESS(st)) return done(irp, st, 0);
+        RtlCopyMemory(buf, &out, sizeof(out));
+        return done(irp, STATUS_SUCCESS, sizeof(out));
+    }
+    if (code == IOCTL_HWGPU_UNMAP) {
+        if (in_len < sizeof(struct hwgpu_map_out)) return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        struct hwgpu_map_out in;
+        RtlCopyMemory(&in, buf, sizeof(in));
+        ExAcquireFastMutex(&g_lock);
+        NTSTATUS st = c->process == PsGetCurrentProcess() ? unmap_heap(c, &in) : STATUS_ACCESS_DENIED;
+        ExReleaseFastMutex(&g_lock);
+        return done(irp, st, 0);
+    }
+    return done(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 }
 
 static void unload(PDRIVER_OBJECT driver)
@@ -142,6 +256,7 @@ static void unload(PDRIVER_OBJECT driver)
     IoDeleteSymbolicLink(&link);
     if (driver->DeviceObject) IoDeleteDevice(driver->DeviceObject);
     if (g_ring) MmUnmapIoSpace(g_ring, HWGPU_RING_BYTES);
+    if (g_heap) MmUnmapIoSpace(g_heap, (SIZE_T)HW_HEAP_SIZE);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
@@ -151,6 +266,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     pa.QuadPart = (LONGLONG)(HW_WINDOW_PA + HWGPU_RING_OFF);
     g_ring = MmMapIoSpace(pa, HWGPU_RING_BYTES, MmCached);
     if (!g_ring) return STATUS_INSUFFICIENT_RESOURCES;
+    /* The heap is optional: firmware or an app from before it leaves Windows without it, and
+     * mapped GPU memory is then copied as before. */
+    pa.QuadPart = (LONGLONG)HW_HEAP_PA;
+    g_heap = MmMapIoSpace(pa, (SIZE_T)HW_HEAP_SIZE, MmCached);
     ExInitializeFastMutex(&g_lock);
 
     UNICODE_STRING name, link;

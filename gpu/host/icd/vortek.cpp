@@ -16,6 +16,7 @@
 // BC textures: Vortek decodes BC1 to BC5 on the CPU. bcn_layer, loaded under this wrapper,
 // decodes BC1 to BC7 on the GPU instead (see bcn.cpp for why copy2 is turned into copy).
 #include <string.h>
+#include <android/log.h>
 
 #include <algorithm>
 #include <mutex>
@@ -131,18 +132,37 @@ void fake_features(VkPhysicalDeviceFeatures* f) {
     f->shaderImageGatherExtended = f->variableMultisampleRate = f->dualSrcBlend = f->imageCubeArray = VK_TRUE;
     f->drawIndirectFirstInstance = f->fragmentStoresAndAtomics = f->multiDrawIndirect = VK_TRUE;
     f->tessellationShader = VK_TRUE;
+    // Not Vortek's: DXVK refuses a device without geometry shaders, which PanVK on Valhall does not
+    // report. Games that use them still fail; the many that do not, run. (Mali's own driver has them.)
+    f->geometryShader = VK_TRUE;
 }
 
 // --- instance-level hooks ---
 
+// Zink (OpenGL in Windows) gets the driver as it is: it turns on whatever it is told exists, and
+// the driver then refuses the device. Everything else gets Vortek's changes.
+bool stretches(VkPhysicalDevice pd) { return engine_of(pd).id != kEngineZink; }
+
 VKAPI_ATTR void VKAPI_CALL get_features(VkPhysicalDevice pd, VkPhysicalDeviceFeatures* f) {
     NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceFeatures)(pd, f);
-    fake_features(f);
+    if (stretches(pd)) fake_features(f);
 }
 
 VKAPI_ATTR void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2* f) {
     NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceFeatures2)(pd, f);
+    if (!stretches(pd)) return;
     fake_features(&f->features);
+    // DXVK 2 and later refuse a device without robustBufferAccess2, which Mali lacks while it has
+    // the rest of VK_EXT_robustness2. Without it, out-of-range reads still stay inside the buffer
+    // (robustBufferAccess) but need not return zero. GameNative's Mali wrapper reports it the same way.
+    if (auto* r2 = static_cast<VkPhysicalDeviceRobustness2FeaturesEXT*>(const_cast<void*>(
+            find_struct(f->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT))))
+        r2->robustBufferAccess2 = r2->robustImageAccess2 = VK_TRUE;
+    // Direct3D 12 needs instance step rate 0, which Mali lacks; pipelines get the largest divisor
+    // instead (zero_divisor), so every instance reads the first element as long as there are fewer.
+    if (auto* dv = static_cast<VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR*>(const_cast<void*>(
+            find_struct(f->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR))))
+        dv->vertexAttributeInstanceRateZeroDivisor |= dv->vertexAttributeInstanceRateDivisor;
 }
 
 void clamp_heaps(VkPhysicalDeviceMemoryProperties* mp, void* chain) {
@@ -167,7 +187,16 @@ VKAPI_ATTR void VKAPI_CALL get_memory_properties2(VkPhysicalDevice pd, VkPhysica
 }
 
 VKAPI_ATTR void VKAPI_CALL get_properties2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2* p) {
-    NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceProperties2)(pd, p);
+    auto real = NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceProperties2);
+    real(pd, p);
+    if (auto* ext = static_cast<VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT*>(const_cast<void*>(
+            find_struct(p->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT)));
+        ext && !ext->maxVertexAttribDivisor) {
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR khr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 again{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &khr};
+        real(pd, &again);
+        ext->maxVertexAttribDivisor = khr.maxVertexAttribDivisor;
+    }
     if (engine_of(pd).id != kEngineVKD3D) return;
     if (auto* v11 = static_cast<VkPhysicalDeviceVulkan11Properties*>(const_cast<void*>(
             find_struct(p->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES))))
@@ -181,22 +210,39 @@ VKAPI_ATTR void VKAPI_CALL get_properties2(VkPhysicalDevice pd, VkPhysicalDevice
 
 VKAPI_ATTR void VKAPI_CALL get_format_properties(VkPhysicalDevice pd, VkFormat format, VkFormatProperties* fp) {
     NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceFormatProperties)(pd, format, fp);
-    if (isFormatScaled(format)) fp->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+    if (stretches(pd) && isFormatScaled(format)) fp->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
 }
 
 VKAPI_ATTR void VKAPI_CALL get_format_properties2(VkPhysicalDevice pd, VkFormat format, VkFormatProperties2* fp) {
     NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceFormatProperties2)(pd, format, fp);
-    if (!isFormatScaled(format)) return;
+    if (!stretches(pd) || !isFormatScaled(format)) return;
     fp->formatProperties.bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
     if (auto* fp3 = static_cast<VkFormatProperties3*>(
             const_cast<void*>(find_struct(fp->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3))))
         fp3->bufferFeatures |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
 }
 
+bool driver_has(VkPhysicalDevice pd, const char* ext) {
+    auto real = NEXT_I(wrap::instance_of(pd), vkEnumerateDeviceExtensionProperties);
+    uint32_t n = 0;
+    real(pd, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> all(n);
+    real(pd, nullptr, &n, all.data());
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(all[i].extensionName, ext)) return true;
+    return false;
+}
+
+// vkd3d-proton asks for VK_EXT_vertex_attribute_divisor, which Mali only has under its Vulkan 1.4
+// name, VK_KHR_vertex_attribute_divisor. Same features and pipeline structs; only the properties
+// struct differs, and get_properties2 fills that one.
+constexpr const char* kDivisorExt = "VK_EXT_vertex_attribute_divisor";
+constexpr const char* kDivisorKhr = "VK_KHR_vertex_attribute_divisor";
+
 VKAPI_ATTR VkResult VKAPI_CALL enumerate_device_extensions(VkPhysicalDevice pd, const char* layer, uint32_t* count,
                                                            VkExtensionProperties* props) {
     auto real = NEXT_I(wrap::instance_of(pd), vkEnumerateDeviceExtensionProperties);
-    if (layer) return real(pd, layer, count, props);
+    if (layer || !stretches(pd)) return real(pd, layer, count, props);
     uint32_t n = 0;
     VkResult r = real(pd, nullptr, &n, nullptr);
     if (r != VK_SUCCESS) return r;
@@ -207,6 +253,15 @@ VKAPI_ATTR VkResult VKAPI_CALL enumerate_device_extensions(VkPhysicalDevice pd, 
     auto hide = hidden_extensions(pd);
     all.erase(std::remove_if(all.begin(), all.end(), [&](const VkExtensionProperties& e) { return hide.count(e.extensionName); }),
               all.end());
+    auto has = [&](const char* name) {
+        return std::any_of(all.begin(), all.end(), [&](const VkExtensionProperties& e) { return !strcmp(e.extensionName, name); });
+    };
+    if (stretches(pd) && has(kDivisorKhr) && !has(kDivisorExt)) {
+        VkExtensionProperties e{};
+        strcpy(e.extensionName, kDivisorExt);
+        e.specVersion = 3;
+        all.push_back(e);
+    }
     if (!props) {
         *count = uint32_t(all.size());
         return VK_SUCCESS;
@@ -230,9 +285,10 @@ ShaderInspector* inspector_of(VkDevice dev) {
 VKAPI_ATTR VkResult VKAPI_CALL create_shader_module(VkDevice dev, const VkShaderModuleCreateInfo* info,
                                                     const VkAllocationCallbacks* alloc, VkShaderModule* out) {
     ShaderInspector* si = inspector_of(dev);
+    if (!si) return NEXT_D(dev, vkCreateShaderModule)(dev, info, alloc, out);  // a device Vortek leaves alone
     ShaderModule* m = nullptr;
     VkResult r;
-    if (!si || info->pNext) {
+    if (info->pNext) {
         // Built as asked, but still behind a ShaderModule so every handle is the same kind.
         m = static_cast<ShaderModule*>(calloc(1, sizeof(ShaderModule)));
         r = NEXT_D(dev, vkCreateShaderModule)(dev, info, alloc, &m->module);
@@ -251,6 +307,7 @@ VKAPI_ATTR VkResult VKAPI_CALL create_shader_module(VkDevice dev, const VkShader
 
 VKAPI_ATTR void VKAPI_CALL destroy_shader_module(VkDevice dev, VkShaderModule handle, const VkAllocationCallbacks* alloc) {
     if (!handle) return;
+    if (!inspector_of(dev)) return NEXT_D(dev, vkDestroyShaderModule)(dev, handle, alloc);
     auto* m = reinterpret_cast<ShaderModule*>(handle);
     if (m->module) NEXT_D(dev, vkDestroyShaderModule)(dev, m->module, alloc);
     free(m->code);
@@ -265,7 +322,29 @@ struct StageFix {
     std::vector<VkShaderModule> built;          // modules made for this pipeline only
     std::vector<VkVertexInputAttributeDescription> attrs;
     VkPipelineVertexInputStateCreateInfo vertex_input{};
+    VkPipelineVertexInputDivisorStateCreateInfoKHR divisor{};
+    std::vector<VkVertexInputBindingDivisorDescriptionKHR> divisors;
 };
+
+// What stands in for a divisor of 0 on this device: 0 when the driver takes 0 itself.
+uint32_t zero_divisor(VkDevice dev) {
+    static std::unordered_map<VkDevice, uint32_t> known;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        if (auto it = known.find(dev); it != known.end()) return it->second;
+    }
+    VkPhysicalDevice pd = wrap::physical_of(dev);
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f};
+    NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceFeatures2)(pd, &f2);
+    VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p};
+    NEXT_I(wrap::instance_of(pd), vkGetPhysicalDeviceProperties2)(pd, &p2);
+    uint32_t v = f.vertexAttributeInstanceRateZeroDivisor ? 0 : std::max(p.maxVertexAttribDivisor, 1u);
+    std::lock_guard<std::mutex> l(g_lock);
+    known[dev] = v;
+    return v;
+}
 
 VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderStageCreateInfo* in, uint32_t n,
                     const VkPipelineVertexInputStateCreateInfo* vi, StageFix* fix) {
@@ -275,6 +354,17 @@ VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderSta
         fix->vertex_input = *vi;
         fix->attrs.assign(vi->pVertexAttributeDescriptions, vi->pVertexAttributeDescriptions + vi->vertexAttributeDescriptionCount);
         fix->vertex_input.pVertexAttributeDescriptions = fix->attrs.data();
+        auto* d = static_cast<const VkPipelineVertexInputDivisorStateCreateInfoKHR*>(
+            find_struct(vi->pNext, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR));
+        uint32_t zero = d && d == vi->pNext ? zero_divisor(dev) : 0;
+        if (zero) {
+            fix->divisor = *d;
+            fix->divisors.assign(d->pVertexBindingDivisors, d->pVertexBindingDivisors + d->vertexBindingDivisorCount);
+            for (auto& b : fix->divisors)
+                if (!b.divisor) b.divisor = zero;
+            fix->divisor.pVertexBindingDivisors = fix->divisors.data();
+            fix->vertex_input.pNext = &fix->divisor;
+        }
     }
     std::vector<VkPipelineShaderStageCreateInfo> inspected;
     std::vector<uint32_t> index;
@@ -394,6 +484,16 @@ void on_instance(VkInstance inst, const VkInstanceCreateInfo* info) {
 
 // Vortek's disableUnsupportedDeviceFeatures: drop what fake_features reported but the driver lacks.
 void patch_device_create(VkPhysicalDevice pd, VkDeviceCreateInfo* info) {
+    static thread_local std::vector<const char*> names;
+    names.assign(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
+    for (auto& n : names)
+        if (!strcmp(n, kDivisorExt) && !driver_has(pd, kDivisorExt)) n = kDivisorKhr;
+    // The renamed one may now be there twice.
+    for (size_t i = 0; i < names.size(); i++)
+        for (size_t j = i + 1; j < names.size();)
+            if (!strcmp(names[i], names[j])) names.erase(names.begin() + j); else j++;
+    info->enabledExtensionCount = uint32_t(names.size());
+    info->ppEnabledExtensionNames = names.data();
     VkPhysicalDeviceFeatures have{};
     NEXT_I(instance_of(pd), vkGetPhysicalDeviceFeatures)(pd, &have);
     static thread_local VkPhysicalDeviceFeatures enabled;
@@ -405,6 +505,23 @@ void patch_device_create(VkPhysicalDevice pd, VkDeviceCreateInfo* info) {
                    const_cast<void*>(find_struct(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)))) {
         want = &f2->features;  // gfxstream's own copy of the guest's request
     }
+    // The robustness2 features get_features2 reported, dropped where the driver lacks them.
+    if (auto* r2 = static_cast<VkPhysicalDeviceRobustness2FeaturesEXT*>(const_cast<void*>(
+            find_struct(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT)))) {
+        VkPhysicalDeviceRobustness2FeaturesEXT real{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &real};
+        NEXT_I(instance_of(pd), vkGetPhysicalDeviceFeatures2)(pd, &f2);
+        r2->robustBufferAccess2 &= real.robustBufferAccess2;
+        r2->robustImageAccess2 &= real.robustImageAccess2;
+        r2->nullDescriptor &= real.nullDescriptor;
+    }
+    if (auto* dv = static_cast<VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR*>(const_cast<void*>(
+            find_struct(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR)))) {
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR real{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &real};
+        NEXT_I(instance_of(pd), vkGetPhysicalDeviceFeatures2)(pd, &f2);
+        dv->vertexAttributeInstanceRateZeroDivisor &= real.vertexAttributeInstanceRateZeroDivisor;
+    }
     if (!want) return;
     auto* w = reinterpret_cast<VkBool32*>(want);
     auto* h = reinterpret_cast<const VkBool32*>(&have);
@@ -413,6 +530,7 @@ void patch_device_create(VkPhysicalDevice pd, VkDeviceCreateInfo* info) {
 }
 
 void on_device(VkPhysicalDevice pd, VkDevice dev, const VkDeviceCreateInfo*) {
+    if (!stretches(pd)) return;  // no inspector: shaders and pipelines go straight through
     Engine e = engine_of(pd);
     VkContext ctx{driver_of(pd), e.id, e.version};
     VkPhysicalDeviceFeatures have{};

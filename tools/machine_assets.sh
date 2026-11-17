@@ -31,9 +31,17 @@ $SIGN -in "$WIN/scream/Install/driver/arm64/scream.cat" -out "$OUT/guest/audio/s
 [ -f "$ROOT/gpu/work/direct/hwgpu.sys" ] || sh "$ROOT/gpu/guest/direct/build.sh"
 [ -f "$ROOT/gpu/work/out/vulkan_hwgpu.dll" ] || bash "$ROOT/gpu/guest/mesa/build.sh"
 [ -f "$ROOT/gpu/work/out/vulkan-1.dll" ] || bash "$ROOT/gpu/guest/loader/build.sh"
+[ -f "$ROOT/gpu/work/out/dx/zink/opengl32.dll" ] || bash "$ROOT/gpu/guest/dx/build.sh"
+[ -f "$ROOT/gpu/work/out/dx/test/gltest-x64.exe" ] || bash "$ROOT/gpu/guest/dx/test/build.sh"
 mkdir -p "$OUT/guest/gpu"
 cp "$ROOT/gpu/work/direct/hwgpu.sys" "$ROOT/gpu/work/out/vulkan_hwgpu.dll" "$ROOT/gpu/work/out/vulkan_hwgpu.json" \
-   "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$OUT/guest/gpu/"
+   "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vktest-x64.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$OUT/guest/gpu/"
+# DXVK, vkd3d-proton and Zink, which use.cmd puts beside a program (Send To in Explorer).
+cp -R "$ROOT/gpu/work/out/dx" "$OUT/guest/gpu/"
+perl -pe 's/\r?\n/\r\n/' "$ROOT/gpu/guest/dx/use.cmd" > "$OUT/guest/gpu/dx/use.cmd"
+# The app compares this with C:\HyperWin\gpu\stamp.txt and sends the files again when they differ.
+STAMP=$(cd "$OUT/guest/gpu" && find . -type f | LC_ALL=C sort | xargs shasum | shasum | cut -c1-16)
+printf '%s\r\n' "$STAMP" > "$OUT/guest/gpu/stamp.txt"
 # guest/ lands in C:\HyperWin. Batch files need CRLF line ends.
 for f in "$ROOT"/tools/offline/guest/*.cmd; do
   perl -pe 's/\r?\n/\r\n/' "$f" > "$OUT/guest/$(basename "$f")"

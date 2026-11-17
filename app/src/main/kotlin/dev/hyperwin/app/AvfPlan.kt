@@ -16,7 +16,16 @@ object AvfPlan {
     const val WINDOW_SIZE_MIB = WINDOW_SIZE / (1024 * 1024)
     const val RAM_BASE_PA = 0x8000_0000L
     const val WINDOWS_MEMORY_MIB = 3072
-    const val WINDOWS_VM_MEMORY_MIB = WINDOWS_MEMORY_MIB + WINDOW_SIZE_MIB
+    /**
+     * GPU memory Windows programs map directly, shared with the renderer (include/hw_abi.h,
+     * HW_HEAP_*): a second region right below the window. The VM gets this much more memory, so
+     * Windows keeps what the machine asks for.
+     */
+    const val HEAP_SIZE_MIB = 512
+    const val HEAP_SIZE = HEAP_SIZE_MIB * 1024 * 1024
+    /** Memory the VM needs beyond what Windows itself gets: the window and the GPU heap. */
+    const val SHARED_MIB = WINDOW_SIZE_MIB + HEAP_SIZE_MIB
+    const val WINDOWS_VM_MEMORY_MIB = WINDOWS_MEMORY_MIB + SHARED_MIB
     const val WINDOW_GUARD_BELOW_TOP_MIB = 16
     /** Default guest frame size. A machine may ask for another; see include/hw_abi.h for the limits. */
     const val FRAME_WIDTH = 1280
@@ -34,6 +43,7 @@ object AvfPlan {
         width in 640..4096 && height in 480..2304 && 0x1000000L + 2L * width * height * 4 <= 0x7f00000L
     /** Keep the ring inside UEFI conventional RAM, with room below its top boundary. */
     const val WINDOW_PA = RAM_BASE_PA + (WINDOWS_MEMORY_MIB - WINDOW_SIZE_MIB - WINDOW_GUARD_BELOW_TOP_MIB).toLong() * 1024 * 1024
+    const val HEAP_PA = WINDOW_PA - HEAP_SIZE.toLong()
     const val VSOCK_PORT = 5601
 
     fun stageUnattended(ctx: Context): File {
@@ -67,13 +77,20 @@ object AvfPlan {
             android.os.Build.MANUFACTURER, android.os.Build.MODEL,
             soc.firstOrNull().orEmpty(), soc.joinToString(" "),
         )
+        val pfd = fdOf(shm)
+        val link = runCatching { Os.readlink("/proc/self/fd/${pfd.fd}") }.getOrDefault("?")
+        // Zero until the renderer hands parts of it out; pages are only real once touched.
+        val heap = SharedMemory.create("hyperwin-gpu", HEAP_SIZE)
+        return SharedWindow(shm, map, pfd, link, heap, fdOf(heap))
+    }
+
+    private fun fdOf(shm: SharedMemory): ParcelFileDescriptor {
         val parcel = android.os.Parcel.obtain()
         shm.writeToParcel(parcel, 0)
         parcel.setDataPosition(0)
         val pfd = parcel.readFileDescriptor()
         parcel.recycle()
-        val link = runCatching { Os.readlink("/proc/self/fd/${pfd.fd}") }.getOrDefault("?")
-        return SharedWindow(shm, map, pfd, link)
+        return pfd
     }
 
     /** Top clock of the phone's fastest core, in MHz. */
@@ -107,12 +124,14 @@ object AvfPlan {
                     val vmConfig = requireNotNull(args?.firstOrNull())
                     val rawConfig = vmConfig.javaClass.getMethod("getRawConfig").invoke(vmConfig)
                     val backingClass = Class.forName("android.system.virtualizationservice.CustomMemoryBackingFile")
-                    val backings = java.lang.reflect.Array.newInstance(backingClass, 1)
-                    val backing = backingClass.getDeclaredConstructor().newInstance()
-                    backingClass.getField("file").set(backing, window.fd.dup())
-                    backingClass.getField("rangeStart").setLong(backing, WINDOW_PA)
-                    backingClass.getField("size").setLong(backing, WINDOW_SIZE.toLong())
-                    java.lang.reflect.Array.set(backings, 0, backing)
+                    val backings = java.lang.reflect.Array.newInstance(backingClass, 2)
+                    fun backing(fd: ParcelFileDescriptor, start: Long, size: Long) = backingClass.getDeclaredConstructor().newInstance().also {
+                        backingClass.getField("file").set(it, fd.dup())
+                        backingClass.getField("rangeStart").setLong(it, start)
+                        backingClass.getField("size").setLong(it, size)
+                    }
+                    java.lang.reflect.Array.set(backings, 0, backing(window.fd, WINDOW_PA, WINDOW_SIZE.toLong()))
+                    java.lang.reflect.Array.set(backings, 1, backing(window.heapFd, HEAP_PA, HEAP_SIZE.toLong()))
                     rawConfig.javaClass.getField("customMemoryBackingFiles").set(rawConfig, backings)
                     invokeBinderMethod(method, original, args)
                 }
@@ -156,11 +175,15 @@ object AvfPlan {
         val buffer: ByteBuffer,
         val fd: ParcelFileDescriptor,
         val link: String,
+        val heap: SharedMemory,
+        val heapFd: ParcelFileDescriptor,
     ) {
         fun close() {
             runCatching { SharedMemory.unmap(buffer) }
             runCatching { fd.close() }
             runCatching { memory.close() }
+            runCatching { heapFd.close() }
+            runCatching { heap.close() }
         }
     }
 }

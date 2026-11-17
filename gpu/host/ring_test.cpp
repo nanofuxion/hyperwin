@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
                               : STREAM_RENDERER_FLAGS_USE_VK_BIT | STREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT;
     g_window = static_cast<uint8_t*>(calloc(1, HW_WINDOW_SIZE));
     CHECK(g_window, "window");
-    CHECK(hwgpu_host_start(g_window, HW_WINDOW_SIZE, flags, 256, 256) == 0, "hwgpu_host_start");
+    CHECK(hwgpu_host_start(g_window, HW_WINDOW_SIZE, nullptr, 0, flags, 256, 256) == 0, "hwgpu_host_start");
 
     Guest a;
     sgpu_hello hello{H(SGPU_CMD_HELLO), SGPU_VERSION, 0};

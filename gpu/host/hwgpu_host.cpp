@@ -18,10 +18,15 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <mutex>
 #include <thread>
+#include <time.h>
+#include <sched.h>
+#include <sys/prctl.h>
 #include <vector>
 
 #include "gfxstream/virtio-gpu-gfxstream-renderer.h"
+#include "gfxstream/virtio-gpu-gfxstream-renderer-unstable.h"
 #include "hw_abi.h"
 #include "hwgpu_ring.h"
 #include "sgpu_proto.h"
@@ -47,12 +52,80 @@ struct Mapping {
     uint8_t* hva = nullptr;
     uint64_t size = 0;
     std::vector<uint8_t> last;  // contents at the last SGPU_CMD_SYNC
+    int grant = -1;             // in the shared heap: the channel's grant entry; nothing to sync
 };
 
 struct Slot {
     uint32_t generation = 0;  // the connection being served, 0 for none
     std::set<uint32_t> resources, contexts;
+    // Heap ranges a process still had mapped when this renderer started: kept from reuse until
+    // that process lets go of its channel.
+    std::vector<std::pair<uint64_t, uint64_t>> quarantined;
 };
+
+// The shared heap (HW_HEAP_PA in the guest): host-visible Vulkan memory gfxstream allocates
+// through gfxstream_set_host_memory_allocator comes from here, so Windows maps it directly.
+uint8_t* g_heap = nullptr;
+uint64_t g_heap_size = 0;
+std::mutex g_heap_lock;
+std::map<uint64_t, uint64_t> g_heap_free, g_heap_used;  // offset -> size
+
+constexpr uint64_t kHeapPage = 4096;
+
+void heap_put(uint64_t off, uint64_t size) {  // g_heap_lock held
+    auto next = g_heap_free.lower_bound(off);
+    if (next != g_heap_free.end() && off + size == next->first) {
+        size += next->second;
+        next = g_heap_free.erase(next);
+    }
+    if (next != g_heap_free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == off) {
+            prev->second += size;
+            return;
+        }
+    }
+    g_heap_free[off] = size;
+}
+
+bool heap_take(uint64_t off, uint64_t size) {  // g_heap_lock held: carve a known range out
+    auto it = g_heap_free.upper_bound(off);
+    if (it == g_heap_free.begin()) return false;
+    --it;
+    uint64_t start = it->first, len = it->second;
+    if (off < start || off + size > start + len) return false;
+    g_heap_free.erase(it);
+    if (off > start) g_heap_free[start] = off - start;
+    if (start + len > off + size) g_heap_free[off + size] = start + len - off - size;
+    return true;
+}
+
+void* heap_alloc(size_t alignment, size_t size) {
+    if (!g_heap) return nullptr;
+    alignment = std::max<size_t>(alignment, kHeapPage);
+    size = (size + kHeapPage - 1) & ~(kHeapPage - 1);
+    std::lock_guard<std::mutex> l(g_heap_lock);
+    for (auto& [off, len] : g_heap_free) {
+        uint64_t at = (off + alignment - 1) & ~uint64_t(alignment - 1);
+        if (at + size > off + len) continue;
+        heap_take(at, size);
+        g_heap_used[at] = size;
+        return g_heap + at;
+    }
+    return nullptr;  // full: gfxstream falls back to private memory, kept in step as before
+}
+
+int heap_release(void* p) {
+    auto* b = static_cast<uint8_t*>(p);
+    if (!g_heap || b < g_heap || b >= g_heap + g_heap_size) return 0;
+    std::lock_guard<std::mutex> l(g_heap_lock);
+    auto it = g_heap_used.find(uint64_t(b - g_heap));
+    if (it != g_heap_used.end()) {
+        heap_put(it->first, it->second);
+        g_heap_used.erase(it);
+    }
+    return 1;
+}
 
 uint8_t* g_window = nullptr;
 bool g_inited = false;
@@ -62,6 +135,12 @@ std::vector<vgpu_resp_capset_info> g_capsets;
 std::map<uint32_t, Backing> g_backing;
 std::map<uint32_t, Mapping> g_maps;
 Slot g_slots[HWGPU_CHANNELS];
+
+uint64_t now_ns() {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+}
 
 void* chan_base(uint32_t slot) { return g_window + hwgpu_chan_off(slot); }
 
@@ -85,6 +164,7 @@ bool g_trace = false;
 
 bool reply(const Link& l, const vgpu_hdr& req, uint32_t type) {
     if (type >= 0x1200) LOG("request 0x%x on channel %u refused: 0x%x", req.type, l.slot, type);
+    if (req.flags & SGPU_FLAG_NO_REPLY) return true;  // the guest did not wait for one
     vgpu_hdr h{};
     h.type = type;
     h.ctx_id = req.ctx_id;
@@ -126,8 +206,20 @@ bool alloc_backing(uint32_t res, size_t size, iovec* iov) {
     return true;
 }
 
+void clear_grant(uint32_t slot, int grant) {
+    if (grant < 0) return;
+    auto* c = hwgpu_chan_ctl(chan_base(slot));
+    __atomic_store_n(&c->grant[grant].size, 0, __ATOMIC_RELEASE);
+    c->grant[grant].offset = 0;
+}
+
 void drop_resource(Slot& s, uint32_t res) {
-    if (g_maps.erase(res)) stream_renderer_resource_unmap(res);
+    auto m = g_maps.find(res);
+    if (m != g_maps.end()) {
+        clear_grant(uint32_t(&s - g_slots), m->second.grant);
+        g_maps.erase(m);
+        stream_renderer_resource_unmap(res);
+    }
     stream_renderer_resource_unref(res);
     g_backing.erase(res);
     s.resources.erase(res);
@@ -139,6 +231,14 @@ void drop_slot(Slot& s) {
     for (auto c : s.contexts) stream_renderer_context_destroy(c);
     s.contexts.clear();
     s.generation = 0;
+    if (!s.quarantined.empty()) {
+        std::lock_guard<std::mutex> l(g_heap_lock);
+        for (auto [off, size] : s.quarantined) heap_put(off, size);
+        s.quarantined.clear();
+    }
+    auto* c = hwgpu_chan_ctl(chan_base(uint32_t(&s - g_slots)));
+    for (uint32_t i = 0; i < HWGPU_GRANTS; i++) clear_grant(uint32_t(&s - g_slots), int(i));
+    (void)c;
 }
 
 template <typename T>
@@ -330,9 +430,32 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         if (g_maps.count(c->resource_id) || stream_renderer_resource_map(c->resource_id, &hva, &size) || !hva)
             return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
         stream_renderer_resource_map_info(c->resource_id, &info);
-        g_maps[c->resource_id] = Mapping{static_cast<uint8_t*>(hva), size,
-                                         std::vector<uint8_t>(static_cast<uint8_t*>(hva),
-                                                              static_cast<uint8_t*>(hva) + size)};
+        auto* b = static_cast<uint8_t*>(hva);
+        if (g_heap && b >= g_heap && b + size <= g_heap + g_heap_size && (uint64_t(b - g_heap) & (kHeapPage - 1)) == 0) {
+            // In the shared heap: grant the range to this channel, and Windows maps it directly.
+            auto* ctl = hwgpu_chan_ctl(l.chan);
+            int g = -1;
+            for (uint32_t i = 0; i < HWGPU_GRANTS && g < 0; i++)
+                if (!__atomic_load_n(&ctl->grant[i].size, __ATOMIC_ACQUIRE)) g = int(i);
+            if (g >= 0) {
+                sgpu_resp_map_heap r{};
+                r.hdr.type = SGPU_RESP_OK_MAP_HEAP;
+                r.map_info = info;
+                r.offset = uint64_t(b - g_heap);
+                r.size = (size + kHeapPage - 1) & ~(kHeapPage - 1);
+                ctl->grant[g].offset = r.offset;
+                __atomic_store_n(&ctl->grant[g].size, r.size, __ATOMIC_RELEASE);
+                Mapping mp;
+                mp.hva = b;
+                mp.size = size;
+                mp.grant = g;
+                g_maps[c->resource_id] = std::move(mp);
+                return send_msg(l, &r, sizeof(r));
+            }
+        }
+        if (g_heap) LOG("resource %u: %llu bytes outside the shared heap, kept in step by copying", c->resource_id,
+                        (unsigned long long)size);
+        g_maps[c->resource_id] = Mapping{b, size, std::vector<uint8_t>(b, b + size)};
         vgpu_resp_map_info r{};
         r.hdr.type = VGPU_RESP_OK_MAP_INFO;
         r.map_info = info;
@@ -340,7 +463,10 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
     }
     case VGPU_CMD_RESOURCE_UNMAP_BLOB: {
         const auto* c = as<vgpu_resource_unref>(m);
-        if (!c || !g_maps.erase(c->resource_id)) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_RESOURCE_ID);
+        auto mi = c ? g_maps.find(c->resource_id) : g_maps.end();
+        if (mi == g_maps.end()) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_RESOURCE_ID);
+        clear_grant(l.slot, mi->second.grant);
+        g_maps.erase(mi);
         stream_renderer_resource_unmap(c->resource_id);
         break;
     }
@@ -361,6 +487,25 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         return send_msg(l, &r, sizeof(r), span, c->len);
     }
     case SGPU_CMD_SYNC: {
+        // Every 5 s: how much mapped memory the syncs walked, and how long they took.
+        static uint64_t st_calls, st_pull, st_scan, st_in, st_out, st_ns, st_last;
+        const uint64_t t0 = now_ns();
+        struct Stat {
+            uint64_t t0;
+            ~Stat() {
+                st_ns += now_ns() - t0;
+                if (st_ns && now_ns() - st_last > 5000000000ull) {
+                    LOG("sync: %llu calls (%llu pull), walked %llu MB, in %llu KB, out %llu KB, %llu ms",
+                        (unsigned long long)st_calls, (unsigned long long)st_pull, (unsigned long long)(st_scan >> 20),
+                        (unsigned long long)(st_in >> 10), (unsigned long long)(st_out >> 10),
+                        (unsigned long long)(st_ns / 1000000));
+                    st_calls = st_pull = st_scan = st_in = st_out = st_ns = 0;
+                    st_last = now_ns();
+                }
+            }
+        } stat{t0};
+        st_calls++;
+        st_in += m.size();
         // Guest changes first, so the host's diff below leaves them out.
         size_t at = sizeof(vgpu_hdr);
         while (at + sizeof(sgpu_sync_entry) <= m.size()) {
@@ -368,7 +513,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
             memcpy(&e, m.data() + at, sizeof(e));
             at += sizeof(e);
             auto it = g_maps.find(e.resource_id);
-            if (!own_res(l, e.resource_id) || at + e.len > m.size() || it == g_maps.end() ||
+            if (!own_res(l, e.resource_id) || at + e.len > m.size() || it == g_maps.end() || it->second.grant >= 0 ||
                 e.offset > it->second.size || e.len > it->second.size - e.offset)
                 return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
             memcpy(it->second.hva + e.offset, m.data() + at, e.len);
@@ -378,10 +523,13 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         std::vector<uint8_t> out(sizeof(vgpu_hdr));
         reinterpret_cast<vgpu_hdr*>(out.data())->type = SGPU_RESP_SYNC;
         if (hdr->flags & SGPU_SYNC_PULL) {
+            st_pull++;
             for (auto res : slot.resources) {
                 auto mi = g_maps.find(res);
                 if (mi == g_maps.end()) continue;
                 Mapping& mp = mi->second;
+                if (mp.grant >= 0) continue;  // shared: nothing to copy
+                st_scan += mp.size;
                 size_t off = 0;
                 while (off < mp.size) {
                     if (out.size() >= SGPU_SYNC_CHUNK) {
@@ -407,6 +555,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
                 }
             }
         }
+        st_out += out.size();
         return send_msg(l, out.data(), out.size());
     }
     case SGPU_CMD_PRESENT: {
@@ -506,6 +655,12 @@ bool serve_one(uint32_t i) {
 void serve_loop() {
     hwgpu_ring_hdr* h = hwgpu_hdr(g_window);
     uint32_t misses = 0;
+    // Requests come in bursts while a program draws, each one waiting on the last answer. For
+    // 200 us after the last request the loop only yields, so the next is seen within microseconds;
+    // after that it sleeps with growing pauses, so a phone's cores are not kept busy (and hot) for
+    // nothing. Sleeps are as asked, not rounded up by timer slack.
+    prctl(PR_SET_TIMERSLACK, 1);
+    uint64_t last = 0;
     while (g_run.load(std::memory_order_relaxed)) {
         __atomic_add_fetch(&h->host_tick, 1, __ATOMIC_RELAXED);
         bool busy = false, open = false;
@@ -515,6 +670,9 @@ void serve_loop() {
         }
         if (busy) {
             misses = 0;
+            last = now_ns();
+        } else if (open && now_ns() - last < 200000ull) {
+            sched_yield();
         } else if (open) {
             hwgpu_backoff(&misses);
         } else {
@@ -525,11 +683,21 @@ void serve_loop() {
 
 }  // namespace
 
-int hwgpu_host_start(void* window, size_t window_bytes, uint32_t renderer_flags, uint32_t width,
-                     uint32_t height) {
+extern "C" void gfxstream_set_host_memory_allocator(void* (*alloc)(size_t, size_t), int (*release)(void*));
+
+int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_bytes, uint32_t renderer_flags,
+                     uint32_t width, uint32_t height) {
     if (!window || window_bytes < HWGPU_RING_OFF + HWGPU_RING_BYTES) return -EINVAL;
     if (g_run.load()) return -EBUSY;
     g_trace = getenv("HWGPU_TRACE") != nullptr;
+    if (heap && heap_bytes && !g_heap) {
+        g_heap = static_cast<uint8_t*>(heap);
+        g_heap_size = heap_bytes & ~(kHeapPage - 1);
+        g_heap_free.clear();
+        g_heap_used.clear();
+        g_heap_free[0] = g_heap_size;
+        gfxstream_set_host_memory_allocator(heap_alloc, heap_release);
+    }
     if (!g_inited) {
         // See SweetCider's tools/gfxstream-android/android.patch: one thread serves every guest
         // stream, so pipe reads must not block, and each guest thread gets a pipe of its own.
@@ -542,6 +710,9 @@ int hwgpu_host_start(void* window, size_t window_bytes, uint32_t renderer_flags,
             {STREAM_RENDERER_PARAM_DEBUG_CALLBACK, reinterpret_cast<uintptr_t>(&on_debug)},
             {STREAM_RENDERER_PARAM_WIN0_WIDTH, width},
             {STREAM_RENDERER_PARAM_WIN0_HEIGHT, height},
+            // Host-visible memory from the shared heap (heap_alloc), imported with VK_EXT_external_memory_host.
+            {STREAM_RENDERER_PARAM_RENDERER_FEATURES,
+             reinterpret_cast<uintptr_t>(g_heap ? "VulkanAllocateHostMemory:enabled" : "")},
         };
         int err = stream_renderer_init(p, sizeof(p) / sizeof(p[0]));
         if (err) {
@@ -564,10 +735,32 @@ int hwgpu_host_start(void* window, size_t window_bytes, uint32_t renderer_flags,
     }
 
     g_window = static_cast<uint8_t*>(window);
-    memset(g_window + HWGPU_RING_OFF, 0, 0x1000);
+    // A new boot's window is all zeros. A renderer restarted under a running Windows (another
+    // Vulkan driver, or the last renderer crashed) finds channels the old one served: what they
+    // made died with it, so they are marked dropped and their processes get errors. Channels still
+    // waiting for their first answer are served as new. The guest owns each channel's state until
+    // it closes it, so nothing is wiped.
     for (uint32_t i = 0; i < HWGPU_CHANNELS; i++) {
-        memset(chan_base(i), 0, HWGPU_CTL_BYTES);
-        hwgpu_chan_ctl(chan_base(i))->slot = i;
+        hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(i));
+        g_slots[i] = Slot{};
+        // A process may still have heap ranges mapped from the last renderer: keep them out of
+        // use until it lets go of the channel, and let it map no more.
+        for (uint32_t g = 0; g < HWGPU_GRANTS; g++) {
+            uint64_t size = __atomic_load_n(&c->grant[g].size, __ATOMIC_ACQUIRE), off = c->grant[g].offset;
+            if (!size) continue;
+            {
+                std::lock_guard<std::mutex> hl(g_heap_lock);
+                if (g_heap && off <= g_heap_size && size <= g_heap_size - off && heap_take(off, size))
+                    g_slots[i].quarantined.emplace_back(off, size);
+            }
+            clear_grant(i, int(g));
+        }
+        if (__atomic_load_n(&c->guest_state, __ATOMIC_ACQUIRE) == HWGPU_CONNECTED &&
+            __atomic_load_n(&c->host_state, __ATOMIC_ACQUIRE) == HWGPU_HOST_READY) {
+            g_slots[i].generation = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
+            LOG("channel %u was open before this renderer, dropping it", i);
+        }
     }
     hwgpu_ring_hdr* h = hwgpu_hdr(g_window);
     h->version = HWGPU_VERSION;

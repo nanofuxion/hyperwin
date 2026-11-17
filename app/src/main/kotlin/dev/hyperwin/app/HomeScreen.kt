@@ -3,8 +3,11 @@ package dev.hyperwin.app
 import android.app.ActivityManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.ColorStateList
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import com.google.android.material.button.MaterialButton
@@ -27,6 +30,7 @@ class HomeScreen(
         fun forceStop()
         fun showLogs()
         fun reinstall()
+        fun importDriver()
     }
 
     private val title = Ui.text(ctx, M.attr.textAppearanceDisplaySmall)
@@ -73,7 +77,7 @@ class HomeScreen(
         settings.removeAllViews()
         if (machine == null) return
         showSpecs(machine)
-        listOf(display(machine), input(), network(machine), performance(machine), startup(), advanced(running)).forEach {
+        listOf(display(machine), graphics(), input(), network(machine), performance(machine), startup(), advanced(running)).forEach {
             settings.addView(it, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP))
         }
         restartNote.visibility = if (running) View.VISIBLE else View.GONE
@@ -123,6 +127,134 @@ class HomeScreen(
             shaped(720) to "Phone shape, small", "1280x720" to "Classic")
             .filter { (size, _) -> size.split('x').let { AvfPlan.validFrame(it[0].toInt(), it[1].toInt()) } }
             .distinctBy { it.first }
+    }
+
+    /**
+     * The Vulkan stack the GPU renders with, top first: fixes, which stack and can be reordered, over
+     * the one driver that is on. Changes apply at once, even while Windows runs. Drivers added from
+     * files have a remove button; the built-in entries do not.
+     */
+    private fun graphics(): View {
+        val list = HwGpu.stack(ctx).toMutableList()
+        fun signature() = list.filter { it.on }.map { it.id }
+        var applied = signature()
+        fun apply() {
+            HwGpu.saveStack(ctx, list)
+            if (signature() == applied) return
+            applied = signature()
+            HwGpu.restart()
+            if (HwGpu.running) setStatus("GPU restarted with ${HwGpu.describe(ctx)}. Programs using it need to start again.")
+        }
+        val box = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        lateinit var render: () -> Unit
+
+        fun row(e: HwGpu.Entry): LinearLayout = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = ctx.dp(64)
+            setPadding(ctx.dp(8), ctx.dp(6), ctx.dp(8), ctx.dp(6))
+            setBackgroundColor(themeColor(M.attr.colorSurfaceContainer))
+            val row = this
+            addView(ImageView(ctx).apply {
+                setImageResource(R.drawable.ic_drag)
+                imageTintList = ColorStateList.valueOf(themeColor(M.attr.colorOnSurfaceVariant))
+                contentDescription = "Drag ${e.label} up or down"
+                setPadding(ctx.dp(12), ctx.dp(12), ctx.dp(12), ctx.dp(12))
+                setOnTouchListener(dragHandle(row, box, list) { apply() })
+            }, LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
+            val summary = when (e.id) {
+                "vortek" -> "Winlator's fixes for Mali. Needed by DXVK and vkd3d-proton on Mali. Includes BC textures."
+                "bcn" -> "Decodes compressed BC textures the driver lacks."
+                HwGpu.PHONE -> "This phone's own driver."
+                else -> "A driver added from a file."
+            }
+            addView(Ui.column(ctx,
+                Ui.text(ctx, M.attr.textAppearanceBodyLarge, value = e.label),
+                Ui.text(ctx, M.attr.textAppearanceBodyMedium, M.attr.colorOnSurfaceVariant, (if (e.fix) "Fix. " else "Driver. ") + summary),
+            ), LinearLayout.LayoutParams(0, Ui.WRAP, 1f).apply { marginStart = ctx.dp(4); marginEnd = ctx.dp(8) })
+            addView(Ui.switch(ctx, e.on) { on ->
+                val at = list.indexOfFirst { it.id == e.id }
+                when {
+                    e.fix -> list[at] = list[at].copy(on = on)
+                    on -> list.replaceAll { if (it.fix) it else it.copy(on = it.id == e.id) }
+                    // A driver must stay on: the phone's takes over, and stays on by itself.
+                    else -> list.replaceAll { if (it.fix) it else it.copy(on = it.id == HwGpu.PHONE) }
+                }
+                post { render() }
+                apply()
+            }.apply { contentDescription = "${e.label} on" })
+            if (e.builtIn) addView(View(ctx), LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
+            else addView(Ui.iconButton(ctx, R.drawable.ic_close, "Remove ${e.label}") {
+                MaterialAlertDialogBuilder(ctx)
+                    .setTitle("Remove ${e.label}?")
+                    .setMessage("You can add it again from its file later.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Remove") { _, _ ->
+                        HwGpu.deleteDriver(ctx, e.id)
+                        list.clear()
+                        list += HwGpu.stack(ctx)
+                        render()
+                        apply()
+                    }
+                    .show()
+            }, LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
+        }
+        render = {
+            box.removeAllViews()
+            list.forEach { box.addView(row(it), LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP)) }
+        }
+        render()
+        return Ui.section(ctx, "Graphics",
+            box,
+            Ui.row(ctx, "Add a driver file", "A Vulkan driver as a .so, or a .zip that holds one, such as Turnip or PanVK.", Ui.chevron(ctx)) {
+                actions.importDriver()
+            },
+            Ui.text(ctx, M.attr.textAppearanceBodySmall, M.attr.colorOnSurfaceVariant,
+                "Fixes that are on run top first, over the one driver that is on. Drag to reorder. " +
+                    "Changes apply at once. Programs using the GPU need to start again.").apply {
+                setPadding(ctx.dp(20), ctx.dp(4), ctx.dp(20), ctx.dp(12))
+            })
+    }
+
+    /**
+     * Drag by the handle: the row follows the finger and trades places with a neighbour once past
+     * its middle. Fixes only trade with fixes and drivers with drivers, since fixes always run on top.
+     */
+    private fun dragHandle(row: View, box: LinearLayout, list: MutableList<HwGpu.Entry>, done: () -> Unit): View.OnTouchListener {
+        var lastY = 0f
+        return View.OnTouchListener { handle, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    handle.parent.requestDisallowInterceptTouchEvent(true)
+                    row.elevation = ctx.dp(6).toFloat()
+                    lastY = ev.rawY
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    row.translationY += ev.rawY - lastY
+                    lastY = ev.rawY
+                    val at = box.indexOfChild(row)
+                    val next = box.getChildAt(at + 1)
+                    val prev = box.getChildAt(at - 1)
+                    fun same(i: Int) = i in list.indices && list[i].fix == list[at].fix
+                    if (next != null && same(at + 1) && row.translationY > next.height / 2f) {
+                        java.util.Collections.swap(list, at, at + 1)
+                        box.removeView(next)
+                        box.addView(next, at)
+                        row.translationY -= next.height
+                    } else if (prev != null && same(at - 1) && row.translationY < -prev.height / 2f) {
+                        java.util.Collections.swap(list, at, at - 1)
+                        box.removeView(prev)
+                        box.addView(prev, at)
+                        row.translationY += prev.height
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    row.animate().translationY(0f).withEndAction { row.elevation = 0f }.start()
+                    done()
+                }
+            }
+            true
+        }
     }
 
     private fun input() = Ui.section(ctx, "Touch",

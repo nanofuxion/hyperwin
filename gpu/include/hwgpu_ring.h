@@ -25,7 +25,7 @@
  * debug marks at HW_FRAME_END (0x7f00000). */
 #define HWGPU_RING_OFF      0x6000000u
 #define HWGPU_MAGIC         0x474e495255504748ull /* "HGPURING" little endian */
-#define HWGPU_VERSION       1u
+#define HWGPU_VERSION       2u  /* 2: heap grants */
 #define HWGPU_CHANNELS      8u
 #define HWGPU_CTL_BYTES     0x1000u
 #define HWGPU_TX_BYTES      (2u << 20)  /* guest -> phone */
@@ -33,6 +33,7 @@
 #define HWGPU_CHAN_STRIDE   (HWGPU_CTL_BYTES + HWGPU_TX_BYTES + HWGPU_RX_BYTES)
 #define HWGPU_RING_BYTES    (0x1000u + HWGPU_CHANNELS * HWGPU_CHAN_STRIDE)
 #define HWGPU_FENCE_RINGS   64u
+#define HWGPU_GRANTS        128u  /* heap ranges one channel may map at once */
 
 _Static_assert(HWGPU_RING_OFF + HWGPU_RING_BYTES <= 0x7f00000u, "GPU rings end below the debug marks");
 
@@ -69,6 +70,9 @@ struct hwgpu_ctl {
     uint64_t rx_head;  /* phone publishes */
     uint64_t rx_tail;  /* guest consumes */
     uint64_t fence[HWGPU_FENCE_RINGS];  /* phone: last finished fence id per ring index */
+    /* phone: parts of the heap (HW_HEAP_PA) this channel's process may map, size 0 for unused.
+     * hwgpu.sys maps only a range that matches one exactly. */
+    struct { uint64_t offset, size; } grant[HWGPU_GRANTS];
 };
 
 _Static_assert(sizeof(struct hwgpu_ctl) <= HWGPU_CTL_BYTES, "control fits its page");
@@ -157,7 +161,22 @@ static inline size_t hwgpu_read_some(const uint8_t *data, uint32_t capacity, uin
 #ifndef HWGPU_KERNEL
 #ifdef _WIN32
 #include <windows.h>
-static inline void hwgpu_pause(unsigned us) { if (us >= 1000) Sleep(us / 1000); else SwitchToThread(); }
+/* Sleep() rounds up to the system timer, often 15.6 ms, so waits of a millisecond or more use a
+ * high-resolution timer, one per thread. */
+static inline void hwgpu_pause(unsigned us)
+{
+    static __thread HANDLE timer;
+    if (us < 1000) {
+        SwitchToThread();
+        return;
+    }
+    if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                               TIMER_ALL_ACCESS);
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)us * 10;
+    if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
+    else Sleep(us / 1000);
+}
 #else
 #include <unistd.h>
 static inline void hwgpu_pause(unsigned us) { usleep(us); }

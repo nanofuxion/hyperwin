@@ -29,16 +29,20 @@ __attribute__((weak)) void on_device(VkPhysicalDevice, VkDevice, const VkDeviceC
 __attribute__((weak)) void on_device_destroy(VkDevice) {}
 __attribute__((weak)) void patch_device_create(VkPhysicalDevice, VkDeviceCreateInfo*) {}
 
+// Set by a module's constructor: its own layer, used unless HWGPU_VK_LAYERS names others. Kept in
+// the module, not the environment, so wrappers stacked in one process each keep their own.
+// Plain arrays: module constructors may run before this file's C++ initializers.
+char g_default_layers[1024], g_default_gipa[64], g_default_gdpa[64];
+
 void default_bcn_layer(void* self) {
-    if (getenv("HWGPU_VK_LAYERS")) return;
     Dl_info info{};
     if (!dladdr(self, &info) || !info.dli_fname) return;
     std::string dir = info.dli_fname;
     dir = dir.substr(0, dir.rfind('/') + 1);
-    setenv("HWGPU_VK_LAYERS", (dir + "libbcn_layer.so").c_str(), 0);
+    snprintf(g_default_layers, sizeof(g_default_layers), "%slibbcn_layer.so", dir.c_str());
     // bcn_layer's own names for its entry points.
-    setenv("HWGPU_VK_LAYER_GIPA", "BCnLayer_GetInstanceProcAddr", 0);
-    setenv("HWGPU_VK_LAYER_GDPA", "BCnLayer_GetDeviceProcAddr", 0);
+    snprintf(g_default_gipa, sizeof(g_default_gipa), "BCnLayer_GetInstanceProcAddr");
+    snprintf(g_default_gdpa, sizeof(g_default_gdpa), "BCnLayer_GetDeviceProcAddr");
 }
 
 namespace {
@@ -89,7 +93,27 @@ bool load_layer(const std::string& entry);
 bool load() {
     static std::once_flag once;
     std::call_once(once, [] {
-        const char* path = getenv("HWGPU_VK_DRIVER");
+        // A stack of wrappers (HWGPU_VK_CHAIN, top first, ':' between): each opens the one after
+        // it, and the last one opens HWGPU_VK_DRIVER, or the phone's libvulkan.so.
+        std::string next, me;
+        Dl_info self{};
+        if (dladdr(reinterpret_cast<void*>(&load), &self) && self.dli_fname) {
+            me = self.dli_fname;
+            me = me.substr(me.rfind('/') + 1);
+        }
+        if (const char* chain = getenv("HWGPU_VK_CHAIN")) {
+            std::string all = chain;
+            std::vector<std::string> links;
+            for (size_t at = 0; at <= all.size();) {
+                size_t end = all.find(':', at);
+                if (end == std::string::npos) end = all.size();
+                links.push_back(all.substr(at, end - at));
+                at = end + 1;
+            }
+            for (size_t i = 0; i + 1 < links.size(); i++)
+                if (links[i] == me) next = links[i + 1];
+        }
+        const char* path = !next.empty() ? next.c_str() : getenv("HWGPU_VK_DRIVER");
         void* lib = dlopen(path && *path ? path : "libvulkan.so", RTLD_NOW | RTLD_LOCAL);
         if (!lib) {
             LOG("cannot open %s: %s", path ? path : "libvulkan.so", dlerror());
@@ -112,7 +136,13 @@ bool load() {
                 g_gipa = dev->GetInstanceProcAddr;
         }
         LOG("driver %s: %s", path && *path ? path : "libvulkan.so", g_gipa ? "loaded" : "no entry point");
-        if (const char* layers = getenv("HWGPU_VK_LAYERS")) {
+        const char* env_layers = getenv("HWGPU_VK_LAYERS");
+        std::string layers = env_layers ? env_layers : g_default_layers;
+        // bcn_layer is one library per process, so it runs once: in the BC textures wrapper when the
+        // stack has one, else in the first wrapper that wants it.
+        const char* stack = getenv("HWGPU_VK_CHAIN");
+        if (!env_layers && stack && strstr(stack, "libvulkan_bcn.so") && me != "libvulkan_bcn.so") layers.clear();
+        if (!layers.empty()) {
             std::string all = layers;
             for (size_t at = 0; at <= all.size();) {
                 size_t end = all.find(':', at);
@@ -139,8 +169,10 @@ bool load_layer(const std::string& entry) {
     // A bare library uses the standard names unless HWGPU_VK_LAYER_GIPA/GDPA name others.
     const char* g_env = getenv("HWGPU_VK_LAYER_GIPA");
     const char* d_env = getenv("HWGPU_VK_LAYER_GDPA");
-    std::string lib = entry, gipa_name = g_env ? g_env : "vkGetInstanceProcAddr",
-                gdpa_name = d_env ? d_env : "vkGetDeviceProcAddr";
+    const bool own = !getenv("HWGPU_VK_LAYERS");  // the module's default layer, with its own names
+    std::string lib = entry,
+                gipa_name = own && *g_default_gipa ? g_default_gipa : g_env ? g_env : "vkGetInstanceProcAddr",
+                gdpa_name = own && *g_default_gdpa ? g_default_gdpa : d_env ? d_env : "vkGetDeviceProcAddr";
     if (entry.size() > 5 && entry.compare(entry.size() - 5, 5, ".json") == 0) {
         std::string text;
         if (FILE* f = fopen(entry.c_str(), "r")) {
@@ -255,6 +287,13 @@ VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDevice
         chained.pNext = &data_info;
     }
     VkResult r = NEXT_I(inst, vkCreateDevice)(pd, &chained, alloc, out);
+    if (r != VK_SUCCESS) {
+        // What was asked for, to find the feature or extension the driver turned down.
+        std::string asked;
+        for (auto* s = static_cast<const VkBaseInStructure*>(info->pNext); s; s = s->pNext) asked += " " + std::to_string(s->sType);
+        for (uint32_t i = 0; i < chained.enabledExtensionCount; i++) asked += std::string(" ") + chained.ppEnabledExtensionNames[i];
+        LOG("vkCreateDevice failed (%d); structs and extensions:%s", r, asked.c_str());
+    }
     if (r != VK_SUCCESS) return r;
     // Device calls start at the top layer. Asking a layer's instance proc addr for
     // vkGetDeviceProcAddr would skip it.
@@ -342,10 +381,17 @@ PFN_vkVoidFunction wrapped(PFN_vkVoidFunction real, const char* name) {
     return real;
 }
 
+PFN_vkVoidFunction any_handle(const char* name);
+
 PFN_vkVoidFunction get_instance_proc_addr(VkInstance inst, const char* name) {
     if (!load() || !name) return nullptr;
-    // Layers keep per-instance tables, so global lookups (no instance) go to the driver,
-    // except instance creation, which the core sends down the chain itself.
+    // gfxstream also looks up instance and device calls with no instance, as a loader exports them,
+    // and calls them for every instance and device it has. A driver has nothing to give for those,
+    // so they get a stub that finds the right chain from the call's first handle.
+    if (!inst) {
+        PFN_vkVoidFunction real = g_gipa(nullptr, name);
+        if (!real && strncmp(name, "vkEnumerateInstance", 19) && strcmp(name, "vkCreateInstance")) return any_handle(name);
+    }
     return wrapped((inst ? top_gipa() : g_gipa)(inst, name), name);
 }
 
@@ -366,6 +412,92 @@ V lookup(const std::unordered_map<K, V>& m, K k) {
     std::lock_guard<std::mutex> l(g_lock);
     auto it = m.find(k);
     return it == m.end() ? V() : it->second;
+}
+
+// The stubs any_handle hands out: stub i saves the call's arguments, asks resolve_stub for the
+// function name i maps to on the first argument's chain, puts the arguments back and jumps there.
+constexpr int kStubs = 512;
+const char* g_stub_name[kStubs];
+int g_stubs_used;
+
+PFN_vkVoidFunction resolve_handle(void* handle, const char* name) {
+    VkDevice dev = VK_NULL_HANDLE;
+    VkInstance inst = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        if (g_gdpa.count(static_cast<VkDevice>(handle))) dev = static_cast<VkDevice>(handle);
+        else if (auto q = g_queue_dev.find(static_cast<VkQueue>(handle)); q != g_queue_dev.end()) dev = q->second;
+        else if (auto c = g_cmd_dev.find(static_cast<VkCommandBuffer>(handle)); c != g_cmd_dev.end()) dev = c->second;
+        else if (auto pd = g_pd_inst.find(static_cast<VkPhysicalDevice>(handle)); pd != g_pd_inst.end()) inst = pd->second;
+        else inst = static_cast<VkInstance>(handle);
+    }
+    return dev ? get_device_proc_addr(dev, name) : get_instance_proc_addr(inst, name);
+}
+
+extern "C" __attribute__((used, visibility("hidden"))) PFN_vkVoidFunction hwgpu_resolve_stub(void* handle, int i) {
+    PFN_vkVoidFunction fn = handle ? resolve_handle(handle, g_stub_name[i]) : nullptr;
+    if (!fn) __android_log_print(ANDROID_LOG_ERROR, "hwgpu", "wrapper: no %s for handle %p", g_stub_name[i], handle);
+    return fn;
+}
+
+extern "C" void hwgpu_stub0();
+#if defined(__aarch64__)
+// 8 bytes per stub: mov w16, #i; b common. common keeps x0-x7 and q0-q7, the argument registers.
+__asm__(R"(
+    .text
+    .p2align 3
+    .globl hwgpu_stub0
+    .hidden hwgpu_stub0
+hwgpu_stub0:
+    .set i, 0
+    .rept 512
+    mov w16, #i
+    b hwgpu_stub_common
+    .set i, i + 1
+    .endr
+hwgpu_stub_common:
+    stp x29, x30, [sp, #-208]!
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    stp q0, q1, [sp, #80]
+    stp q2, q3, [sp, #112]
+    stp q4, q5, [sp, #144]
+    stp q6, q7, [sp, #176]
+    str x8, [sp, #200]
+    mov w1, w16
+    bl hwgpu_resolve_stub
+    mov x17, x0
+    ldp x0, x1, [sp, #16]
+    ldp x2, x3, [sp, #32]
+    ldp x4, x5, [sp, #48]
+    ldp x6, x7, [sp, #64]
+    ldp q0, q1, [sp, #80]
+    ldp q2, q3, [sp, #112]
+    ldp q4, q5, [sp, #144]
+    ldp q6, q7, [sp, #176]
+    ldr x8, [sp, #200]
+    ldp x29, x30, [sp], #208
+    cbz x17, 1f
+    br x17
+1:  ret
+)");
+#endif
+
+PFN_vkVoidFunction any_handle(const char* name) {
+#if defined(__aarch64__)
+    std::lock_guard<std::mutex> l(g_lock);
+    for (int i = 0; i < g_stubs_used; i++)
+        if (!strcmp(g_stub_name[i], name)) return reinterpret_cast<PFN_vkVoidFunction>(reinterpret_cast<char*>(&hwgpu_stub0) + 8 * i);
+    if (g_stubs_used == kStubs) return nullptr;
+    g_stub_name[g_stubs_used] = strdup(name);
+    return reinterpret_cast<PFN_vkVoidFunction>(reinterpret_cast<char*>(&hwgpu_stub0) + 8 * g_stubs_used++);
+#else
+    (void)name;
+    return nullptr;
+#endif
 }
 
 }  // namespace

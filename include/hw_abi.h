@@ -16,6 +16,11 @@
 #ifndef HW_WINDOW_PA
 #define HW_WINDOW_PA 0x137000000ull
 #endif
+/* GPU memory Windows programs map directly (gpu/README.md): a second region shared with the phone,
+ * right below the window. The firmware keeps it from Windows like the window. The phone's GPU
+ * server hands it out; hwgpu.sys maps parts of it into the programs they belong to. */
+#define HW_HEAP_SIZE (512ull * 1024ull * 1024ull)
+#define HW_HEAP_PA (HW_WINDOW_PA - HW_HEAP_SIZE)
 /* Default frame size. The host may set any size from HW_MIN_* to HW_MAX_* in the header. */
 #define HW_WIDTH 1280u
 #define HW_HEIGHT 720u

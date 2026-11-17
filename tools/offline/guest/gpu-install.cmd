@@ -8,7 +8,22 @@ copy /y %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys
 sc query hwgpu >nul 2>&1 || sc create hwgpu type= kernel start= auto binPath= System32\drivers\hwgpu.sys DisplayName= "HyperWin GPU ring"
 sc config hwgpu start= auto
 sc start hwgpu
-rem Apps link to the Vulkan loader, which Windows does not ship. Keep one already installed.
-if not exist %SystemRoot%\System32\vulkan-1.dll copy /y %G%\vulkan-1.dll %SystemRoot%\System32\vulkan-1.dll
+rem Apps link to the Vulkan loader, which Windows does not ship. Keep one something else installed,
+rem and update ours (the marker says System32's copy came from here).
+if not exist %SystemRoot%\System32\vulkan-1.dll echo.> %G%\vulkan-1.ours
+if exist %G%\vulkan-1.ours copy /y %G%\vulkan-1.dll %SystemRoot%\System32\vulkan-1.dll
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
+rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).
+for /d %%u in (C:\Users\*) do if exist "%%u\AppData\Roaming\Microsoft\Windows\SendTo" call :sendto "%%u\AppData\Roaming\Microsoft\Windows\SendTo"
+call :sendto "C:\Users\Default\AppData\Roaming\Microsoft\Windows\SendTo"
+exit /b 0
+
+:sendto
+if not exist "%~1" mkdir "%~1"
+(echo @call %G%\dx\use.cmd dxvk %%*^& timeout /t 3 ^>nul)> "%~1\GPU - DXVK, Direct3D 8 to 11.cmd"
+(echo @call %G%\dx\use.cmd sarek %%*^& timeout /t 3 ^>nul)> "%~1\GPU - DXVK-Sarek, Direct3D 8 to 11.cmd"
+(echo @call %G%\dx\use.cmd vkd3d %%*^& timeout /t 3 ^>nul)> "%~1\GPU - vkd3d-proton, Direct3D 12.cmd"
+(echo @call %G%\dx\use.cmd zink %%*^& timeout /t 3 ^>nul)> "%~1\GPU - Zink, OpenGL.cmd"
+(echo @call %G%\dx\use.cmd off %%*^& timeout /t 3 ^>nul)> "%~1\GPU - Windows default.cmd"
+exit /b 0

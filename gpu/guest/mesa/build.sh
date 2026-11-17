@@ -1,6 +1,7 @@
 #!/bin/bash
-# Builds the Windows ARM64 Vulkan driver: Mesa's gfxstream encoder with the HyperWin ring backend
-# (windows.patch), plus vktest.exe, SweetCider's triangle check, to run inside Windows.
+# Builds the Windows Vulkan driver: Mesa's gfxstream encoder with the HyperWin ring backend
+# (windows.patch), plus vktest.exe, SweetCider's triangle check, to run inside Windows. The driver
+# is ARM64X (gpu/guest/arm64x): ARM64 apps and x64 apps under emulation both load it.
 #   gpu/guest/mesa/build.sh [workdir]
 # Output in gpu/work/out/: vulkan_hwgpu.dll, vulkan_hwgpu.json, vktest.exe.
 # Needs meson, ninja, mako, pyyaml, and llvm-mingw in build/third_party/win (tools/third_party).
@@ -21,30 +22,18 @@ fi
 mkdir -p "$SRC/src/gfxstream/guest/platform/windows/hwgpu"
 cp "$ROOT/gpu/include/"{hwgpu_ring.h,hwgpu_ioctl.h,sgpu_proto.h} "$SRC/src/gfxstream/guest/platform/windows/hwgpu/"
 
-cat > "$WORK/win-cross.ini" <<INI
-[binaries]
-c = '$T/aarch64-w64-mingw32-clang'
-cpp = '$T/aarch64-w64-mingw32-clang++'
-ar = '$T/llvm-ar'
-strip = '$T/llvm-strip'
-windres = '$T/aarch64-w64-mingw32-windres'
-[host_machine]
-system = 'windows'
-cpu_family = 'aarch64'
-cpu = 'armv8'
-endian = 'little'
-INI
+"$HERE/../arm64x/cross.sh" "$WORK/arm64x.ini"
 # --gc-sections and vk_util.c's SPIR-V helpers: see the vulkan/meson.build hunk in windows.patch.
-[ -d "$WORK/build" ] || meson setup "$WORK/build" "$SRC" --cross-file "$WORK/win-cross.ini" \
+[ -d "$WORK/build-x" ] || meson setup "$WORK/build-x" "$SRC" --cross-file "$WORK/arm64x.ini" \
   -Dvulkan-drivers=gfxstream -Dgallium-drivers= -Dplatforms=windows -Dglx=disabled -Degl=disabled \
   -Dgles1=disabled -Dgles2=disabled -Dopengl=false -Dllvm=disabled -Dvalgrind=disabled \
   -Dlibunwind=disabled -Dzstd=disabled -Dmicrosoft-clc=disabled -Dspirv-to-dxil=false \
-  -Dbuildtype=debugoptimized -Dc_link_args=-Wl,--gc-sections -Dcpp_link_args=-Wl,--gc-sections
-ninja -C "$WORK/build" src/gfxstream/guest/vulkan/libvulkan_gfxstream.dll
+  -Dbuildtype=debugoptimized "-Dc_link_args=['-static','-Wl,--gc-sections']" "-Dcpp_link_args=['-static','-Wl,--gc-sections']"
+ninja -C "$WORK/build-x" src/gfxstream/guest/vulkan/libvulkan_gfxstream.dll
 
 OUT=$WORK/out
 mkdir -p "$OUT" "$WORK/shim"
-"$T/llvm-strip" -o "$OUT/vulkan_hwgpu.dll" "$WORK/build/src/gfxstream/guest/vulkan/libvulkan_gfxstream.dll"
+"$T/llvm-strip" -o "$OUT/vulkan_hwgpu.dll" "$WORK/build-x/src/gfxstream/guest/vulkan/libvulkan_gfxstream.dll"
 # The loader finds it through HKLM\SOFTWARE\Khronos\Vulkan\Drivers, value = this file's path.
 cat > "$OUT/vulkan_hwgpu.json" <<'JSON'
 {
@@ -68,4 +57,8 @@ H
 VKTEST=$ROOT/../sweetcider-gpu/tools/gfxstream-guest/vktest
 "$T/aarch64-w64-mingw32-clang" -std=c11 -O1 -I"$WORK/shim" -I"$SRC/include" -I"$VKTEST" \
   -o "$OUT/vktest.exe" "$VKTEST/vktest.c"
+# The same check as an x64 program, which Windows runs under emulation: it loads the ARM64EC half
+# of the driver.
+"$T/x86_64-w64-mingw32-clang" -std=c11 -O1 -I"$WORK/shim" -I"$SRC/include" -I"$VKTEST" \
+  -o "$OUT/vktest-x64.exe" "$VKTEST/vktest.c"
 ls -la "$OUT"

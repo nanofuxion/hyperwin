@@ -69,6 +69,23 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     private val pickIso = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) setup?.onIsoPicked(uri)
     }
+    private val pickDriver = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        Thread {
+            val name = runCatching { HwGpu.importDriver(this, uri) }.getOrNull()
+            runOnUiThread {
+                if (name == null) {
+                    MaterialAlertDialogBuilder(this).setTitle("No driver found")
+                        .setMessage("Choose a Vulkan driver .so file, or a .zip that holds one.")
+                        .setPositiveButton("OK", null).show()
+                    return@runOnUiThread
+                }
+                HwGpu.useDriver(this, name)
+                HwGpu.restart()
+                if (screen == Screen.HOME) home.refresh(AvfLaunch.machine != null, status)
+            }
+        }.start()
+    }
     private val collapseToolbar = Runnable { showBar(false) }
     private val hideBooting = Runnable { booting.visibility = View.GONE }
 
@@ -457,6 +474,8 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             .setPositiveButton("Close", null)
             .show()
     }
+
+    override fun importDriver() = pickDriver.launch(arrayOf("application/octet-stream", "application/zip", "application/x-sharedlib", "*/*"))
 
     override fun reinstall() {
         replaceOldMachines = true

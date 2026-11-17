@@ -88,9 +88,11 @@
 #define SGPU_RESP_OK_DATA    0x1181u  /* vgpu_hdr, u32 len, len bytes */
 #define SGPU_RESP_SYNC       0x1182u  /* vgpu_hdr, sgpu_sync_entry list */
 #define SGPU_RESP_AGAIN      0x1183u  /* TRANSFER_FROM_HOST on a pipe: nothing to read yet */
+#define SGPU_RESP_OK_MAP_HEAP 0x1184u /* MAP_BLOB: sgpu_resp_map_heap, the blob lives in the shared heap */
 #define SGPU_EVT_FENCE       0x1190u  /* vgpu_hdr with fence_id, ctx_id, ring_idx */
 #define SGPU_SYNC_PULL       (1u << 8) /* SGPU_CMD_SYNC flag: reply with the host's changes */
 #define SGPU_SYNC_MORE       (1u << 9) /* SGPU_RESP_SYNC flag: more host changes, pull again */
+#define SGPU_FLAG_NO_REPLY   (1u << 12) /* request flag: answer nothing, not even an error (pipe writes) */
 #define SGPU_SYNC_CHUNK      (16u << 20) /* most change bytes either side puts in one message */
 #define SGPU_SYNC_PAGE       4096u
 
@@ -206,6 +208,16 @@ struct vgpu_resp_map_info {
 	struct vgpu_hdr hdr;
 	uint32_t map_info;
 	uint32_t padding;
+};
+
+/* The blob's memory is the heap range [offset, offset + size): map it (IOCTL_HWGPU_MAP) instead of
+ * keeping a copy in step. */
+struct sgpu_resp_map_heap {
+	struct vgpu_hdr hdr;
+	uint32_t map_info;
+	uint32_t padding;
+	uint64_t offset;
+	uint64_t size;
 };
 
 struct sgpu_hello {

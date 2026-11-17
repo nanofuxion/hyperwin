@@ -164,8 +164,12 @@ object GuestAgent {
                 val mhz = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(AvfPlan.hostCpuMhz()).array()
                 if (agentVersion >= 3 && AvfPlan.hostCpuMhz() > 0) send(CPU_MHZ, mhz, 4)
                 // The GPU driver files this app carries, against the ones on the Windows disk.
-                if (agentVersion >= VERSION) gpuCheck = exec("cmd /c mkdir C:\\HyperWin\\gpu 2>nul & " +
-                    "findstr /x /c:${MachinePrep.gpuStamp(appContext ?: return)} C:\\HyperWin\\gpu\\stamp.txt")
+                // The folders come first: file copies into Windows do not make them.
+                val c = appContext ?: return
+                val dirs = MachinePrep.gpuFiles(c).mapNotNull { it.substringBeforeLast('/', "").ifEmpty { null } }.toSet()
+                    .joinToString(" ") { it.replace('/', '\\') }
+                if (agentVersion >= VERSION) gpuCheck = exec("cmd /c (for %d in (. $dirs) do @mkdir C:\\HyperWin\\gpu\\%d 2>nul) & " +
+                    "findstr /x /c:${MachinePrep.gpuStamp(c)} C:\\HyperWin\\gpu\\stamp.txt")
             }
             PORTS -> {
                 val b = ByteBuffer.wrap(buf, 0, len).order(ByteOrder.LITTLE_ENDIAN)
@@ -211,7 +215,7 @@ object GuestAgent {
         gpuCheck = -1
         Thread {
             runCatching {
-                for (name in MachinePrep.GPU_FILES) push(ctx.assets.open("machine/guest/gpu/$name"), "C:\\HyperWin\\gpu\\$name")
+                for (name in MachinePrep.gpuFiles(ctx)) push(ctx.assets.open("machine/guest/gpu/$name"), "C:\\HyperWin\\gpu\\" + name.replace('/', '\\'))
                 push(ctx.assets.open("machine/guest/gpu-install.cmd"), "C:\\HyperWin\\gpu-install.cmd")
                 exec("cmd /c C:\\HyperWin\\gpu-install.cmd & (echo ${MachinePrep.gpuStamp(ctx)})> C:\\HyperWin\\gpu\\stamp.txt")
                 Log.i(TAG, "GPU drivers sent to Windows")

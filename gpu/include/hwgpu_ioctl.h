@@ -13,6 +13,20 @@
 /* CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS) */
 #define IOCTL_HWGPU_OPEN 0x00222400u
 
+/* Map a granted heap range into the caller (in: hwgpu_map_in, out: hwgpu_map_out), and unmap it
+ * again (in: hwgpu_map_out). Closing the handle unmaps whatever is left. */
+#define IOCTL_HWGPU_MAP   0x00222404u
+#define IOCTL_HWGPU_UNMAP 0x00222408u
+
+struct hwgpu_map_in {
+    uint64_t offset;      /* from the start of the heap */
+    uint64_t size;
+};
+
+struct hwgpu_map_out {
+    uint64_t user;        /* address in the caller */
+};
+
 struct hwgpu_open_out {
     uint64_t chan;        /* user address of the channel: control page, tx, rx */
     uint32_t slot;

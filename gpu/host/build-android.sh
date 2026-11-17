@@ -1,12 +1,13 @@
 #!/bin/bash
 # Builds libhwgpu.so (arm64) for the app: the ring server plus its JNI entry, linked to the
-# libgfxstream_backend.so that SweetCider builds with tools/gfxstream-android/build.sh.
-#   gpu/host/build-android.sh [gfxstream work dir]
+# libgfxstream_backend.so that build-gfxstream.sh builds (run first when missing).
+#   gpu/host/build-android.sh [gfxstream output dir]
 # Output: gpu/work/android/arm64-v8a/{libhwgpu.so,libgfxstream_backend.so,libc++_shared.so},
 # ready to drop into the app's jniLibs.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-GFX=${1:-$HERE/../../../sweetcider-gpu/tools/gfxstream-android/work}
+GFX=${1:-$HERE/../work/gfx-out}
+[ -f "$GFX/lib/arm64-v8a/libgfxstream_backend.so" ] || "$HERE/build-gfxstream.sh"
 NDK=${ANDROID_HOME:-$HOME/Library/Android/sdk}/ndk/27.2.12479018
 CXX=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android31-clang++
 OUT=$HERE/../work/android/arm64-v8a
@@ -15,7 +16,7 @@ mkdir -p "$OUT"
   -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/hwgpu_host.cpp" "$HERE/hwgpu_jni.cpp" \
   -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
   -o "$OUT/libhwgpu.so"
-cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/jni/arm64-v8a/libc++_shared.so" "$OUT/"
+cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"
 # ring_test for the phone's shell: adb push gpu/work/android/arm64-v8a /data/local/tmp/hwgpu, then
 # LD_LIBRARY_PATH=/data/local/tmp/hwgpu /data/local/tmp/hwgpu/ring_test
@@ -38,7 +39,8 @@ if [ ! -d "$BCN/.git" ]; then
   git init -q "$BCN"
   git -C "$BCN" fetch -q --depth 1 https://github.com/Pipetto-crypto/bcn_layer.git "$BCN_REV"
   git -C "$BCN" checkout -q FETCH_HEAD
-  # The features it strips at device creation lived in a block that had ended.
+  # The features it strips at device creation lived in a block that had ended, and only requests
+  # through pEnabledFeatures were stripped, not through VkPhysicalDeviceFeatures2 (Zink, DXVK).
   git -C "$BCN" apply "$HERE/icd/bcn_layer.patch"
 fi
 BCN_GEN=$HERE/../work/bcn-build
@@ -83,3 +85,6 @@ glslc -mfmt=num "$HERE/icd/scaled.vert" -o "$SHD/scaled.vert.inc"
 glslc -mfmt=num "$HERE/icd/scaled.frag" -o "$SHD/scaled.frag.inc"
 "$CXX" -std=c++17 -O1 -fPIE -pie -Wall -Wno-missing-field-initializers -DVK_NO_PROTOTYPES -I"$MESA_INC" -I"$SHD" \
   "$HERE/icd/scaledtest.cpp" -ldl -nostdlib++ -lc++_shared -o "$OUT/scaledtest"
+# A stand-in libhardware.so (icd/libhardware_stub.c), so drivers built as HAL modules load from the app.
+"$CC" -O2 -fPIC -shared -Wall -Wl,-soname,libhardware.so -Wl,-z,max-page-size=16384 \
+  "$HERE/icd/libhardware_stub.c" -o "$OUT/libhardware.so"

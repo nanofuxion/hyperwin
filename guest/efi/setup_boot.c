@@ -141,6 +141,11 @@ uint64_t SetupBootEntry(void *image, void *system)
             address = HW_WINDOW_PA + i;
             bs_fn(bs, 2)(2, 0, (2u * 1024u * 1024u) / 4096, (uint64_t)&address, 0, 0);
         }
+        /* The GPU heap below it (hw_abi.h) is the phone's too: keep it from Windows the same way. */
+        for (i = 0; i < HW_HEAP_SIZE; i += 2u * 1024u * 1024u) {
+            address = HW_HEAP_PA + i;
+            bs_fn(bs, 2)(2, 0, (2u * 1024u * 1024u) / 4096, (uint64_t)&address, 0, 0);
+        }
         paint(0);                 /* black, and byte-for-byte the frame the host starts with */
     }
     status = bs_fn(bs, 16)((uint64_t)image, (uint64_t)li_guid, (uint64_t)&loaded, 0, 0, 0);

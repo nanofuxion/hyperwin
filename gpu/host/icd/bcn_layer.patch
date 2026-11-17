@@ -1,8 +1,8 @@
 diff --git a/src/bcn_layer.cpp b/src/bcn_layer.cpp
-index 6536b4b..1332446 100644
+index 6536b4b..fce9e8c 100644
 --- a/src/bcn_layer.cpp
 +++ b/src/bcn_layer.cpp
-@@ -400,8 +400,9 @@ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
+@@ -400,11 +400,17 @@ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
  
      memoryIndex = idx < memoryProps.memoryTypeCount ? idx : UINT32_MAX;
  
@@ -13,3 +13,11 @@ index 6536b4b..1332446 100644
      	enabledFeatures.textureCompressionBC &= featuresMap[GetKey(physicalDevice)].textureCompressionBC;
      	createInfo.pEnabledFeatures = &enabledFeatures;
      }
++    // The same feature asked through VkPhysicalDeviceFeatures2, as Zink and DXVK ask.
++    for (VkBaseOutStructure* s = (VkBaseOutStructure*)createInfo.pNext; s; s = s->pNext) {
++    	if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
++    		((VkPhysicalDeviceFeatures2*)s)->features.textureCompressionBC &= featuresMap[GetKey(physicalDevice)].textureCompressionBC;
++    }
+ 
+     PFN_vkCreateDevice createDevice = (PFN_vkCreateDevice)gipa(instance, "vkCreateDevice");
+     result = createDevice(physicalDevice, &createInfo, pAllocator, pDevice);

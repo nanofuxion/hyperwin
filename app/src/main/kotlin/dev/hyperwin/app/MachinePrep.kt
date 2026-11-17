@@ -56,14 +56,17 @@ object MachinePrep {
         return report
     }
 
-    /** GPU files in machine/guest/gpu (tools/machine_assets.sh), installed by gpu-install.cmd. */
-    val GPU_FILES = listOf("hwgpu.sys", "vulkan_hwgpu.dll", "vulkan_hwgpu.json", "vktest.exe", "vulkan-1.dll")
+    /** GPU files under machine/guest/gpu (tools/machine_assets.sh), installed by gpu-install.cmd. */
+    fun gpuFiles(ctx: android.content.Context): List<String> {
+        fun walk(path: String): List<String> = ctx.assets.list("machine/guest/gpu$path").orEmpty().let { names ->
+            if (names.isEmpty()) listOf(path.removePrefix("/")) else names.flatMap { walk("$path/$it") }
+        }
+        return walk("").filter { it != "stamp.txt" }
+    }
 
-    /** Checksum of this app's GPU files; Windows keeps the one it has in C:\HyperWin\gpu\stamp.txt. */
-    fun gpuStamp(ctx: android.content.Context): Long = gpuStampCache ?: java.util.zip.CRC32().apply {
-        for (name in GPU_FILES) ctx.assets.open("machine/guest/gpu/$name").use { update(it.readBytes()) }
-    }.value.also { gpuStampCache = it }
-    private var gpuStampCache: Long? = null
+    /** Fingerprint of this app's GPU files; Windows keeps the one it has in C:\HyperWin\gpu\stamp.txt. */
+    fun gpuStamp(ctx: android.content.Context): String =
+        ctx.assets.open("machine/guest/gpu/stamp.txt").use { it.readBytes().decodeToString().trim() }
 
     private fun stageAssets(activity: Activity): File {
         val dir = File(activity.cacheDir, "prep-assets").apply { deleteRecursively(); mkdirs() }
@@ -74,9 +77,8 @@ object MachinePrep {
                 activity.assets.open(path).use { input -> dest.outputStream().use { input.copyTo(it) } }
             } else children.forEach { copy("$path/$it", File(dest, it)) }
         }
+        // A new machine gets the GPU at first boot (firstboot.cmd); its stamp.txt says it is current.
         copy("machine", dir)
-        // A new machine gets the GPU at first boot (firstboot.cmd); the stamp says it is current.
-        File(dir, "guest/gpu/stamp.txt").writeText("${gpuStamp(activity)}\r\n")
         return dir
     }
 }
