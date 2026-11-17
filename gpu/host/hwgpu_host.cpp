@@ -80,7 +80,11 @@ bool send_msg(const Link& l, const void* head, size_t head_len, const void* tail
            (!tail_len || hwgpu_write_all(l.chan, l.generation, 0, tail, tail_len));
 }
 
+// HWGPU_TRACE=1 in the environment logs every request; refusals are always logged.
+bool g_trace = false;
+
 bool reply(const Link& l, const vgpu_hdr& req, uint32_t type) {
+    if (type >= 0x1200) LOG("request 0x%x on channel %u refused: 0x%x", req.type, l.slot, type);
     vgpu_hdr h{};
     h.type = type;
     h.ctx_id = req.ctx_id;
@@ -99,7 +103,7 @@ void on_fence(void*, stream_renderer_fence* f) {
 }
 
 void on_debug(void*, stream_renderer_debug* d) {
-    if (d && d->message && d->debug_type <= STREAM_RENDERER_DEBUG_WARN) LOG("gfxstream: %s", d->message);
+    if (d && d->message && (g_trace || d->debug_type <= STREAM_RENDERER_DEBUG_WARN)) LOG("gfxstream: %s", d->message);
 }
 
 uint8_t* blob_span(uint32_t res, uint64_t off, uint32_t len) {
@@ -170,6 +174,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         if (!own_res(l, res)) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_RESOURCE_ID);
     }
 
+    if (g_trace) LOG("channel %u: request 0x%x ctx %u, %zu bytes", l.slot, hdr->type, hdr->ctx_id, m.size());
     switch (hdr->type) {
     case SGPU_CMD_HELLO: {
         sgpu_hello_resp r{};
@@ -524,6 +529,7 @@ int hwgpu_host_start(void* window, size_t window_bytes, uint32_t renderer_flags,
                      uint32_t height) {
     if (!window || window_bytes < HWGPU_RING_OFF + HWGPU_RING_BYTES) return -EINVAL;
     if (g_run.load()) return -EBUSY;
+    g_trace = getenv("HWGPU_TRACE") != nullptr;
     if (!g_inited) {
         // See SweetCider's tools/gfxstream-android/android.patch: one thread serves every guest
         // stream, so pipe reads must not block, and each guest thread gets a pipe of its own.

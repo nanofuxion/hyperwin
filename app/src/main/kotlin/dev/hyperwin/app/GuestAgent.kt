@@ -149,7 +149,10 @@ object GuestAgent {
         when (type) {
             PACKET -> net?.fromGuest(buf, len)
             EXEC_OUT -> String(buf, 4, len - 4).lines().forEach { if (it.isNotBlank()) Log.i(TAG, "out| ${it.trimEnd()}") }
-            EXEC_DONE -> Log.i(TAG, "exit ${le32(buf, 4)} (command ${le32(buf, 0)})")
+            EXEC_DONE -> {
+                Log.i(TAG, "exit ${le32(buf, 4)} (command ${le32(buf, 0)})")
+                if (le32(buf, 0) == gpuCheck && le32(buf, 4) != 0) syncGpu()
+            }
             FILE_RESULT -> Log.i(TAG, if (le32(buf, 0) == 1) "file written" else "file write failed")
             HELLO -> {
                 agentVersion = buf[0].toInt()
@@ -160,6 +163,9 @@ object GuestAgent {
                 exec("cmd /c bcdedit /set {current} recoveryenabled no & bcdedit /set {current} bootstatuspolicy ignoreallfailures")
                 val mhz = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(AvfPlan.hostCpuMhz()).array()
                 if (agentVersion >= 3 && AvfPlan.hostCpuMhz() > 0) send(CPU_MHZ, mhz, 4)
+                // The GPU driver files this app carries, against the ones on the Windows disk.
+                if (agentVersion >= VERSION) gpuCheck = exec("cmd /c mkdir C:\\HyperWin\\gpu 2>nul & " +
+                    "findstr /x /c:${MachinePrep.gpuStamp(appContext ?: return)} C:\\HyperWin\\gpu\\stamp.txt")
             }
             PORTS -> {
                 val b = ByteBuffer.wrap(buf, 0, len).order(ByteOrder.LITTLE_ENDIAN)
@@ -192,6 +198,27 @@ object GuestAgent {
         return id
     }
 
+    @Volatile private var gpuCheck = -1
+    private val pushLock = Any()
+
+    /**
+     * Brings Windows' GPU drivers up to this app's (machines made before the GPU, or by an older
+     * app): sends the files and runs gpu-install.cmd, which loads the ring driver and registers the
+     * Vulkan driver. New machines get them at setup and skip this.
+     */
+    private fun syncGpu() {
+        val ctx = appContext ?: return
+        gpuCheck = -1
+        Thread {
+            runCatching {
+                for (name in MachinePrep.GPU_FILES) push(ctx.assets.open("machine/guest/gpu/$name"), "C:\\HyperWin\\gpu\\$name")
+                push(ctx.assets.open("machine/guest/gpu-install.cmd"), "C:\\HyperWin\\gpu-install.cmd")
+                exec("cmd /c C:\\HyperWin\\gpu-install.cmd & (echo ${MachinePrep.gpuStamp(ctx)})> C:\\HyperWin\\gpu\\stamp.txt")
+                Log.i(TAG, "GPU drivers sent to Windows")
+            }.onFailure { Log.e(TAG, "GPU driver update failed", it) }
+        }.start()
+    }
+
     /** A machine made by an older app has an older agent: send ours and swap it in. Once per boot. */
     private fun updateAgent() {
         val ctx = appContext ?: return
@@ -209,7 +236,7 @@ object GuestAgent {
 
     fun push(local: File, guestPath: String) = push(local.inputStream(), guestPath)
 
-    fun push(source: java.io.InputStream, guestPath: String) {
+    fun push(source: java.io.InputStream, guestPath: String) = synchronized(pushLock) {
         val path = guestPath.toByteArray()
         send(FILE_OPEN, path, path.size)
         source.use { input ->

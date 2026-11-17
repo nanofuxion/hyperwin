@@ -109,30 +109,30 @@ gpu/host/test-mac.sh          # ring server + gfxstream on MoltenVK, prints PASS
 gpu/host/build-android.sh     # gpu/work/android/arm64-v8a/{libhwgpu,libgfxstream_backend,libc++_shared}.so
 gpu/guest/direct/build.sh     # gpu/work/direct/hwgpu.sys, test-signed
 gpu/guest/mesa/build.sh       # gpu/work/out/{vulkan_hwgpu.dll,vulkan_hwgpu.json,vktest.exe}
+gpu/guest/loader/build.sh     # gpu/work/out/vulkan-1.dll, the Khronos loader (Windows has none)
 ```
 
-## Not wired up yet
+## In the app
 
-The app does not load `libhwgpu.so`. It needs the three `.so` files in jniLibs, then, after
-`hw_window_init` and before the VM boots:
+`app/build.gradle.kts` packs `gpu/work/android/arm64-v8a` into the APK and runs `host/build-android.sh`
+first when `libhwgpu.so` is missing (it needs `../sweetcider-gpu` built). `HwGpu.kt` starts the
+renderer (Vulkan, surfaceless) before every VM boot and stops it when the VM exits. A build without
+the libraries still runs Windows, without a GPU.
 
-```kotlin
-object HwGpu {
-    init { System.loadLibrary("hwgpu") }
-    // flags: STREAM_RENDERER_FLAGS_USE_VK_BIT (0x8) | STREAM_RENDERER_FLAGS_USE_SURFACELESS_BIT (0x20)
-    @JvmStatic external fun nativeStart(window: java.nio.ByteBuffer, flags: Int, width: Int, height: Int): Int
-    @JvmStatic external fun nativeStop()
-}
-```
+Windows gets the guest side from the machine assets: `tools/machine_assets.sh` builds `hwgpu.sys`
+and `vulkan_hwgpu.dll` when missing and stages them, with `vulkan_hwgpu.json` and `vktest.exe`, in
+`machine/guest/gpu`, which machine prep copies to `C:\HyperWin\gpu`. `firstboot.cmd` runs
+`gpu-install.cmd`: it loads `hwgpu.sys` as an auto-start kernel service and registers the manifest
+under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`. On machines made before this, or by an older app,
+the app compares `C:\HyperWin\gpu\stamp.txt` with its own files when the guest agent connects,
+and sends and installs them when they differ.
 
-In Windows, as administrator:
+Check in Windows: `C:\HyperWin\gpu\vktest.exe C:\HyperWin\gpu\vulkan_hwgpu.dll`.
 
-```
-copy hwgpu.sys C:\Windows\System32\drivers\
-sc create hwgpu type= kernel start= auto binPath= System32\drivers\hwgpu.sys
-sc start hwgpu
-reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v C:\hwgpu\vulkan_hwgpu.json /t REG_DWORD /d 0
-C:\hwgpu\vktest.exe C:\hwgpu\vulkan_hwgpu.dll
-```
+Windows apps reach the driver through `vulkan-1.dll` (`guest/loader/build.sh`), which
+`gpu-install.cmd` puts in System32 when Windows has none. Windows frames reach the app's window by
+Mesa's win32 WSI in software mode: the guest has no DXGI device, so presents are GDI blits, and
+every present mode is offered since a blit shows at once (windows.patch).
 
-Nothing here has run inside Windows or on the phone yet.
+Verified on the Pixel 6 Pro, 2026-11-17: `vktest` PASS on "Virtio-GPU GFXStream (Mali-G78)", and
+the AIO Graphics Test's native Vulkan cube (`--cube vk`) spins at about 58 FPS.

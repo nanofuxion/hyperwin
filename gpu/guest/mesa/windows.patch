@@ -760,6 +760,35 @@ index 1f83396..e6d47d2 100644
 -    include_directories: [inc_platform_virtgpu, inc_src, inc_include],
 +    include_directories: [inc_platform_virtgpu, inc_src, inc_include, include_directories('hwgpu')],
  )
+diff --git a/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp b/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
+index cce4cf1..8e358c4 100644
+--- a/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
++++ b/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
+@@ -83,6 +83,9 @@ static const char* const kGuestEmulatedInstanceExtensions[] = {
+ #endif
+ #if defined(GFXSTREAM_VK_METAL)
+     VK_EXT_METAL_SURFACE_EXTENSION_NAME,
++#endif
++#if defined(_WIN32)
++    "VK_KHR_win32_surface",  /* Mesa's win32 WSI, presenting by GDI blit */
+ #endif
+     VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+ };
+diff --git a/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp b/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp
+index f45a199..9812aac 100644
+--- a/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp
++++ b/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp
+@@ -17,8 +17,9 @@ VkResult gfxstream_vk_wsi_init(struct gfxstream_vk_physical_device* physical_dev
+     VkResult result = (VkResult)0;
+ 
+     const struct wsi_device_options options = {
+-#if defined(GFXSTREAM_VK_METAL)
++#if defined(GFXSTREAM_VK_METAL) || defined(_WIN32)
+         // A host image cannot be bound to a Metal drawable; copy instead.
++        // Windows: no DXGI device in the guest, so frames reach the window by GDI blit.
+         .sw_device = true,
+ #else
+         .sw_device = false,
 diff --git a/src/gfxstream/guest/vulkan/meson.build b/src/gfxstream/guest/vulkan/meson.build
 index 8113832..aef3ef6 100644
 --- a/src/gfxstream/guest/vulkan/meson.build
@@ -936,3 +965,17 @@ index 5972142..2cdbbfa 100644
      MESA_TRACE_SCOPE("vkQueueSubmit2KHR");
      VkResult vkQueueSubmit2KHR_VkResult_return = (VkResult)0;
      auto vkEnc = gfxstream::vk::ResourceTracker::getQueueEncoder(queue);
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 0622857..98d1b61 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -401,6 +401,9 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+ }
+ 
+ static const VkPresentModeKHR present_modes_gdi[] = {
++   /* A GDI blit is shown at once, so every mode is the same here. Apps often ask for these. */
++   VK_PRESENT_MODE_IMMEDIATE_KHR,
++   VK_PRESENT_MODE_MAILBOX_KHR,
+    VK_PRESENT_MODE_FIFO_KHR,
+ };
+ static const VkPresentModeKHR present_modes_dxgi[] = {

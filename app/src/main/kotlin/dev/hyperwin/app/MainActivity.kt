@@ -392,8 +392,9 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                     status = "Windows is running."
                 } else if (report.startsWith("stopped") && AvfLaunch.lastStopWasReboot) {
                     startWindows(restart = true)
-                } else if (attempt < 2) {
-                    // Rarely the firmware faults right at power-on. A second try nearly always works.
+                } else if (attempt < 4) {
+                    // The firmware sometimes faults at power-on (ArmCpuDxe, splitting a live page
+                    // table entry under KVM), and sometimes twice running. A try costs about a second.
                     synchronized(console) { console.append("\n").append(report).append("\nTrying once more.\n") }
                     startWindows(restart, attempt + 1)
                 } else {

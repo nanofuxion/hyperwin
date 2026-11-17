@@ -47,6 +47,16 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 
+// The GPU renderer libraries (libhwgpu, libgfxstream_backend, libc++_shared) are built, not checked
+// in. Build them before the app when they are missing; see gpu/README.md for what the script needs.
+val gpuHostLibs by tasks.registering(Exec::class) {
+    val lib = rootProject.file("gpu/work/android/arm64-v8a/libhwgpu.so")
+    onlyIf { !lib.exists() }
+    workingDir = rootProject.projectDir
+    commandLine("bash", "gpu/host/build-android.sh")
+}
+tasks.named("preBuild") { dependsOn(gpuHostLibs) }
+
 dependencies {
     // Material Design 3 widgets and dynamic colour for the setup and settings screens.
     implementation("com.google.android.material:material:1.12.0")

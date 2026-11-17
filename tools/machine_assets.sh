@@ -26,6 +26,14 @@ cp "$WIN/scream/Install/driver/arm64/Scream.inf" "$OUT/guest/audio/"
 cp "$WIN/scream/Install/helpers/devcon-arm64.exe" "$OUT/guest/audio/devcon.exe"
 $SIGN -in "$WIN/scream/Install/driver/arm64/Scream.sys" -out "$OUT/guest/audio/Scream.sys" >/dev/null
 $SIGN -in "$WIN/scream/Install/driver/arm64/scream.cat" -out "$OUT/guest/audio/scream.cat" >/dev/null
+# GPU (gpu/README.md): the ring driver and the Vulkan driver Windows apps load. Built here when
+# missing; the Mesa build takes a while the first time.
+[ -f "$ROOT/gpu/work/direct/hwgpu.sys" ] || sh "$ROOT/gpu/guest/direct/build.sh"
+[ -f "$ROOT/gpu/work/out/vulkan_hwgpu.dll" ] || bash "$ROOT/gpu/guest/mesa/build.sh"
+[ -f "$ROOT/gpu/work/out/vulkan-1.dll" ] || bash "$ROOT/gpu/guest/loader/build.sh"
+mkdir -p "$OUT/guest/gpu"
+cp "$ROOT/gpu/work/direct/hwgpu.sys" "$ROOT/gpu/work/out/vulkan_hwgpu.dll" "$ROOT/gpu/work/out/vulkan_hwgpu.json" \
+   "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$OUT/guest/gpu/"
 # guest/ lands in C:\HyperWin. Batch files need CRLF line ends.
 for f in "$ROOT"/tools/offline/guest/*.cmd; do
   perl -pe 's/\r?\n/\r\n/' "$f" > "$OUT/guest/$(basename "$f")"

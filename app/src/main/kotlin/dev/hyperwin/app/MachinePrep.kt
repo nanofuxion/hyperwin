@@ -56,6 +56,15 @@ object MachinePrep {
         return report
     }
 
+    /** GPU files in machine/guest/gpu (tools/machine_assets.sh), installed by gpu-install.cmd. */
+    val GPU_FILES = listOf("hwgpu.sys", "vulkan_hwgpu.dll", "vulkan_hwgpu.json", "vktest.exe", "vulkan-1.dll")
+
+    /** Checksum of this app's GPU files; Windows keeps the one it has in C:\HyperWin\gpu\stamp.txt. */
+    fun gpuStamp(ctx: android.content.Context): Long = gpuStampCache ?: java.util.zip.CRC32().apply {
+        for (name in GPU_FILES) ctx.assets.open("machine/guest/gpu/$name").use { update(it.readBytes()) }
+    }.value.also { gpuStampCache = it }
+    private var gpuStampCache: Long? = null
+
     private fun stageAssets(activity: Activity): File {
         val dir = File(activity.cacheDir, "prep-assets").apply { deleteRecursively(); mkdirs() }
         fun copy(path: String, dest: File) {
@@ -66,6 +75,8 @@ object MachinePrep {
             } else children.forEach { copy("$path/$it", File(dest, it)) }
         }
         copy("machine", dir)
+        // A new machine gets the GPU at first boot (firstboot.cmd); the stamp says it is current.
+        File(dir, "guest/gpu/stamp.txt").writeText("${gpuStamp(activity)}\r\n")
         return dir
     }
 }
