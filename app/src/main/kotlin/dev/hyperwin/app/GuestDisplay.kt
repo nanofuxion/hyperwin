@@ -1,17 +1,20 @@
 package dev.hyperwin.app
 
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
+import android.view.Display
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import java.nio.ByteBuffer
+import android.view.View
 import java.util.concurrent.atomic.AtomicLong
 
-/** Presents the AVF-backed guest frame ring on the app's own SurfaceView. */
+/**
+ * Presents the AVF-backed guest frame on the app's own SurfaceView. The surface buffer has the
+ * guest's size and the phone's compositor scales it, so the view itself is kept at the guest's shape.
+ */
 class GuestDisplay(
     private val view: SurfaceView,
-    private val onStatus: (String) -> Unit,
+    /** Called once per start, when the guest first changes the picture after its initial frame. */
+    private val onLive: () -> Unit,
 ) {
     private val lock = Any()
     private val generation = AtomicLong(0)
@@ -22,9 +25,25 @@ class GuestDisplay(
     init {
         view.setSurfaceLifecycle(SurfaceView.SURFACE_LIFECYCLE_FOLLOWS_ATTACHMENT)
         view.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) = startIfReady()
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                // Ask for the panel's fastest rate; the render loop keeps the screen's actual pace.
+                bestMode(view.display)?.let {
+                    runCatching { holder.surface.setFrameRate(it.refreshRate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
+                }
+                WindowBridge.nativeSetSurface(holder.surface)
+                startIfReady()
+            }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
-            override fun surfaceDestroyed(holder: SurfaceHolder) = stop()
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                WindowBridge.nativeSetSurface(null)   // returns once no draw is in flight
+                stop()
+            }
+        })
+        view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                (v.parent as? View)?.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fit() }
+            }
+            override fun onViewDetachedFromWindow(v: View) = Unit
         })
     }
 
@@ -34,11 +53,8 @@ class GuestDisplay(
             running = true
             generation.incrementAndGet()
         }
-        if (sharedWindow == null) {
-            onStatus("AVF shared framebuffer is not attached.")
-        } else {
-            startIfReady()
-        }
+        refit()
+        if (sharedWindow != null) startIfReady()
     }
 
     fun vmStopped() {
@@ -54,6 +70,25 @@ class GuestDisplay(
     }
 
     fun saveFrame() = Unit
+
+    fun refit() { view.post { fit() } }
+
+    /** Sizes the view to the largest rectangle of the guest's shape that fits its parent, centred. */
+    private fun fit() {
+        val parent = view.parent as? View ?: return
+        val roomW = parent.width - parent.paddingLeft - parent.paddingRight
+        val roomH = parent.height - parent.paddingTop - parent.paddingBottom
+        if (roomW <= 0 || roomH <= 0) return
+        val scale = minOf(roomW.toFloat() / AvfPlan.frameWidth, roomH.toFloat() / AvfPlan.frameHeight)
+        val w = (AvfPlan.frameWidth * scale).toInt()
+        val h = (AvfPlan.frameHeight * scale).toInt()
+        val params = view.layoutParams as? android.widget.FrameLayout.LayoutParams ?: return
+        if (params.width == w && params.height == h) return
+        params.width = w
+        params.height = h
+        params.gravity = android.view.Gravity.CENTER
+        view.layoutParams = params
+    }
 
     private fun stop() {
         synchronized(lock) {
@@ -80,65 +115,36 @@ class GuestDisplay(
     }
 
     private fun render(sharedWindow: AvfPlan.SharedWindow, runGeneration: Long) {
-        val frame = ByteBuffer.allocateDirect(AvfPlan.FRAME_BYTES)
-        val bitmap = Bitmap.createBitmap(AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT, Bitmap.Config.ARGB_8888)
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-        var lastSequence = 0
-        var reportedFrame = false
-        val startTime = System.nanoTime()
+        var draws = 0
+        var passes = 0
+        var refreshHz = 60f
+        var nextFrame = System.nanoTime()
         try {
             while (isCurrent(runGeneration, sharedWindow)) {
-                if (!view.holder.surface.isValid) {
-                    Thread.sleep(25)
-                    continue
-                }
-                frame.clear()
-                val sequence = WindowBridge.nativeCopyFrame(sharedWindow.buffer, frame)
-                val gopFramebuffer = sequence == -2
-                if (gopFramebuffer || (sequence > 0 && sequence != lastSequence)) {
-                    frame.position(0)
-                    bitmap.copyPixelsFromBuffer(frame)
-                    draw(bitmap, paint)
-                    if (!gopFramebuffer) lastSequence = sequence
-                    if (!reportedFrame) {
-                        reportedFrame = true
-                        onStatus(if (gopFramebuffer) "UEFI GOP framebuffer is live." else "Shared framebuffer connected; guest sequence $sequence.")
-                    }
-                } else if (!reportedFrame && System.nanoTime() - startTime > 5_000_000_000L) {
-                    reportedFrame = true
-                    onStatus("Waiting for U-Boot/EFI or Windows to publish a frame.")
-                }
-                Thread.sleep(16)
+                if (passes++ % 120 == 0) refreshHz = view.display?.refreshRate?.takeIf { it >= 20f } ?: 60f
+                if (WindowBridge.nativePresent(sharedWindow.buffer) == 1 && ++draws == 2) onLive()
+                // One pass per screen refresh of the phone, less the time the pass took.
+                nextFrame = maxOf(nextFrame + (1_000_000_000L / refreshHz).toLong(), System.nanoTime() + 1_000_000L)
+                val wait = nextFrame - System.nanoTime()
+                Thread.sleep(wait / 1_000_000L, (wait % 1_000_000L).toInt())
             }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         } finally {
-            bitmap.recycle()
             if (renderThread === Thread.currentThread()) renderThread = null
         }
     }
 
-    private fun draw(bitmap: Bitmap, paint: Paint) {
-        val holder = view.holder
-        val canvas = runCatching { holder.lockCanvas() }.getOrNull() ?: return
-        try {
-            canvas.drawColor(0xff000000.toInt())
-            val dst = fitRect(canvas, bitmap.width, bitmap.height)
-            canvas.drawBitmap(bitmap, null, dst, paint)
-        } finally {
-            holder.unlockCanvasAndPost(canvas)
-        }
-    }
-
-    private fun fitRect(canvas: Canvas, width: Int, height: Int): android.graphics.RectF {
-        val scale = minOf(canvas.width.toFloat() / width, canvas.height.toFloat() / height)
-        val w = width * scale
-        val h = height * scale
-        val left = (canvas.width - w) / 2f
-        val top = (canvas.height - h) / 2f
-        return android.graphics.RectF(left, top, left + w, top + h)
-    }
-
     private fun isCurrent(expected: Long, sharedWindow: AvfPlan.SharedWindow): Boolean =
         running && generation.get() == expected && window === sharedWindow
+
+    companion object {
+        /** The fastest refresh rate the screen offers at its current resolution. */
+        fun bestMode(display: Display?): Display.Mode? {
+            val now = display?.mode ?: return null
+            return display.supportedModes
+                .filter { it.physicalWidth == now.physicalWidth && it.physicalHeight == now.physicalHeight }
+                .maxByOrNull { it.refreshRate }
+        }
+    }
 }

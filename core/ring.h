@@ -5,6 +5,8 @@
 #include "tpm2.h"
 
 void hw_window_init(void *window, size_t bytes);
+/* Frame size for the next boot; ignored when it does not fit the window. Call after hw_window_init. */
+void hw_window_set_mode(void *window, uint32_t width, uint32_t height);
 void hw_publish_frame(void *window, const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t stride);
 void hw_publish_audio(void *window, const int16_t *stereo, uint32_t frames);
 void hw_set_pad(void *window, uint32_t connected, uint32_t packet, uint16_t buttons,

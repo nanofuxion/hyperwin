@@ -34,4 +34,7 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 
-dependencies {}
+dependencies {
+    // Material Design 3 widgets and dynamic colour for the setup and settings screens.
+    implementation("com.google.android.material:material:1.12.0")
+}

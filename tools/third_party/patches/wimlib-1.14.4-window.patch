@@ -1,0 +1,109 @@
+diff -ru ../orig/wimlib-1.14.4/include/wimlib/file_io.h wimlib-1.14.4/include/wimlib/file_io.h
+--- ../orig/wimlib-1.14.4/include/wimlib/file_io.h	2023-07-22 19:55:59
++++ wimlib-1.14.4/include/wimlib/file_io.h	2026-11-16 21:04:10
+@@ -12,6 +12,7 @@
+ 	int fd;
+ 	unsigned int is_pipe : 1;
+ 	off_t offset;
++	off_t base;	/* HyperWin: file offset of byte 0 of a "hwwin:" window */
+ };
+ 
+ int
+@@ -40,6 +41,7 @@
+ {
+ 	fd->fd = raw_fd;
+ 	fd->offset = 0;
++	fd->base = 0;
+ 	fd->is_pipe = 0;
+ }
+ 
+diff -ru ../orig/wimlib-1.14.4/src/file_io.c wimlib-1.14.4/src/file_io.c
+--- ../orig/wimlib-1.14.4/src/file_io.c	2024-02-02 18:19:49
++++ wimlib-1.14.4/src/file_io.c	2026-11-16 21:04:10
+@@ -117,7 +117,7 @@
+ 		goto is_pipe;
+ 
+ 	while (count) {
+-		ssize_t ret = pread(fd->fd, buf, count, offset);
++		ssize_t ret = pread(fd->fd, buf, count, offset + fd->base);
+ 		if (unlikely(ret <= 0)) {
+ 			if (ret == 0) {
+ 				errno = EINVAL;
+@@ -199,7 +199,7 @@
+ 		return -1;
+ 	}
+ 	if (fd->offset != offset) {
+-		if (lseek(fd->fd, offset, SEEK_SET) == -1)
++		if (lseek(fd->fd, offset + fd->base, SEEK_SET) == -1)
+ 			return -1;
+ 		fd->offset = offset;
+ 	}
+diff -ru ../orig/wimlib-1.14.4/src/wim.c wimlib-1.14.4/src/wim.c
+--- ../orig/wimlib-1.14.4/src/wim.c	2024-02-02 18:19:49
++++ wimlib-1.14.4/src/wim.c	2026-11-16 21:04:27
+@@ -616,17 +616,32 @@
+ 	wim->progctx = progctx;
+ }
+ 
++/* HyperWin: "hwwin:OFFSET:SIZE:PATH" names the byte window [OFFSET,
++ * OFFSET+SIZE) of PATH, e.g. install.esd inside an unextracted ISO.  */
+ static int
+-open_wim_file(const tchar *filename, struct filedes *fd_ret)
++open_wim_file(const tchar *filename, struct filedes *fd_ret, u64 *window_size)
+ {
+ 	int raw_fd;
++	const tchar *path = filename;
++	long long base = 0, size = 0;
++	int used = 0;
+ 
+-	raw_fd = topen(filename, O_RDONLY | O_BINARY);
++	if (sscanf(filename, "hwwin:%lld:%lld:%n", &base, &size, &used) == 2 && used)
++		path = filename + used;
++	raw_fd = topen(path, O_RDONLY | O_BINARY);
+ 	if (raw_fd < 0) {
+ 		ERROR_WITH_ERRNO("Can't open \"%"TS"\" read-only", filename);
+ 		return WIMLIB_ERR_OPEN;
+ 	}
+ 	filedes_init(fd_ret, raw_fd);
++	if (used) {
++		fd_ret->base = base;
++		*window_size = size;
++		if (lseek(raw_fd, base, SEEK_SET) == -1) {
++			close(raw_fd);
++			return WIMLIB_ERR_READ;
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -648,12 +663,16 @@
+ 		struct stat stbuf;
+ 
+ 		wimfile = wim_filename_or_fd;
+-		ret = open_wim_file(wimfile, &wim->in_fd);
++		u64 window_size = 0;
++
++		ret = open_wim_file(wimfile, &wim->in_fd, &window_size);
+ 		if (ret)
+ 			return ret;
+ 
+ 		/* The file size is needed for enforcing some limits later. */
+-		if (fstat(wim->in_fd.fd, &stbuf) == 0)
++		if (window_size)
++			wim->file_size = window_size;
++		else if (fstat(wim->in_fd.fd, &stbuf) == 0)
+ 			wim->file_size = stbuf.st_size;
+ 
+ 		/* The absolute path to the WIM is requested so that
+@@ -668,7 +687,10 @@
+ 		 * Warning: in Windows native builds, realpath() calls the
+ 		 * replacement function in win32_replacements.c.
+ 		 */
+-		wim->filename = realpath(wimfile, NULL);
++		if (window_size)
++			wim->filename = STRDUP(wimfile);
++		else
++			wim->filename = realpath(wimfile, NULL);
+ 		if (!wim->filename) {
+ 			ERROR_WITH_ERRNO("Failed to get full path to file "
+ 					 "\"%"TS"\"", wimfile);

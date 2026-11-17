@@ -53,6 +53,9 @@ static const struct efi_guid simple_text_output_guid = {
 /* The shared window is BGRA in memory: EFI's BlueGreenRedReserved enum is 1. */
 static struct gop_info mode_info = {0, HW_WIDTH, HW_HEIGHT, 1, 0, 0, 0, 0, HW_WIDTH};
 static struct gop_mode mode = {1, 0, &mode_info, sizeof(mode_info), 0, HW_WIDTH * HW_HEIGHT * 4u};
+/* The host picks the frame size (the phone's own, or smaller) and writes it into the header. */
+#define FB_WIDTH ((uint64_t)mode_info.width)
+#define FB_HEIGHT ((uint64_t)mode_info.height)
 static struct gop_protocol protocol;
 static struct gop_memory_path memory_path = {
     1, 3, 24, 0, 0, 0, 0x7f, 0xff, 4
@@ -73,6 +76,69 @@ static void output(const char *text)
         while (*text && n + 1 < sizeof(wide) / sizeof(wide[0])) wide[n++] = (uint8_t)*text++;
         wide[n] = 0;
         write(console_out, wide);
+    }
+}
+
+/* Windows shows the SMBIOS system and processor text ("Gunyah Virtual Machine", "Gunyah vCPU" and
+ * a clock guessed from the timer). The host knows the real phone, so put its names there through
+ * the firmware's own SMBIOS protocol, which rebuilds the published table on every change. */
+struct smbios_protocol {
+    void *add;
+    uint64_t (*update_string)(struct smbios_protocol *, uint16_t *handle, uint64_t *number, const char *text);
+    void *remove;
+    uint64_t (*get_next)(struct smbios_protocol *, uint16_t *handle, uint8_t *type, uint8_t **record, void **producer);
+};
+typedef uint64_t (*efi_locate_protocol)(const void *guid, void *registration, void **out);
+static const struct efi_guid smbios_guid = {
+    0x03583ff6, 0xcb36, 0x4940, {0x94, 0x7e, 0xb9, 0xb3, 0x9f, 0x4a, 0xfa, 0xf7}
+};
+
+static void set_string(struct smbios_protocol *s, uint16_t handle, uint8_t number, const char *text)
+{
+    uint64_t n = number;
+    if (number && text[0]) s->update_string(s, &handle, &n, text);
+}
+
+static void copy_text(char *dst, const char *src, uint32_t size)
+{
+    uint32_t i;
+    for (i = 0; i + 1 < size && src[i] >= 0x20 && src[i] < 0x7f; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+
+static void apply_identity(void *bs, const struct hw_header *h)
+{
+    efi_locate_protocol locate = *(efi_locate_protocol *)((uint8_t *)bs + 24 + 37 * 8);
+    struct smbios_protocol *s = 0;
+    char maker[32], model[48], cpu_maker[32], cpu_name[64];
+    uint32_t mhz = h->cpu_mhz;
+    uint8_t type;
+    copy_text(maker, h->system_maker, sizeof maker);
+    copy_text(model, h->system_model, sizeof model);
+    copy_text(cpu_maker, h->cpu_maker, sizeof cpu_maker);
+    copy_text(cpu_name, h->cpu_name, sizeof cpu_name);
+    if (locate(&smbios_guid, 0, (void **)&s) || !s) return;
+    for (type = 1; type <= 4; type++) {
+        uint16_t handle = 0xfffe;                  /* "first record" */
+        uint8_t *r, a, b, c = 0;
+        if (s->get_next(s, &handle, &type, &r, 0) || !r) continue;
+        if (type == 4) {
+            if (mhz && mhz < 0xffff) {                 /* max and current speed, in MHz */
+                r[0x14] = r[0x16] = (uint8_t)mhz;
+                r[0x15] = r[0x17] = (uint8_t)(mhz >> 8);
+            }
+            a = r[0x07];                               /* string numbers; r moves on an update */
+            b = r[0x10];
+            set_string(s, handle, a, cpu_maker);
+            set_string(s, handle, b, cpu_name);
+        } else {
+            a = r[0x04];                               /* manufacturer */
+            b = type == 3 ? r[0x06] : r[0x05];         /* product (the chassis keeps it as version) */
+            if (type == 1) c = r[0x1a];                /* family */
+            set_string(s, handle, a, maker);
+            set_string(s, handle, b, model);
+            set_string(s, handle, c, model);
+        }
     }
 }
 
@@ -99,9 +165,9 @@ static uint64_t set_mode(struct gop_protocol *self, uint32_t requested)
     if (!self || !self->mode || !self->mode->info || !self->mode->frame_buffer_base)
         return EFI_INVALID_PARAMETER;
     bytes = self->mode->frame_buffer_size;
-    if (bytes < (uint64_t)HW_WIDTH * HW_HEIGHT * 4u) return EFI_INVALID_PARAMETER;
+    if (bytes < FB_WIDTH * FB_HEIGHT * 4u) return EFI_INVALID_PARAMETER;
     frame = (uint8_t *)self->mode->frame_buffer_base;
-    for (i = 0; i < (uint64_t)HW_WIDTH * HW_HEIGHT; ++i) {
+    for (i = 0; i < FB_WIDTH * FB_HEIGHT; ++i) {
         frame[i * 4u] = 0;
         frame[i * 4u + 1u] = 0;
         frame[i * 4u + 2u] = 0;
@@ -113,7 +179,7 @@ static uint64_t set_mode(struct gop_protocol *self, uint32_t requested)
 
 static int rect_in_frame(uint64_t x, uint64_t y, uint64_t width, uint64_t height)
 {
-    return x <= HW_WIDTH && y <= HW_HEIGHT && width <= HW_WIDTH - x && height <= HW_HEIGHT - y;
+    return x <= FB_WIDTH && y <= FB_HEIGHT && width <= FB_WIDTH - x && height <= FB_HEIGHT - y;
 }
 
 static uint64_t blt(struct gop_protocol *self, struct gop_pixel *buffer, uint32_t operation,
@@ -129,20 +195,20 @@ static uint64_t blt(struct gop_protocol *self, struct gop_pixel *buffer, uint32_
     if ((operation == 2 || operation == 3) && !rect_in_frame(dest_x, dest_y, width, height)) return EFI_INVALID_PARAMETER;
     if (operation == 0) {
         struct gop_pixel color = *buffer;
-        for (y = 0; y < height; y++) for (x = 0; x < width; x++) fb[(dest_y + y) * HW_WIDTH + dest_x + x] = color;
+        for (y = 0; y < height; y++) for (x = 0; x < width; x++) fb[(dest_y + y) * FB_WIDTH + dest_x + x] = color;
     } else if (operation == 1) {
-        for (y = 0; y < height; y++) for (x = 0; x < width; x++) buffer[(dest_y + y) * pitch + dest_x + x] = fb[(source_y + y) * HW_WIDTH + source_x + x];
+        for (y = 0; y < height; y++) for (x = 0; x < width; x++) buffer[(dest_y + y) * pitch + dest_x + x] = fb[(source_y + y) * FB_WIDTH + source_x + x];
     } else if (operation == 2) {
-        for (y = 0; y < height; y++) for (x = 0; x < width; x++) fb[(dest_y + y) * HW_WIDTH + dest_x + x] = buffer[(source_y + y) * pitch + source_x + x];
+        for (y = 0; y < height; y++) for (x = 0; x < width; x++) fb[(dest_y + y) * FB_WIDTH + dest_x + x] = buffer[(source_y + y) * pitch + source_x + x];
     } else {
         int64_t row = dest_y > source_y ? (int64_t)height - 1 : 0;
         int64_t step = dest_y > source_y ? -1 : 1;
         for (; row >= 0 && row < (int64_t)height; row += step) {
             uint64_t col;
             if (dest_y == source_y && dest_x > source_x) {
-                for (col = width; col > 0; col--) fb[(dest_y + (uint64_t)row) * HW_WIDTH + dest_x + col - 1] = fb[(source_y + (uint64_t)row) * HW_WIDTH + source_x + col - 1];
+                for (col = width; col > 0; col--) fb[(dest_y + (uint64_t)row) * FB_WIDTH + dest_x + col - 1] = fb[(source_y + (uint64_t)row) * FB_WIDTH + source_x + col - 1];
             } else {
-                for (col = 0; col < width; col++) fb[(dest_y + (uint64_t)row) * HW_WIDTH + dest_x + col] = fb[(source_y + (uint64_t)row) * HW_WIDTH + source_x + col];
+                for (col = 0; col < width; col++) fb[(dest_y + (uint64_t)row) * FB_WIDTH + dest_x + col] = fb[(source_y + (uint64_t)row) * FB_WIDTH + source_x + col];
             }
         }
     }
@@ -165,13 +231,14 @@ uint64_t GopDriverEntry(void *image, void *system)
         h->magic[3] != 'R' || h->magic[4] != 'W' || h->magic[5] != 'I' ||
         h->magic[6] != 'N' || h->magic[7] != '1' || h->version != HW_VERSION ||
         h->header_bytes < sizeof(*h) || h->window_size != HW_WINDOW_SIZE ||
-        h->width != HW_WIDTH || h->height != HW_HEIGHT || h->stride != HW_WIDTH * 4u ||
-        h->format != HW_FORMAT_BGRA || __atomic_load_n(&h->front, __ATOMIC_ACQUIRE) > 1 ||
-        !( __atomic_load_n(&h->guest_flags, __ATOMIC_ACQUIRE) & HW_GUEST_RING_RESERVED) ||
-        HW_FRAME0 + (uint64_t)2 * h->stride * h->height > h->window_size) {
+        !hw_mode_ok(h) || __atomic_load_n(&h->front, __ATOMIC_ACQUIRE) > 1 ||
+        !( __atomic_load_n(&h->guest_flags, __ATOMIC_ACQUIRE) & HW_GUEST_RING_RESERVED)) {
         output("shared ring invalid or unreserved\r\n");
         return EFI_INVALID_PARAMETER;
     }
+    mode_info.width = mode_info.pixels_per_scanline = h->width;
+    mode_info.height = h->height;
+    apply_identity(bs, h);
     acpi_status = HyperwinInstallAcpi(system);
     output(acpi_status == 0 ? "ACPI tables installed\r\n" : "ACPI table install failed\r\n");
     protocol.query_mode = query_mode;

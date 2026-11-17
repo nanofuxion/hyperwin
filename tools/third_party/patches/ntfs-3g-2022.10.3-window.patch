@@ -1,0 +1,135 @@
+diff -ru ../orig/ntfs-3g_ntfsprogs-2022.10.3/libntfs-3g/unix_io.c ntfs-3g_ntfsprogs-2022.10.3/libntfs-3g/unix_io.c
+--- ../orig/ntfs-3g_ntfsprogs-2022.10.3/libntfs-3g/unix_io.c	2022-10-20 11:33:44
++++ ntfs-3g_ntfsprogs-2022.10.3/libntfs-3g/unix_io.c	2026-11-16 21:03:43
+@@ -66,6 +66,42 @@
+ 
+ #define DEV_FD(dev)	(*(int *)dev->d_private)
+ 
++/*
++ * HyperWin: a device named "hwwin:OFFSET:SIZE:PATH" is the byte window
++ * [OFFSET, OFFSET+SIZE) of the file PATH, so a partition inside a raw disk
++ * image can be formatted and mounted without a loop device.
++ */
++struct hw_window { int fd; s64 off; s64 size; };
++#define DEV_WIN(dev)	((struct hw_window *)dev->d_private)
++
++static const char *hw_window_path(const char *name, s64 *off, s64 *size)
++{
++	char *end;
++
++	*off = 0;
++	*size = 0;
++	if (strncmp(name, "hwwin:", 6))
++		return name;
++	*off = strtoll(name + 6, &end, 10);
++	if (*end != ':')
++		return name;
++	*size = strtoll(end + 1, &end, 10);
++	if (*end != ':')
++		return name;
++	return end + 1;
++}
++
++static s64 hw_clamp(struct ntfs_device *dev, s64 count, s64 pos)
++{
++	s64 size = DEV_WIN(dev)->size;
++
++	if (!size)
++		return count;
++	if (pos >= size)
++		return 0;
++	return count > size - pos ? size - pos : count;
++}
++
+ /* Define to nothing if not present on this system. */
+ #ifndef O_EXCL
+ #	define O_EXCL 0
+@@ -119,28 +155,34 @@
+ 	struct flock flk;
+ 	struct stat sbuf;
+ 	int err;
++	s64 win_off, win_size;
++	const char *path = hw_window_path(dev->d_name, &win_off, &win_size);
+ 
+ 	if (NDevOpen(dev)) {
+ 		errno = EBUSY;
+ 		return -1;
+ 	}
+-	if (stat(dev->d_name, &sbuf)) {
++	if (stat(path, &sbuf)) {
+ 		ntfs_log_perror("Failed to access '%s'", dev->d_name);
+ 		return -1;
+ 	}
+ 	if (S_ISBLK(sbuf.st_mode))
+ 		NDevSetBlock(dev);
+ 	
+-	dev->d_private = ntfs_malloc(sizeof(int));
++	dev->d_private = ntfs_malloc(sizeof(struct hw_window));
+ 	if (!dev->d_private)
+ 		return -1;
++	DEV_WIN(dev)->off = win_off;
++	DEV_WIN(dev)->size = win_size;
+ 	/*
+ 	 * Open file for exclusive access if mounting r/w.
+ 	 * Fuseblk takes care about block devices.
+ 	 */ 
+ 	if (!NDevBlock(dev) && (flags & O_RDWR) == O_RDWR)
+ 		flags |= O_EXCL;
+-	*(int*)dev->d_private = open(dev->d_name, flags);
++	*(int*)dev->d_private = open(path, flags);
++	if (win_off && *(int*)dev->d_private != -1)
++		lseek(DEV_FD(dev), win_off, SEEK_SET);
+ 	if (*(int*)dev->d_private == -1) {
+ 		err = errno;
+ 			/* if permission error and rw, retry read-only */
+@@ -244,7 +286,18 @@
+ static s64 ntfs_device_unix_io_seek(struct ntfs_device *dev, s64 offset,
+ 		int whence)
+ {
+-	return lseek(DEV_FD(dev), offset, whence);
++	struct hw_window *w = DEV_WIN(dev);
++	s64 pos;
++
++	if (!w->off && !w->size)
++		return lseek(w->fd, offset, whence);
++	if (whence == SEEK_SET)
++		pos = lseek(w->fd, w->off + offset, SEEK_SET);
++	else if (whence == SEEK_END && w->size)
++		pos = lseek(w->fd, w->off + w->size + offset, SEEK_SET);
++	else
++		pos = lseek(w->fd, offset, whence);
++	return pos < 0 ? pos : pos - w->off;
+ }
+ 
+ /**
+@@ -260,7 +313,11 @@
+ static s64 ntfs_device_unix_io_read(struct ntfs_device *dev, void *buf,
+ 		s64 count)
+ {
+-	return read(DEV_FD(dev), buf, count);
++	struct hw_window *w = DEV_WIN(dev);
++
++	if (w->size)
++		count = hw_clamp(dev, count, lseek(w->fd, 0, SEEK_CUR) - w->off);
++	return read(w->fd, buf, count);
+ }
+ 
+ /**
+@@ -298,7 +355,7 @@
+ static s64 ntfs_device_unix_io_pread(struct ntfs_device *dev, void *buf,
+ 		s64 count, s64 offset)
+ {
+-	return pread(DEV_FD(dev), buf, count, offset);
++	return pread(DEV_FD(dev), buf, hw_clamp(dev, count, offset), DEV_WIN(dev)->off + offset);
+ }
+ 
+ /**
+@@ -320,7 +377,7 @@
+ 		return -1;
+ 	}
+ 	NDevSetDirty(dev);
+-	return pwrite(DEV_FD(dev), buf, count, offset);
++	return pwrite(DEV_FD(dev), buf, count, DEV_WIN(dev)->off + offset);
+ }
+ 
+ /**

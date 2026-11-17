@@ -37,6 +37,18 @@ void hw_window_init(void *window, size_t bytes)
     __atomic_store_n(&h->seq, 0, __ATOMIC_RELAXED);
 }
 
+void hw_window_set_mode(void *window, uint32_t width, uint32_t height)
+{
+    struct hw_header *h = window, probe = *h;
+    probe.width = width;
+    probe.height = height;
+    probe.stride = width * 4;
+    if (!hw_mode_ok(&probe)) return;
+    h->width = width;
+    h->height = height;
+    h->stride = width * 4;
+}
+
 void hw_publish_frame(void *window, const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t stride)
 {
     struct hw_header *h = window;
@@ -114,9 +126,7 @@ int hw_copy_gop_front(void *window, uint8_t *dst, uint32_t dst_bytes)
     if (!h || !dst || h->magic[0] != 'H' || h->magic[1] != 'Y' ||
         h->magic[2] != 'P' || h->magic[3] != 'R' || h->magic[4] != 'W' ||
         h->magic[5] != 'I' || h->magic[6] != 'N' || h->magic[7] != '1' ||
-        h->version != HW_VERSION || h->width != HW_WIDTH || h->height != HW_HEIGHT ||
-        h->stride != HW_WIDTH * 4u || h->format != HW_FORMAT_BGRA ||
-        h->window_size != HW_WINDOW_SIZE) return -1;
+        h->version != HW_VERSION || !hw_mode_ok(h) || h->window_size != HW_WINDOW_SIZE) return -1;
     front = __atomic_load_n(&h->front, __ATOMIC_ACQUIRE);
     if (front > 1) return -1;
     bytes = hw_frame_bytes(h);

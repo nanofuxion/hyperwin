@@ -16,11 +16,20 @@
 #ifndef HW_WINDOW_PA
 #define HW_WINDOW_PA 0x137000000ull
 #endif
+/* Default frame size. The host may set any size from HW_MIN_* to HW_MAX_* in the header. */
 #define HW_WIDTH 1280u
 #define HW_HEIGHT 720u
+#define HW_MIN_WIDTH 640u
+#define HW_MIN_HEIGHT 480u
+#define HW_MAX_WIDTH 4096u
+#define HW_MAX_HEIGHT 2304u
 #define HW_FORMAT_BGRA 1u
 
 #define HW_FRAME0 0x10000u
+/* Two frames that do not fit between HW_FRAME0 and HW_AUDIO start here instead. */
+#define HW_FRAME_BIG 0x1000000u
+/* Guest debug marks (guest/efi/trace.c) sit at the top of the window; frames end below. */
+#define HW_FRAME_END 0x7f00000u
 #define HW_AUDIO  0x800000u
 #define HW_AUDIO_BYTES (1024u * 1024u)
 
@@ -29,6 +38,31 @@
 #define HW_VSOCK_PORT_FILES 5602
 /* Guest listens; the app connects and sends framed HID input reports (length byte, report). */
 #define HW_VSOCK_PORT_INPUT 5650
+/* Guest agent (guest/agent/hwagent.c): the app connects to this port. Frames are
+ * u32 payload length, u8 type, payload. */
+#define HW_VSOCK_PORT_AGENT 5651
+#define HW_AGENT_VERSION 4
+#define HW_AGENT_PACKET 1       /* both ways: one IPv4 packet */
+#define HW_AGENT_EXEC 2         /* app -> guest: u32 id, u8 mode, UTF-8 command line */
+#define HW_AGENT_EXEC_OUT 3     /* guest -> app: u32 id, output bytes */
+#define HW_AGENT_EXEC_DONE 4    /* guest -> app: u32 id, u32 exit code */
+#define HW_AGENT_FILE_OPEN 5    /* app -> guest: UTF-8 path to create */
+#define HW_AGENT_FILE_DATA 6    /* app -> guest: bytes */
+#define HW_AGENT_FILE_CLOSE 7   /* app -> guest */
+#define HW_AGENT_FILE_RESULT 8  /* guest -> app: u32 1 = written */
+#define HW_AGENT_HELLO 9        /* guest -> app: u8 version, u8 network adapter present */
+#define HW_AGENT_NET_CONFIG 10  /* app -> guest: ASCII "ip mask gateway dns mtu" */
+#define HW_AGENT_PORTS 11       /* guest -> app: u16 n, n TCP listening ports, u16 m, m bound UDP ports */
+/* app -> guest: u8 n, then n contacts now on the screen: u8 id, u16 x, u16 y (0..65535 of the
+ * desktop). A contact missing from the next frame has lifted. */
+#define HW_AGENT_TOUCH 12
+#define HW_AGENT_TOUCH_MAX 10
+/* app -> guest: u32 clock of the phone's processor in MHz, for Windows to show. Windows measures
+ * the clock with the cycle counter, which this VM lacks, and would report the timer's 25 MHz. */
+#define HW_AGENT_CPU_MHZ 13
+#define HW_AGENT_EXEC_SYSTEM 0  /* run as SYSTEM, output captured */
+#define HW_AGENT_EXEC_DESKTOP 1 /* start on the signed-in user's desktop */
+#define HW_AGENT_EXEC_HIDDEN 2  /* the same, with no console window (helpers such as "hwagent.exe keyboard") */
 #define HW_VSOCK_CID_HOST 2
 
 /* File mailbox. The guest asks; the host reads its own files and writes the answer.
@@ -88,6 +122,13 @@ struct hw_header {
     uint32_t tpm_rc;
     uint8_t tpm_req[1024];
     uint8_t tpm_resp[1024];
+    /* What Windows shows as the computer and processor (SMBIOS). The host fills these in before
+     * boot; an empty string keeps the firmware's own text. */
+    char system_maker[32];
+    char system_model[48];
+    char cpu_maker[32];
+    char cpu_name[64];
+    uint32_t cpu_mhz;
 };
 
 _Static_assert(sizeof(struct hw_header) < 0x1000, "header must fit in the first page");
@@ -129,7 +170,17 @@ static inline uint32_t hw_frame_bytes(const struct hw_header *h)
 
 static inline uint32_t hw_frame_off(const struct hw_header *h, uint32_t index)
 {
-    return HW_FRAME0 + index * hw_frame_bytes(h);
+    uint32_t bytes = hw_frame_bytes(h);
+    return (2u * bytes > HW_AUDIO - HW_FRAME0 ? HW_FRAME_BIG : HW_FRAME0) + index * bytes;
+}
+
+/* True when the header describes a frame pair that fits the window. */
+static inline int hw_mode_ok(const struct hw_header *h)
+{
+    return h->width >= HW_MIN_WIDTH && h->width <= HW_MAX_WIDTH &&
+           h->height >= HW_MIN_HEIGHT && h->height <= HW_MAX_HEIGHT &&
+           h->stride == h->width * 4u && h->format == HW_FORMAT_BGRA &&
+           (uint64_t)hw_frame_off(h, 1) + hw_frame_bytes(h) <= HW_FRAME_END;
 }
 
 #endif

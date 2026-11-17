@@ -39,7 +39,10 @@ memmove
 memset
 DEF
 "$DLLTOOL" -m arm64 -d "$OUT/ntoskrnl.def" -l "$OUT/ntoskrnl.lib"
-lld-link /driver /subsystem:native /entry:DriverEntry /machine:arm64 /nodefaultlib /release \
+# /tsaware:no: lld sets the "terminal server aware" bit by default, and Windows then refuses to load
+# the driver after boot (STATUS_CONFLICTING_ADDRESSES, device problem 39). Only the boot loader
+# ignores it. Windows demotes this driver to demand start (StartOverride), so it must load late.
+lld-link /driver /subsystem:native /entry:DriverEntry /machine:arm64 /nodefaultlib /release /tsaware:no \
   /out:"$OUT/hwvsinput.unsigned.sys" "$OUT/hwvsinput.o" "$OUT/ntoskrnl.lib"
 osslsigncode sign -certs build/testcert/hyperwin-test.crt -key build/testcert/hyperwin-test.key -h sha256 \
   -n "HyperWin vsock input" -in "$OUT/hwvsinput.unsigned.sys" -out "$OUT/hwvsinput.sys.new" >/dev/null

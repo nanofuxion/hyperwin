@@ -31,11 +31,15 @@ object VsockInput {
 
     @Volatile var connected = false
         private set
+    /** Where the user last pointed, as a fraction of the guest's height. The keyboard pans to keep it in view. */
+    @Volatile var focusY = 0.5f
+        private set
 
     fun start(machine: Any) {
         synchronized(lock) {
+            // Always a new thread: the previous VM's loop may still be in its sleep and exits on its own.
             vm = machine
-            if (thread?.isAlive == true) return
+            closeLocked()
             thread = Thread({ connectLoop(machine) }, "hw-vsock-input").apply { isDaemon = true; start() }
         }
     }
@@ -107,8 +111,111 @@ object VsockInput {
             ((if (up) 1 else 0) or (if (e0) 2 else 0)).toByte()))
     }
 
-    /** Finger on the guest view: absolute position, primary button while touching, two fingers right-click. */
+    /** What fingers on the guest view do. */
+    enum class TouchMode { TOUCH, TRACKPAD }
+    @Volatile var touchMode = TouchMode.TOUCH
+
+    private const val TAP_MS = 250L
+    private const val TAP_SLOP_PX = 24f
+    private const val SCROLL_STEP_PX = 36f
+    private const val PAD_SPEED = 1.4f
+    private var gesture = 0                 // which path took this gesture: 0 pointer, 1 touch, 2 trackpad
+    private var padX = 0f
+    private var padY = 0f
+    private var padTravel = 0f
+    private var padFingers = 0
+    private var padDownAt = 0L
+    private var padDragging = false
+    private var padLastTap = 0L
+    private var padScroll = 0f
+
+    /**
+     * Finger on the guest view. Touch mode sends every finger to Windows as a touch screen contact
+     * when the guest agent is up, else one finger as the pointer. Trackpad mode moves the pointer.
+     */
     fun touch(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) gesture = when {
+            touchMode == TouchMode.TRACKPAD -> 2
+            GuestAgent.touchReady -> 1
+            else -> 0
+        }
+        return when (gesture) {
+            1 -> contacts(event, viewWidth, viewHeight)
+            2 -> trackpad(event, viewWidth, viewHeight)
+            else -> finger(event, viewWidth, viewHeight)
+        }
+    }
+
+    /** All fingers still down, as HW_AGENT_TOUCH: count, then id, x, y per contact. */
+    private fun contacts(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
+        val gone = when (event.actionMasked) {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> -1
+            MotionEvent.ACTION_POINTER_UP -> event.actionIndex
+            else -> -2
+        }
+        val out = java.io.ByteArrayOutputStream()
+        out.write(0)
+        var n = 0
+        for (i in 0 until event.pointerCount) {
+            if (gone == -1 || i == gone || n == 10) continue
+            val (x, y) = guestPosition(event.getX(i), event.getY(i), viewWidth, viewHeight, clamp = true) ?: continue
+            if (n == 0) focusY = y / AXIS_MAX.toFloat()
+            out.write(event.getPointerId(i)); out.write(x and 0xff); out.write(x shr 8); out.write(y and 0xff); out.write(y shr 8)
+            n++
+        }
+        return GuestAgent.touch(out.toByteArray().also { it[0] = n.toByte() })
+    }
+
+    /** Laptop trackpad: drag moves the pointer, tap clicks, two fingers scroll or right-click, tap then drag holds. */
+    private fun trackpad(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
+        val skip = if (event.actionMasked == MotionEvent.ACTION_POINTER_UP) event.actionIndex else -1
+        val live = (0 until event.pointerCount).filter { it != skip }
+        val x = live.map { event.getX(it) }.average().toFloat()
+        val y = live.map { event.getY(it) }.average().toFloat()
+        val here = lastX to lastY
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                padTravel = 0f; padScroll = 0f; padFingers = 1; padDownAt = event.eventTime
+                padDragging = event.eventTime - padLastTap < TAP_MS
+                if (padDragging) pointer(here, 1)
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> padFingers = maxOf(padFingers, event.pointerCount)
+            MotionEvent.ACTION_MOVE -> {
+                val dx = x - padX
+                val dy = y - padY
+                padTravel += kotlin.math.abs(dx) + kotlin.math.abs(dy)
+                if (event.pointerCount >= 2) {
+                    padScroll += dy
+                    val steps = (padScroll / SCROLL_STEP_PX).toInt()
+                    if (steps != 0) { padScroll -= steps * SCROLL_STEP_PX; pointer(here, buttons, steps) }
+                } else if (padTravel > TAP_SLOP_PX) {
+                    val scale = minOf(viewWidth.toFloat() / AvfPlan.frameWidth, viewHeight.toFloat() / AvfPlan.frameHeight)
+                    val nx = lastX + dx * PAD_SPEED * AXIS_MAX / (AvfPlan.frameWidth * scale)
+                    val ny = lastY + dy * PAD_SPEED * AXIS_MAX / (AvfPlan.frameHeight * scale)
+                    pointer(nx.toInt().coerceIn(0, AXIS_MAX) to ny.toInt().coerceIn(0, AXIS_MAX), buttons)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val tapped = event.actionMasked == MotionEvent.ACTION_UP && padTravel <= TAP_SLOP_PX &&
+                    event.eventTime - padDownAt < TAP_MS
+                if (padDragging) {
+                    pointer(here, 0)
+                } else if (tapped) {
+                    val button = if (padFingers >= 2) 2 else 1
+                    pointer(here, button)
+                    pointer(here, 0)
+                    if (button == 1) padLastTap = event.eventTime
+                }
+                padDragging = false
+            }
+        }
+        padX = x
+        padY = y
+        return true
+    }
+
+    /** One finger as the pointer: absolute position, primary button while touching, two fingers right-click. */
+    private fun finger(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
         val ending = event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL ||
             event.actionMasked == MotionEvent.ACTION_POINTER_UP
         val pos = guestPosition(event.getX(0), event.getY(0), viewWidth, viewHeight)
@@ -142,6 +249,7 @@ object VsockInput {
         buttons = state
         lastX = pos.first
         lastY = pos.second
+        focusY = lastY / AXIS_MAX.toFloat()
         send(byteArrayOf(
             POINTER.toByte(),
             (lastX and 0xff).toByte(), (lastX shr 8).toByte(),
@@ -151,14 +259,14 @@ object VsockInput {
     }
 
     /** Same letterboxing as GuestDisplay.fitRect. Touches on the black bars are ignored. */
-    private fun guestPosition(x: Float, y: Float, width: Int, height: Int): Pair<Int, Int>? {
+    private fun guestPosition(x: Float, y: Float, width: Int, height: Int, clamp: Boolean = false): Pair<Int, Int>? {
         if (width <= 0 || height <= 0) return null
-        val scale = minOf(width.toFloat() / AvfPlan.FRAME_WIDTH, height.toFloat() / AvfPlan.FRAME_HEIGHT)
-        val w = AvfPlan.FRAME_WIDTH * scale
-        val h = AvfPlan.FRAME_HEIGHT * scale
+        val scale = minOf(width.toFloat() / AvfPlan.frameWidth, height.toFloat() / AvfPlan.frameHeight)
+        val w = AvfPlan.frameWidth * scale
+        val h = AvfPlan.frameHeight * scale
         val fx = (x - (width - w) / 2f) / w
         val fy = (y - (height - h) / 2f) / h
-        if (fx < -0.02f || fx > 1.02f || fy < -0.02f || fy > 1.02f) return null
+        if (!clamp && (fx < -0.02f || fx > 1.02f || fy < -0.02f || fy > 1.02f)) return null
         return (fx.coerceIn(0f, 1f) * AXIS_MAX).toInt() to (fy.coerceIn(0f, 1f) * AXIS_MAX).toInt()
     }
 

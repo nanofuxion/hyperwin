@@ -27,7 +27,7 @@ def main():
         svc = 'ControlSet001\\Services\\' + d['service']
         go(svc)
         dw('Type', d.get('type', 1)); dw('Start', d['start']); dw('ErrorControl', 1)
-        sz('ImagePath', '\\SystemRoot\\System32\\drivers\\' + d['file'].split('/')[-1], 2)
+        sz('ImagePath', 'System32\\drivers\\' + d['file'].split('/')[-1], 2)
         sz('DisplayName', d.get('description', d['service']))
         if d.get('group'): sz('Group', d['group'])
         values(svc, d.get('values', {}).get('service', {}))

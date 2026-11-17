@@ -1,279 +1,377 @@
 package dev.hyperwin.app
 
-import android.app.Activity
-import android.app.AlertDialog
-import android.content.Context
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.text.InputType
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
-import android.view.SurfaceView
 import android.view.View
-import android.view.WindowInsets
-import android.view.inputmethod.InputMethodManager
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.google.android.material.card.MaterialCardView
+import com.google.android.material.color.DynamicColors
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.progressindicator.CircularProgressIndicator
+import dev.hyperwin.app.Ui.dp
+import dev.hyperwin.app.Ui.fill
+import dev.hyperwin.app.Ui.spaced
+import dev.hyperwin.app.Ui.themeColor
+import com.google.android.material.R as M
 
-/** Guest display and controls. The console text is kept in real views for accessibility. */
-class MainActivity : Activity() {
+/**
+ * One activity, three screens: the first-run setup slides, the settings (home) screen, and Windows
+ * itself with a small pull-down toolbar. Settings are kept in the machine's machine.json and in
+ * the app's preferences, so they are there again on the next launch.
+ */
+class MainActivity : AppCompatActivity(), HomeScreen.Actions {
+    private enum class Screen { SETUP, HOME, WINDOWS }
+
     private val console = StringBuilder()
-    private var desktopSurface: SurfaceView? = null
-    private var guestDisplay: GuestDisplay? = null
-    private lateinit var status: TextView
-    private lateinit var typeButton: Button
-    private lateinit var bootButton: Button
-    private lateinit var stopButton: Button
-    private lateinit var logButton: Button
-    private lateinit var menuButton: Button
-    private lateinit var controls: LinearLayout
-    private lateinit var logPanel: ScrollView
-    private lateinit var consoleText: TextView
-    private var machineDialog: MachinePrep.Dialog? = null
     private val prefs by lazy { getSharedPreferences("hyperwin", MODE_PRIVATE) }
+    private val ui = Handler(Looper.getMainLooper())
+    private var screen = Screen.HOME
+    private var status = "Ready to start."
+    private var replaceOldMachines = false
+    private var keyboardHeight = 0
+    private var starting = false
+
+    private lateinit var root: FrameLayout
+    private lateinit var guest: GuestView
+    private lateinit var guestDisplay: GuestDisplay
+    private lateinit var guestLayer: FrameLayout
+    private lateinit var booting: LinearLayout
+    private lateinit var bootingText: TextView
+    private lateinit var toolbar: FrameLayout
+    private lateinit var handle: View
+    private lateinit var bar: View
+    private lateinit var homeLayer: FrameLayout
+    private lateinit var setupLayer: FrameLayout
+    private lateinit var home: HomeScreen
+    private var setup: SetupFlow? = null
+
+    private val pickIso = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) setup?.onIsoPicked(uri)
+    }
+    private val collapseToolbar = Runnable { showBar(false) }
+    private val hideBooting = Runnable { booting.visibility = View.GONE }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val desktopHasFocus = desktopSurface?.hasFocus() == true
-        if (desktopHasFocus && event.keyCode !in HOST_KEYS &&
-            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)
-        ) {
-            if (AvfLaunch.key(event)) return true
-        }
+        if (screen == Screen.WINDOWS && event.keyCode !in HOST_KEYS &&
+            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) && AvfLaunch.key(event)
+        ) return true
         return super.dispatchKeyEvent(event)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        VsockInput.touchMode = if (prefs.getBoolean(TRACKPAD, false)) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
 
-        status = TextView(this).apply {
-            text = "Ready. Start Windows to open the guest."
-            contentDescription = "Status: $text"
-            setTextColor(0xFFFFFFFF.toInt())
-            textSize = 16f
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-            isScreenReaderFocusable = true
-            isFocusable = true
-        }
-        consoleText = TextView(this).apply {
-            text = "Guest console output will appear here."
-            setTextColor(0xFFE7EEF2.toInt())
-            textSize = 12f
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextIsSelectable(true)
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = "Guest console output"
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-        }
-
-        val surface = SurfaceView(this).apply {
-            contentDescription = "Windows guest display. Touch moves the Windows pointer and clicks. " +
-                "Two fingers right-click. A hardware keyboard and mouse also work."
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        guest = GuestView(this).apply {
+            contentDescription = "Windows display. Touch works as a touch screen, or as a trackpad in trackpad mode. " +
+                "A hardware keyboard and mouse also work."
             isFocusable = true
             isFocusableInTouchMode = true
-            isClickable = true
-            setOnClickListener { requestFocus() }
             requestUnbufferedDispatch(InputDevice.SOURCE_ANY)
             setOnTouchListener { view, event ->
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) view.requestFocus()
-                if (event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE) {
-                    VsockInput.mouse(event, view.width, view.height)
-                } else {
-                    VsockInput.touch(event, view.width, view.height)
+                if (event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE) VsockInput.mouse(event, view.width, view.height)
+                else VsockInput.touch(event, view.width, view.height)
+                if (event.actionMasked == MotionEvent.ACTION_UP) {
+                    view.performClick()
+                    if (keyboardHeight > 0) panForKeyboard()
                 }
-                if (event.actionMasked == MotionEvent.ACTION_UP) view.performClick()
                 true
             }
             setOnGenericMotionListener { view, event ->
-                if (isMouseEvent(event)) VsockInput.mouse(event, view.width, view.height) else false
+                if ((event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) VsockInput.mouse(event, view.width, view.height)
+                else false
             }
         }
-        desktopSurface = surface
-        guestDisplay = GuestDisplay(surface) { message ->
-            runOnUiThread { if (!isFinishing) updateStatus(message) }
-        }
-
-        bootButton = Button(this).apply {
-            text = "Boot Windows"
-            setOnClickListener { startWindows() }
-        }
-        typeButton = Button(this).apply {
-            text = "Type to Windows"
-            contentDescription = "Open the Android keyboard to type into Windows"
-            setOnClickListener { showTypeTextDialog() }
-        }
-        stopButton = Button(this).apply {
-            text = "Stop VM"
-            contentDescription = "Stop the Windows virtual machine"
-            isEnabled = false
-            setOnClickListener {
-                isEnabled = false
-                Thread {
-                    val report = AvfLaunch.stopWindows { guestDisplay?.vmStopped() }
-                    runOnUiThread {
-                        updateStatus(report)
-                        stopButton.isEnabled = false
-                        bootButton.isEnabled = true
-                        typeButton.isEnabled = false
-                        showControls(true)
-                    }
-                }.start()
-            }
-        }
-
-        logButton = Button(this).apply {
-            text = "Show log"
-            setOnClickListener {
-                val show = logPanel.visibility != View.VISIBLE
-                logPanel.visibility = if (show) View.VISIBLE else View.GONE
-                text = if (show) "Hide log" else "Show log"
-            }
-        }
-        controls = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(8))
-            setBackgroundColor(0xDD101418.toInt())
-            addView(status)
-            addView(CheckBox(this@MainActivity).apply {
-                text = "Open to Windows on launch"
-                contentDescription = "Start Windows as soon as HyperWin opens"
-                setTextColor(0xFFFFFFFF.toInt())
-                isChecked = prefs.getBoolean(BOOT_ON_LAUNCH, false)
-                setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean(BOOT_ON_LAUNCH, on).apply() }
-            })
-            addView(Button(this@MainActivity).apply {
-                text = "Prepare machine"
-                contentDescription = "Build a Windows disk from an ISO, with cores, memory and disk size"
-                setOnClickListener { prepareMachine() }
-            })
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                addView(bootButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(6) })
-                addView(typeButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(6) })
-                addView(logButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(6) })
-                addView(stopButton, LinearLayout.LayoutParams(0, dp(52), 1f))
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(8) })
-        }
-        logPanel = ScrollView(this).apply {
-            isFillViewport = true
-            visibility = View.GONE
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = "Scrollable guest console output"
-            setBackgroundColor(0xDD101418.toInt())
-            addView(consoleText)
-        }
-        menuButton = Button(this).apply {
-            text = "Menu"
-            contentDescription = "Show HyperWin controls"
-            alpha = 0.6f
-            visibility = View.GONE
-            setOnClickListener { showControls(controls.visibility != View.VISIBLE) }
-        }
-        val root = FrameLayout(this).apply {
+        guestLayer = FrameLayout(this).apply {
             setBackgroundColor(0xff000000.toInt())
-            addView(surface, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ))
-            addView(controls, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                android.view.Gravity.TOP,
-            ))
-            addView(logPanel, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                dp(160),
-                android.view.Gravity.BOTTOM,
-            ))
-            addView(menuButton, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                dp(44),
-                android.view.Gravity.TOP or android.view.Gravity.END,
-            ))
-            setOnApplyWindowInsetsListener { _, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
-                controls.setPadding(controls.paddingLeft, dp(10) + bars.top,
-                    controls.paddingRight, controls.paddingBottom)
-                (menuButton.layoutParams as FrameLayout.LayoutParams).apply {
-                    topMargin = bars.top + dp(4)
-                    marginEnd = bars.right + dp(4)
-                }
-                val logParams = logPanel.layoutParams as FrameLayout.LayoutParams
-                logParams.bottomMargin = bars.bottom
-                logPanel.layoutParams = logParams
-                insets
-            }
+            addView(guest, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH, Gravity.CENTER))
+        }
+        guestDisplay = GuestDisplay(guest) {
+            // The first changed frame after the firmware's blank one is Windows drawing.
+            runOnUiThread { ui.removeCallbacks(hideBooting); hideBooting.run() }
+        }
+        bootingText = Ui.text(this, M.attr.textAppearanceTitleMedium).apply { setTextColor(0xffffffff.toInt()) }
+        booting = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            addView(CircularProgressIndicator(this@MainActivity).apply { isIndeterminate = true },
+                LinearLayout.LayoutParams(Ui.WRAP, Ui.WRAP))
+            addView(bootingText.spaced(20, Ui.WRAP))
+        }
+        buildToolbar()
+        // The layers carry the surface colour, so it also fills behind the system bars and cutout.
+        homeLayer = FrameLayout(this).apply { setBackgroundColor(themeColor(M.attr.colorSurface)) }
+        setupLayer = FrameLayout(this).apply { setBackgroundColor(themeColor(M.attr.colorSurface)) }
+        home = HomeScreen(this, prefs, this)
+        homeLayer.fill(home.view)
+
+        root = FrameLayout(this).apply {
+            setBackgroundColor(0xff000000.toInt())
+            fill(guestLayer)
+            fill(booting)
+            addView(toolbar, FrameLayout.LayoutParams(Ui.WRAP, Ui.WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+            fill(homeLayer)
+            fill(setupLayer)
         }
         setContentView(root)
-        bootButton.requestFocus()
-        if (intent.getBooleanExtra("windows", false) ||
-            (savedInstanceState == null && AvfLaunch.machine == null && prefs.getBoolean(BOOT_ON_LAUNCH, false))
-        ) startWindows()
-    }
-
-    @Deprecated("Activity result for the ISO picker")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        val uri = data?.data
-        if (requestCode == MachinePrep.PICK_ISO && resultCode == RESULT_OK && uri != null) machineDialog?.onIsoPicked(uri)
-    }
-
-    private fun prepareMachine() {
-        machineDialog = MachinePrep.Dialog(this) { machine ->
-            bootButton.isEnabled = false
-            updateStatus("Preparing ${machine.name}. This takes a while.")
-            Thread {
-                val report = runCatching {
-                    MachinePrep.prepare(this, machine) { percent, message ->
-                        runOnUiThread { if (!isFinishing) updateStatus("$percent%: $message") }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            listOf(homeLayer, setupLayer).forEach { it.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, keyboard)) }
+            keyboardHeight = keyboard
+            panForKeyboard()
+            (toolbar.layoutParams as FrameLayout.LayoutParams).topMargin = bars.top
+            toolbar.requestLayout()
+            insets
+        }
+        // Run the phone's screen at its fastest rate, so Windows frames are shown as soon as they change.
+        GuestDisplay.bestMode(display)?.let { mode ->
+            window.attributes = window.attributes.also { it.preferredDisplayModeId = mode.modeId }
+        }
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    screen == Screen.SETUP && setup?.back() == true -> Unit
+                    screen == Screen.SETUP && preparedMachine() != null -> {
+                        replaceOldMachines = false
+                        show(Screen.HOME)
                     }
-                }.getOrElse { it.message ?: "Machine preparation failed" }
-                runOnUiThread {
-                    updateStatus(report)
-                    bootButton.isEnabled = AvfLaunch.machine == null
+                    screen == Screen.HOME && AvfLaunch.machine != null -> show(Screen.WINDOWS)
+                    screen == Screen.WINDOWS -> showBar(true)       // never drop out of a running Windows
+                    else -> finish()
                 }
-            }.start()
-        }.also { it.show() }
-    }
+            }
+        })
 
-    override fun onPause() {
-        guestDisplay?.saveFrame()
-        super.onPause()
+        val isoExtra = intent.getStringExtra(EXTRA_PREPARE_ISO)
+        when {
+            AvfLaunch.machine != null -> {                          // the activity was rebuilt under a running VM
+                show(Screen.WINDOWS)
+                guestDisplay.vmStarted(AvfLaunch.sharedWindow)
+            }
+            savedInstanceState == null && isoExtra != null -> {
+                // Unattended setup (adb): am start -n dev.hyperwin.app/.MainActivity --es prepareIso <uri>
+                val machine = Machine.create(this).apply {
+                    source = isoExtra
+                    sourceName = isoExtra.substringAfterLast('/')
+                    save()
+                }
+                openSetup().showWorking()
+                runPrep(machine)
+            }
+            preparedMachine() == null -> openSetup()                // first launch: the setup slides
+            intent.getBooleanExtra("windows", false) || prefs.getBoolean(BOOT_ON_LAUNCH, false) -> startWindows()
+            else -> show(Screen.HOME)
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        if (AvfLaunch.machine != null) guestDisplay?.vmStarted(AvfLaunch.sharedWindow)
+        if (AvfLaunch.machine != null) guestDisplay.vmStarted(AvfLaunch.sharedWindow)
+        if (screen == Screen.WINDOWS) immersive(true)
     }
 
-    private fun startWindows() {
-        val surface = desktopSurface ?: return
-        bootButton.isEnabled = false
-        updateStatus("Starting Windows firmware. Keyboard input is available after the guest starts.")
-        surface.requestFocus()
+    private fun preparedMachine(): Machine? =
+        Machine.active(this)?.takeIf { it.prepared }
+            ?: Machine.all(this).firstOrNull { it.prepared }?.also { Machine.setActive(this, it) }
+
+    private fun show(next: Screen) {
+        screen = next
+        setupLayer.visibility = if (next == Screen.SETUP) View.VISIBLE else View.GONE
+        homeLayer.visibility = if (next == Screen.HOME) View.VISIBLE else View.GONE
+        toolbar.visibility = if (next == Screen.WINDOWS) View.VISIBLE else View.GONE
+        if (next == Screen.HOME) home.refresh(AvfLaunch.machine != null, status)
+        if (next == Screen.WINDOWS) {
+            showBar(false)
+            guest.requestFocus()
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            guest.hideKeyboard()
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        immersive(next == Screen.WINDOWS)
+    }
+
+    private fun immersive(on: Boolean) {
+        val controller = WindowCompat.getInsetsController(window, root)
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (on) controller.hide(WindowInsetsCompat.Type.systemBars()) else controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    // ---- toolbar over Windows: a small grabber that opens into a pill of actions ----
+
+    private fun buildToolbar() {
+        handle = FrameLayout(this).apply {
+            contentDescription = "Show HyperWin controls"
+            isClickable = true
+            isFocusable = true
+            addView(View(this@MainActivity).apply {
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(8).toFloat()
+                    setColor(0xb0ffffff.toInt())
+                    setStroke(dp(1), 0x80000000.toInt())
+                }
+            }, FrameLayout.LayoutParams(dp(44), dp(7), Gravity.CENTER))
+            setOnClickListener { showBar(true) }
+        }
+        fun action(label: String, icon: Int, onClick: () -> Unit) =
+            Ui.button(this, label, M.attr.borderlessButtonStyle, icon) { onClick(); nudgeToolbar() }
+        bar = MaterialCardView(this, null, M.attr.materialCardViewElevatedStyle).apply {
+            radius = dp(28).toFloat()
+            // See-through, so Windows stays readable underneath. No shadow: it would show through.
+            cardElevation = 0f
+            setCardBackgroundColor(androidx.core.graphics.ColorUtils.setAlphaComponent(themeColor(M.attr.colorSurfaceContainerHigh), 0xB0))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(2), dp(4), dp(2))
+                addView(action("Keyboard", R.drawable.ic_keyboard) { togglePhoneKeyboard() }.apply {
+                    contentDescription = "Show this phone's keyboard and type into Windows"
+                })
+                addView(action("Windows keyboard", R.drawable.ic_keyboard) { showWindowsKeyboard() }.apply {
+                    contentDescription = "Open the on-screen keyboard inside Windows"
+                })
+                addView(action("Settings", R.drawable.ic_settings) { show(Screen.HOME) })
+                addView(Ui.iconButton(this@MainActivity, R.drawable.ic_close, "Hide controls") { showBar(false) })
+            })
+        }
+        toolbar = FrameLayout(this).apply {
+            addView(handle, FrameLayout.LayoutParams(dp(88), dp(30), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+            addView(bar, FrameLayout.LayoutParams(Ui.WRAP, Ui.WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+                setMargins(dp(8), dp(8), dp(8), dp(12))
+            })
+        }
+    }
+
+    private fun showBar(open: Boolean) {
+        ui.removeCallbacks(collapseToolbar)
+        bar.visibility = if (open) View.VISIBLE else View.GONE
+        handle.visibility = if (open) View.GONE else View.VISIBLE
+        if (open) nudgeToolbar()
+    }
+
+    /** The pill folds back into the grabber after a few quiet seconds. */
+    private fun nudgeToolbar() {
+        ui.removeCallbacks(collapseToolbar)
+        ui.postDelayed(collapseToolbar, 6000)
+    }
+
+    /**
+     * The phone's keyboard covers the lower part of the screen. Windows keeps its size and slides
+     * up just far enough that the place last touched (or the pointer) sits in the part still visible.
+     */
+    private fun panForKeyboard() {
+        val visible = root.height - keyboardHeight
+        val focus = guest.top + VsockInput.focusY * guest.height
+        val most = (guest.bottom - visible).coerceAtLeast(0).toFloat()
+        val shift = if (keyboardHeight == 0) 0f else (focus - visible / 2f).coerceIn(0f, most)
+        guest.animate().translationY(-shift).setDuration(150).start()
+    }
+
+    private fun togglePhoneKeyboard() {
+        val shown = ViewCompat.getRootWindowInsets(root)?.isVisible(WindowInsetsCompat.Type.ime()) == true
+        if (shown) guest.hideKeyboard() else guest.showKeyboard()
+    }
+
+    private fun showWindowsKeyboard() {
+        // Windows' touch keyboard, docked along the bottom. Older agents can only open the classic one.
+        if (GuestAgent.connected && GuestAgent.agentVersion >= 4) GuestAgent.exec("C:\\HyperWin\\hwagent.exe keyboard", hidden = true)
+        else if (GuestAgent.connected) GuestAgent.exec("explorer.exe C:\\Windows\\System32\\osk.exe", desktop = true)
+        else Toast.makeText(this, "Windows is still starting. Try again in a moment.", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---- setup ----
+
+    private fun openSetup(): SetupFlow {
+        val flow = SetupFlow(this, pickIso = { pickIso.launch(arrayOf("application/x-iso9660-image", "application/octet-stream", "*/*")) }) {
+            runPrep(it)
+        }
+        setup = flow
+        setupLayer.removeAllViews()
+        setupLayer.fill(flow.view)
+        show(Screen.SETUP)
+        return flow
+    }
+
+    /** Builds the machine's disk, then boots it. */
+    private fun runPrep(machine: Machine) {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Thread {
+            val report = runCatching {
+                MachinePrep.prepare(this, machine) { percent, message ->
+                    Log.i("HyperWinPrep", "$percent% $message")
+                    runOnUiThread { setup?.showProgress(percent, message) }
+                }
+            }.getOrElse { it.message ?: "Windows could not be set up." }
+            Log.i("HyperWinPrep", report)
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                if (!machine.prepared) {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    setup?.showFailure(report)
+                    return@runOnUiThread
+                }
+                // A reinstall the user confirmed: the Windows it replaces goes now that the new one exists.
+                if (replaceOldMachines) Machine.all(this).filter { it.dir != machine.dir }.forEach { it.dir.deleteRecursively() }
+                replaceOldMachines = false
+                setup = null
+                setupLayer.removeAllViews()
+                if (AvfLaunch.machine == null) startWindows() else show(Screen.HOME)
+            }
+        }.start()
+    }
+
+    // ---- Windows ----
+
+    private fun startWindows(restart: Boolean = false, attempt: Int = 1) {
+        if (starting || AvfLaunch.machine != null) return     // one Windows at a time: they share a disk
+        starting = true
+        show(Screen.WINDOWS)
+        bootingText.text = if (restart) "Windows is restarting" else "Starting Windows"
+        booting.visibility = View.VISIBLE
+        ui.removeCallbacks(hideBooting)
+        ui.postDelayed(hideBooting, 60_000)
         Thread {
             val report = runCatching {
                 AvfLaunch.bootWindows(
                     this,
-                    onVmStarted = { guestDisplay?.vmStarted(AvfLaunch.sharedWindow) },
+                    onVmStarted = { guestDisplay.vmStarted(AvfLaunch.sharedWindow) },
                     onVmStopped = {
-                        guestDisplay?.vmStopped()
+                        guestDisplay.vmStopped()
                         runOnUiThread {
-                            if (!isFinishing) {
-                                bootButton.isEnabled = true
-                                typeButton.isEnabled = false
-                                stopButton.isEnabled = false
-                                updateStatus("Windows stopped.")
-                                showControls(true)
+                            // A stop while still starting is reported, and handled, by the start below.
+                            if (isFinishing || starting) return@runOnUiThread
+                            if (AvfLaunch.lastStopWasReboot) {
+                                startWindows(restart = true)
+                            } else {
+                                status = "Windows is off."
+                                booting.visibility = View.GONE
+                                show(Screen.HOME)
                             }
                         }
                     },
@@ -282,114 +380,93 @@ class MainActivity : Activity() {
                         console.append(chunk)
                         if (console.length > 12000) console.delete(0, console.length - 12000)
                     }
-                    val shown = currentConsole()
-                    runOnUiThread {
-                        consoleText.text = shown
-                    }
                 }
-            }.getOrElse { it.message ?: "Windows boot failed" }
+            }.getOrElse { it.message ?: "Windows could not start." }
             runOnUiThread {
-                updateStatus(report.substringBefore('\n'))
-                if (report.contains('\n')) {
-                    consoleText.text = report.substringAfter('\n')
+                if (isFinishing) return@runOnUiThread
+                starting = false
+                if (report == AvfLaunch.BUSY) {
+                    // Another screen of this app is starting it already; show that one's Windows.
+                    status = "Windows is running."
+                } else if (report.startsWith("VM running;")) {
+                    status = "Windows is running."
+                } else if (report.startsWith("stopped") && AvfLaunch.lastStopWasReboot) {
+                    startWindows(restart = true)
+                } else if (attempt < 2) {
+                    // Rarely the firmware faults right at power-on. A second try nearly always works.
+                    synchronized(console) { console.append("\n").append(report).append("\nTrying once more.\n") }
+                    startWindows(restart, attempt + 1)
+                } else {
+                    synchronized(console) { console.append("\n").append(report) }
+                    status = "Windows could not start. The log under Advanced has the details."
+                    booting.visibility = View.GONE
+                    show(Screen.HOME)
                 }
-                val isRunning = report.startsWith("VM running;")
-                bootButton.isEnabled = !isRunning
-                typeButton.isEnabled = isRunning
-                stopButton.isEnabled = isRunning
-                showControls(!isRunning)
-                surface.requestFocus()
             }
         }.start()
     }
 
-    private fun showControls(show: Boolean) {
-        controls.visibility = if (show) View.VISIBLE else View.GONE
-        menuButton.visibility = if (AvfLaunch.machine != null) View.VISIBLE else View.GONE
-        menuButton.text = if (show) "Hide" else "Menu"
-        if (!show) {
-            logPanel.visibility = View.GONE
-            logButton.text = "Show log"
-            desktopSurface?.requestFocus()
-        }
+    override fun startOrReturn() {
+        if (AvfLaunch.machine != null) show(Screen.WINDOWS) else startWindows()
     }
 
-    private fun showTypeTextDialog() {
-        if (AvfLaunch.machine == null) {
-            updateStatus("Start Windows before typing to the guest.")
+    /** Asks Windows to shut down by itself; the screen comes back here when it has. */
+    override fun shutDown() {
+        if (!GuestAgent.connected) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Windows is not answering yet")
+                .setMessage("It may still be starting. You can wait, or force it off. Forcing loses anything not saved.")
+                .setNegativeButton("Wait", null)
+                .setPositiveButton("Force stop") { _, _ -> forceStop() }
+                .show()
             return
         }
-        val textInput = EditText(this).apply {
-            hint = "Text to send to Windows"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            contentDescription = "Text to send to the Windows guest"
-            minLines = 2
-            maxLines = 5
-        }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("Type to Windows")
-            .setMessage("Basic US keyboard characters are submitted as key presses. The guest layout and Caps Lock can affect the result.")
-            .setView(textInput)
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Send", null)
-            .create()
-        dialog.setOnDismissListener {
-            desktopSurface?.post { desktopSurface?.requestFocus() }
-        }
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val text = textInput.text
-                if (text.isEmpty()) {
-                    dialog.dismiss()
-                } else {
-                    typeButton.isEnabled = false
-                    dialog.dismiss()
-                    Thread {
-                        val result = AvfLaunch.typeText(text)
-                        runOnUiThread {
-                            if (!isFinishing) {
-                                typeButton.isEnabled = true
-                                val message = when {
-                                    result.failure == AvfLaunch.TextSendFailure.GUEST_UNAVAILABLE ->
-                                        "Windows is not accepting text input right now."
-                                    result.failure == AvfLaunch.TextSendFailure.UNSUPPORTED_CHARACTER ->
-                                        "No text was sent. Use basic US keyboard characters."
-                                    result.failure == AvfLaunch.TextSendFailure.INPUT_REJECTED && result.acceptedCharacters > 0 ->
-                                        "Only ${result.acceptedCharacters} of ${result.totalCharacters} characters were submitted before input stopped."
-                                    result.failure == AvfLaunch.TextSendFailure.INPUT_REJECTED ->
-                                        "The Windows guest rejected the text input."
-                                    else -> "All ${result.totalCharacters} characters were submitted as guest key presses."
-                                }
-                                updateStatus(message)
-                            }
-                        }
-                    }.start()
-                }
+        GuestAgent.exec("shutdown /s /t 0")
+        status = "Windows is shutting down."
+        home.setStatus(status)
+    }
+
+    override fun forceStop() {
+        Thread {
+            AvfLaunch.stopWindows { guestDisplay.vmStopped() }
+            runOnUiThread {
+                status = "Windows is off."
+                booting.visibility = View.GONE
+                show(Screen.HOME)
             }
-        }
-        dialog.show()
-        textInput.post {
-            textInput.requestFocus()
-            val inputMethod = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            inputMethod.showSoftInput(textInput, InputMethodManager.SHOW_IMPLICIT)
-        }
+        }.start()
     }
 
-    private fun updateStatus(message: String) {
-        status.text = message
-        status.contentDescription = "Status: $message"
+    override fun showLogs() {
+        val text = synchronized(console) { console.toString() }.ifBlank { "Nothing yet. The log fills when Windows starts." }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Logs")
+            .setView(ScrollView(this).apply {
+                addView(TextView(this@MainActivity).apply {
+                    this.text = text
+                    typeface = android.graphics.Typeface.MONOSPACE
+                    textSize = 12f
+                    setTextIsSelectable(true)
+                    setPadding(dp(24), dp(8), dp(24), dp(8))
+                })
+            })
+            .setNeutralButton("Copy") { _, _ ->
+                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("HyperWin log", text))
+            }
+            .setPositiveButton("Close", null)
+            .show()
     }
 
-    private fun currentConsole(): String = synchronized(console) { console.toString().takeLast(12000) }
+    override fun reinstall() {
+        replaceOldMachines = true
+        openSetup()
+    }
 
-    private fun isMouseEvent(event: MotionEvent): Boolean =
-        (event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private companion object {
+    companion object {
         const val BOOT_ON_LAUNCH = "bootOnLaunch"
-        val HOST_KEYS = setOf(
+        const val TRACKPAD = "trackpadMode"
+        private const val EXTRA_PREPARE_ISO = "prepareIso"
+        private val HOST_KEYS = setOf(
             KeyEvent.KEYCODE_BACK,
             KeyEvent.KEYCODE_HOME,
             KeyEvent.KEYCODE_POWER,

@@ -1,0 +1,886 @@
+{
+  "drivers": [
+    {
+      "service": "hwpci",
+      "file": "build/hwpci/hwpci.sys",
+      "start": 0,
+      "type": 1,
+      "group": "Boot Bus Extender",
+      "class": "{4d36e97d-e325-11ce-bfc1-08002be10318}",
+      "className": "System",
+      "description": "HyperWin PCI CAM bus",
+      "devices": [
+        {
+          "instance": "ACPI\\HWPC0001\\0",
+          "hardwareIds": [
+            "ACPI\\HWPC0001",
+            "*HWPC0001"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "viostor",
+      "file": "build/virtio-win/viostor/w11/ARM64/viostor.sys",
+      "start": 0,
+      "type": 1,
+      "group": "SCSI miniport",
+      "class": "{4d36e97b-e325-11ce-bfc1-08002be10318}",
+      "className": "SCSIAdapter",
+      "description": "Red Hat VirtIO SCSI controller",
+      "values": {
+        "service": {
+          "Parameters": {
+            "BusType": 1,
+            "DmaRemappingCompatible": 0,
+            "DisableCompletionPoll": 0,
+            "PollIntervalUs": 1000
+          },
+          "Parameters\\PnpInterface": {
+            "5": 1
+          }
+        },
+        "device": {
+          "Device Parameters\\Interrupt Management\\MessageSignaledInterruptProperties": {
+            "MSISupported": 0,
+            "MessageNumberLimit": 257
+          },
+          "Device Parameters\\Interrupt Management\\Affinity Policy": {
+            "DevicePolicy": 5,
+            "GroupPolicy": 1
+          }
+        }
+      },
+      "devices": [
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0008",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0010",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0018",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0020",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0028",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0030",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0038",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0040",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0048",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0050",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0058",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0060",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0068",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0070",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0078",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0080",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0088",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0090",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&0098",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00A0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00A8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00B0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00B8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00C0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00C8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00D0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00D8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00E0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00E8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00F0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01\\3&0&0&00F8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_11001AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0008",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0010",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0018",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0020",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0028",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0030",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0038",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0040",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0048",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0050",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0058",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0060",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0068",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0070",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0078",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0080",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0088",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0090",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&0098",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00A0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00A8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00B0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00B8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00C0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00C8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00D0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00D8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00E0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00E8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00F0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01\\3&0&0&00F8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1042&SUBSYS_10421AF4"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VirtioSocket",
+      "file": "build/virtio-win/viosock/w11/ARM64/viosock.sys",
+      "start": 0,
+      "type": 1,
+      "class": "{4d36e97d-e325-11ce-bfc1-08002be10318}",
+      "className": "System",
+      "description": "VirtIO Socket Driver",
+      "devices": [
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0008",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0010",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0018",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0020",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0028",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0030",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0038",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0040",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0048",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0050",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0058",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0060",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0068",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0070",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0078",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0080",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0088",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0090",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&0098",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00A0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00A8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00B0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00B8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00C0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00C8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00D0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00D8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00E0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00E8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00F0",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        },
+        {
+          "instance": "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01\\3&0&0&00F8",
+          "hardwareIds": [
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053&SUBSYS_10531AF4"
+          ],
+          "compatibleIds": [
+            "PCI\\VEN_1AF4&DEV_1053&REV_01",
+            "PCI\\VEN_1AF4&DEV_1053"
+          ]
+        }
+      ],
+      "values": {
+        "service": {
+          "Parameters\\Wdf": {
+            "KmdfLibraryVersion": "1.15"
+          }
+        },
+        "device": {
+          "Device Parameters\\Interrupt Management\\MessageSignaledInterruptProperties": {
+            "MSISupported": 0,
+            "MessageNumberLimit": 1
+          }
+        }
+      }
+    },
+    {
+      "service": "hwvsinput",
+      "file": "build/hwvsinput/hwvsinput.sys",
+      "start": 0,
+      "type": 1,
+      "class": "{4d36e96b-e325-11ce-bfc1-08002be10318}",
+      "className": "Keyboard",
+      "description": "HyperWin keyboard and mouse (vsock)",
+      "devices": [
+        {
+          "instance": "ROOT\\HWVSKBD\\0000",
+          "hardwareIds": [
+            "ROOT\\HWVSKBD"
+          ],
+          "class": "{4d36e96b-e325-11ce-bfc1-08002be10318}",
+          "className": "Keyboard",
+          "description": "HyperWin keyboard"
+        },
+        {
+          "instance": "ROOT\\HWVSMOU\\0000",
+          "hardwareIds": [
+            "ROOT\\HWVSMOU"
+          ],
+          "class": "{4d36e96f-e325-11ce-bfc1-08002be10318}",
+          "className": "Mouse",
+          "description": "HyperWin mouse"
+        }
+      ]
+    }
+  ]
+}

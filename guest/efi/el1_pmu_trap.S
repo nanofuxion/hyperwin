@@ -32,6 +32,9 @@ Lundef:
     and x15, x17, #0x1f
 Lemulate:
     mrs x17, cntvct_el0
+    nop                             // three slots trace.c fills in: they scale the timer's
+    nop                             // count up to the pace of the real processor's clock
+    nop
     adr x16, Ltable
     add x16, x16, x15, lsl #3
     br x16

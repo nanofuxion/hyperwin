@@ -16,7 +16,13 @@ import java.util.concurrent.atomic.AtomicReference
 object AvfLaunch {
     private const val TAG = "HyperWin"
     private const val PKG = "android.system.virtualmachine."
-    private const val NAME = "hyperwin"
+    /**
+     * AVF keeps one VM object per name, so with a single name the previous VM's late "stopped" can
+     * land on the next one's callback and stop it. Starts alternate between two names; each name's
+     * last VM has long exited by the time it is used again.
+     */
+    private val NAMES = arrayOf("hyperwin-a", "hyperwin-b")
+    private var nextName = 0
     private val keyboardLock = Any()
 
     enum class TextSendFailure { GUEST_UNAVAILABLE, UNSUPPORTED_CHARACTER, INPUT_REJECTED }
@@ -46,6 +52,8 @@ object AvfLaunch {
     private const val HW_FILE_PORT = 5602
 
     @Volatile var machine: Any? = null
+    /** True when the last VM exit was the guest restarting itself (Windows setup does this twice). */
+    @Volatile var lastStopWasReboot = false
         private set
     @Volatile var sharedWindow: AvfPlan.SharedWindow? = null
         private set
@@ -56,14 +64,18 @@ object AvfLaunch {
         VsockInput.key(event)
     }
 
-    /** Sends basic Android IME text as guest key presses for touch-only phones. */
-    fun typeText(text: CharSequence): TextSendResult = synchronized(keyboardLock) {
+    /**
+     * Sends text as guest key presses (US layout). A character with no key stops the whole text,
+     * or is left out when [skipUnknown] is set, as the on-screen keyboard pass-through wants.
+     */
+    fun typeText(text: CharSequence, skipUnknown: Boolean = false): TextSendResult = synchronized(keyboardLock) {
         val normalized = text.toString().replace("\r\n", "\n").replace('\r', '\n')
         if (machine == null) {
             return TextSendResult(0, normalized.length, TextSendFailure.GUEST_UNAVAILABLE)
         }
-        val strokes = normalized.map {
-            guestStroke(it) ?: return TextSendResult(0, normalized.length, TextSendFailure.UNSUPPORTED_CHARACTER)
+        val strokes = normalized.mapNotNull {
+            guestStroke(it) ?: if (skipUnknown) null
+                else return TextSendResult(0, normalized.length, TextSendFailure.UNSUPPORTED_CHARACTER)
         }
         for ((index, stroke) in strokes.withIndex()) {
             if (!sendStroke(stroke)) {
@@ -157,6 +169,10 @@ object AvfLaunch {
     private data class GuestStroke(val keyCode: Int, val shift: Boolean = false)
 
     /** edk2-gunyah, the setup ESP, and the tiny11 ISO. Same shape as the QEMU boot that reached Windows Setup. */
+    /** One start at a time for the whole app: two VMs on one disk corrupt it. */
+    private val booting = java.util.concurrent.atomic.AtomicBoolean(false)
+    const val BUSY = "busy: Windows is already starting or running"
+
     fun bootWindows(
         ctx: Context,
         onVmStarted: () -> Unit = {},
@@ -164,11 +180,30 @@ object AvfLaunch {
         machine: Machine? = Machine.active(ctx),
         onConsole: (String) -> Unit,
     ): String {
+        if (this.machine != null || !booting.compareAndSet(false, true)) return BUSY
+        try {
+            return bootWindowsOnce(ctx, onVmStarted, onVmStopped, machine, onConsole)
+        } finally {
+            booting.set(false)
+        }
+    }
+
+    private fun bootWindowsOnce(
+        ctx: Context,
+        onVmStarted: () -> Unit,
+        onVmStopped: () -> Unit,
+        machine: Machine?,
+        onConsole: (String) -> Unit,
+    ): String {
         val dir = File(ctx.filesDir, "win").apply { mkdirs() }
         val firmware = File(dir, "edk2-gunyah.fd")
         copyAsset(ctx, "edk2-gunyah.fd", firmware)
         if (machine != null && machine.prepared) {
-            val window = AvfPlan.createWindow(ByteArray(0))
+            // A disk with older boot files only knows the default frame size.
+            MachinePrep.hardenBoot(ctx, machine)
+            val (width, height) = if (MachinePrep.refreshLoader(ctx, machine)) machine.frameSize()
+                else AvfPlan.FRAME_WIDTH to AvfPlan.FRAME_HEIGHT
+            val window = AvfPlan.createWindow(ByteArray(0), width, height)
             sharedWindow?.close()
             sharedWindow = window
                 startDebugTap(window, File(dir, "frame.bgra"))
@@ -242,6 +277,7 @@ object AvfLaunch {
             vm.javaClass.getMethod("stop").invoke(vm)
             machine = null
             VsockInput.stop()
+            GuestAgent.stop()
             runCatching { onVmStopped() }
             sharedWindow?.let { window ->
                 sharedWindow = null
@@ -268,7 +304,7 @@ object AvfLaunch {
                     val magic = ByteArray(8).also { for (i in 0 until 8) it[i] = b.get(i) }.decodeToString()
                     val flags = b.getInt(52)
                     val seq = b.getInt(44)
-                    val pixel = b.getInt(0x10000)
+                    val pixel = b.getInt(AvfPlan.frameOffset)
                     val windowState = "$magic flags=${flags.toUInt().toString(16)} seq=$seq pixel=${pixel.toUInt().toString(16)}"
                     if (windowState != lastWindow) {
                         lastWindow = windowState
@@ -277,7 +313,12 @@ object AvfLaunch {
                     val base = 0x7f00000
                     val marks = StringBuilder()
                     for (i in 0 until 20) marks.append(java.lang.Long.toHexString(b.getLong(base + 0x100 + 8 * i))).append(' ')
-                    if (marks.toString() != lastMarks) { lastMarks = marks.toString(); Log.i("HyperWinDbg", "marks " + lastMarks) }
+                    if (marks.toString() != lastMarks) {
+                        lastMarks = marks.toString()
+                        Log.i("HyperWinDbg", "marks " + lastMarks)
+                        val images = (32 until 160).map { b.getLong(base + 0x100 + 8 * it) }.filter { it != 0L }
+                        if (images.isNotEmpty()) Log.i("HyperWinDbg", "images " + images.joinToString(" ") { java.lang.Long.toHexString(it) })
+                    }
                     val diag = "diag " + (0 until 128).joinToString(" ") { Integer.toHexString(b.getInt(0xA00000 + 4 * it)) }
                     if (diag != lastDiag) { lastDiag = diag; Log.i("HyperWinDbg", diag) }
                     if (b.getLong(base) == 0x1111222233334444L && lastCount != 1L) {
@@ -287,12 +328,12 @@ object AvfLaunch {
                             " far=" + h(32) + " lr=" + h(40) + " sp=" + h(48) + " spsr=" + h(56))
                     }
                 }
-                /* Debug builds: save the guest frame (1280x720 BGRA) every few seconds so it can
+                /* Debug builds: save the guest frame (BGRA) every few seconds so it can
                  * be pulled with adb when the app's own controls cover part of it. */
                 if (frameDump != null && ++ticks % 8 == 0) runCatching {
-                    val frame = ByteArray(1280 * 720 * 4)
+                    val frame = ByteArray(AvfPlan.frameBytes)
                     val view = window.buffer.duplicate()
-                    view.position(0x10000)
+                    view.position(AvfPlan.frameOffset)
                     view.get(frame)
                     val tmp = File(frameDump.parentFile, frameDump.name + ".tmp")
                     tmp.writeBytes(frame)
@@ -329,21 +370,43 @@ object AvfLaunch {
             cfgClass.getMethod("setVmOutputCaptured", Boolean::class.javaPrimitiveType).invoke(cfg, true)
             cfgClass.getMethod("setConnectVmConsole", Boolean::class.javaPrimitiveType).invoke(cfg, false)
             val config = cfgClass.getMethod("build").invoke(cfg)
-            runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, NAME) }
-            val vm = vmmClass.getMethod("create", String::class.java, config.javaClass).invoke(vmm, NAME, config)
+            val name = NAMES[nextName++ % NAMES.size]
+            runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, name) }
+            runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, "hyperwin") }   // older builds' name
+            val vm = vmmClass.getMethod("create", String::class.java, config.javaClass).invoke(vmm, name, config)
             val events = LinkedBlockingQueue<String>()
+            // AVF can report one exit twice (onError, then onStopped). Act on the first only, or
+            // a restart would start two VMs on the same disk.
+            val ended = java.util.concurrent.atomic.AtomicBoolean(false)
             val cbClass = Class.forName(PKG + "VirtualMachineCallback")
+            // AVF hands back the same VM object for the same name, so a stop of the previous VM can
+            // arrive after this one is running. A stop while the object says "running" is that one.
+            val launched = java.util.concurrent.atomic.AtomicBoolean(false)   // nothing of ours ends before run()
+            fun stale(): Boolean = !launched.get() || runCatching {
+                vm.javaClass.getMethod("getStatus").invoke(vm) == vm.javaClass.getField("STATUS_RUNNING").getInt(null)
+            }.getOrDefault(false)
             val callback = java.lang.reflect.Proxy.newProxyInstance(cbClass.classLoader, arrayOf(cbClass)) { proxy, m, args ->
+                if ((m.name == "onError" || m.name == "onStopped") && stale()) {
+                    Log.i(TAG, "ignoring a late ${m.name} from the previous VM")
+                    return@newProxyInstance null
+                }
                 when (m.name) {
                     "onPayloadStarted", "onPayloadReady" -> { events.add("started"); null }
                     "onError" -> {
                         events.add("error: ${args?.getOrNull(1)} ${args?.getOrNull(2)}")
-                        handleVmStopped(sharedWindow, onVmStopped)
+                        if (ended.compareAndSet(false, true)) {
+                            lastStopWasReboot = false
+                            handleVmStopped(sharedWindow, onVmStopped)
+                        }
                         null
                     }
                     "onStopped" -> {
                         events.add("stopped: ${args?.getOrNull(1)}")
-                        handleVmStopped(sharedWindow, onVmStopped)
+                        if (ended.compareAndSet(false, true)) {
+                            lastStopWasReboot = args?.getOrNull(1) ==
+                                runCatching { cbClass.getField("STOP_REASON_REBOOT").getInt(null) }.getOrNull()
+                            handleVmStopped(sharedWindow, onVmStopped)
+                        }
                         null
                     }
                     "hashCode" -> System.identityHashCode(proxy)
@@ -356,6 +419,7 @@ object AvfLaunch {
             machine = null
             val backingHook = sharedWindow?.let { AvfPlan.installWindowBackingHook(it) }
             try {
+                launched.set(true)
                 vm.javaClass.getMethod("run").invoke(vm)
             } finally {
                 backingHook?.close()
@@ -385,18 +449,26 @@ object AvfLaunch {
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(if (keep) 45 else 40)
             while (System.nanoTime() < deadline && done.get() == null &&
                 synchronized(console) { !console.contains(expect) }) {
+                // The firmware prints this when it faults; it then hangs, so there is nothing to wait for.
+                if (keep && synchronized(console) { console.contains("Synchronous Exception") }) {
+                    done.set("error: the firmware stopped while starting")
+                    break
+                }
                 val event = events.poll(250, TimeUnit.MILLISECONDS) ?: continue
                 Log.i(TAG, event)
                 if (event.startsWith("error") || event.startsWith("stopped")) done.set(event)
             }
+            if (keep && done.get() == null && synchronized(console) { !console.contains(expect) })
+                done.set("error: the firmware did not reach the Windows loader")
             val tail = synchronized(console) { console.toString().takeLast(2000) }
             if (!keep || done.get() != null) {
                 machine = null
                 runCatching { vm.javaClass.getMethod("stop").invoke(vm) }
-                runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, NAME) }
+                runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, name) }
             } else {
                 machine = vm
                 VsockInput.start(vm)
+                GuestAgent.start(ctx, vm, Machine.active(ctx)?.lanMode == true)
             }
             val result = done.get()?.let { "$it\n$tail" }
                 ?: if (keep) "VM running; Windows desktop not yet verified\n$tail"
@@ -419,6 +491,7 @@ object AvfLaunch {
     private fun handleVmStopped(window: AvfPlan.SharedWindow?, onVmStopped: () -> Unit) {
         machine = null
         VsockInput.stop()
+        GuestAgent.stop()
         runCatching { onVmStopped() }
         if (window != null && sharedWindow === window) {
             sharedWindow = null

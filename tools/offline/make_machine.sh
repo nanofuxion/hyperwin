@@ -41,7 +41,7 @@ EOF
 ntfscp -f "${DEV}s2" stage/SYSTEM.new /Windows/System32/config/SYSTEM
 while read -r f; do ntfscp -f "${DEV}s2" "$f" "/Windows/System32/drivers/$(basename "$f")"; done < stage/driver_files.txt
 
-sed "s/@USER@/$USERNAME/g" "$ROOT/tools/offline/unattend.xml" > stage/unattend.xml
+sed -e "s/@USER@/$USERNAME/g" -e "s/@PASSWORD@//g" -e "s/@COMPUTER@/HYPERWIN/g" "$ROOT/tools/offline/unattend.xml" > stage/unattend.xml
 ntfscp -f "${DEV}s2" stage/unattend.xml /Windows/System32/Sysprep/unattend.xml
 ntfscp -f "${DEV}s2" stage/unattend.xml /Windows/Panther/unattend.xml 2>/dev/null || true
 

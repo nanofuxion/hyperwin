@@ -71,6 +71,166 @@ static void install_el1_trap_logger(uint64_t base);
 #endif
 static uint32_t total_patched;
 
+/* ---- the cycle counter, at the real processor's pace ----
+ * Windows works out the processor's speed by timing its cycle counter, and uses that counter for
+ * all its CPU accounting. This VM has no cycle counter, so reads of it become reads of the
+ * virtual timer, which ticks at about 25 MHz: Windows then reports a 25 MHz processor. Multiplying
+ * every such read by (real clock / timer rate) makes the counter look like the phone's own.
+ * A multiply needs more than the one instruction a read occupies, so each read in the kernel
+ * branches to a five-word stub placed in unused padding of the kernel's code, which reads the
+ * timer, scales it with shifts and adds on the same register, and branches back. */
+#ifdef HYPERWIN_STANDALONE_COMPAT
+#define HW_SCALE_KERNEL_COUNTER 0
+static uint32_t scale_shift;          /* count << scale_shift ... */
+static uint32_t scale_op[2];          /* ... then up to two "x = x +/- (x >> n)", rd = rn = rm = 0 */
+static uint32_t scale_ready;          /* a factor was worked out */
+static uint32_t scale_on;             /* and the kernel has room for every stub */
+static uint64_t kernel_base;
+
+/* Picks shift and corrections whose product is closest to processor Hz / timer Hz. */
+static void plan_scale(void)
+{
+    const struct hw_header *h = (const struct hw_header *)HW_WINDOW_PA;
+    uint64_t frq, want, best = ~0ull;
+    uint32_t a, i, j;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+    if (h->magic[0] != 'H' || h->magic[1] != 'Y' || h->header_bytes < sizeof *h || !h->cpu_mhz || !frq) return;
+    want = (((uint64_t)h->cpu_mhz * 1000000ull) << 16) / frq;             /* 16.16 fixed point */
+    if (want < (2u << 16) || want > (4096u << 16)) return;
+    for (a = 0; a <= 12; ++a) for (i = 0; i < 25; ++i) for (j = 0; j < 25; ++j) {
+        /* i, j: 0 none, 1..12 add x >> n, 13..24 subtract x >> (n - 12) */
+        uint64_t c = 65536ull << a, err;
+        if (i) c = i <= 12 ? c + (c >> i) : c - (c >> (i - 12));
+        if (j) c = j <= 12 ? c + (c >> j) : c - (c >> (j - 12));
+        if (!i && j) continue;
+        err = c > want ? c - want : want - c;
+        if (err >= best) continue;
+        best = err;
+        scale_shift = a;
+        scale_op[0] = !i ? 0 : i <= 12 ? 0x8b400000u | (i << 10) : 0xcb400000u | ((i - 12) << 10);
+        scale_op[1] = !j ? 0 : j <= 12 ? 0x8b400000u | (j << 10) : 0xcb400000u | ((j - 12) << 10);
+    }
+    /* Off. A read must branch to its stub, and the only room for 493 stubs is padding in and around
+     * the kernel's exception vector tables. Windows rewrites some of that at run time, on some
+     * CPUs, so 2 boots in 3 crashed (ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY). Windows reports the
+     * timer's 25 MHz instead; the agent puts the real clock in the registry for display. */
+    scale_ready = HW_SCALE_KERNEL_COUNTER;
+}
+
+/* The three scaling instructions for register r, padded with NOPs. */
+static void emit_scale(volatile uint32_t *out, uint32_t r)
+{
+    uint32_t k;
+    out[0] = scale_shift ? 0xd3400000u | (((64 - scale_shift) & 63) << 16) | ((63 - scale_shift) << 10) | (r << 5) | r
+                         : 0xd503201fu;                                   /* lsl xR, xR, #shift */
+    for (k = 0; k < 2; ++k)
+        out[1 + k] = scale_op[k] ? scale_op[k] | (r << 16) | (r << 5) | r : 0xd503201fu;
+}
+
+/* Unused padding in the kernel's code that stays in memory: runs of zero words in sections that
+ * are neither pageable nor dropped after start-up. These are the gaps around its vector tables. */
+static volatile uint32_t *gap_at[512];
+static uint32_t gap_words[512], gaps, gap_i, gap_off;
+
+static void find_gaps(uint64_t base)
+{
+    uint32_t pe = *(const uint32_t *)(base + 0x3c), nsec, optsz, i;
+    const uint8_t *hdr = (const uint8_t *)(base + pe);
+    gaps = gap_i = gap_off = 0;
+    if (pe < 0x40u || pe > 0x400u || *(const uint32_t *)hdr != 0x4550u) return;
+    nsec = *(const uint16_t *)(hdr + 6);
+    optsz = *(const uint16_t *)(hdr + 20);
+    for (i = 0; i < nsec && i < 32; ++i) {
+        const uint8_t *sec = hdr + 24 + optsz + i * 40;
+        uint32_t vsize = *(const uint32_t *)(sec + 8), va = *(const uint32_t *)(sec + 12);
+        uint32_t flags = *(const uint32_t *)(sec + 36), words = vsize / 4, n = 0;
+        volatile uint32_t *w = (volatile uint32_t *)(base + va);
+        if ((flags & 0x2a000000u) != 0x28000000u || vsize > 0x2000000u) continue;   /* code, not paged, kept */
+        if (sec[0] == 'I' && sec[1] == 'N' && sec[2] == 'I' && sec[3] == 'T') continue;
+        while (n < words) {
+            uint32_t m = n;
+            while (m < words && !w[m]) ++m;
+            if (m - n >= 16 && gaps < 512) {            /* leave a word untouched at each end */
+                gap_at[gaps] = w + n + 1;
+                gap_words[gaps++] = m - n - 2;
+            }
+            n = m > n ? m : n + 1;
+        }
+    }
+}
+
+/* Next free five-word place. A vector entry starts every 0x80 bytes; never begin or cross one. */
+static volatile uint32_t *next_slot(uint32_t *g, uint32_t *off)
+{
+    while (*g < gaps) {
+        while (*off + 5 <= gap_words[*g]) {
+            volatile uint32_t *p = gap_at[*g] + *off;
+            uint64_t a = (uint64_t)p & 0x7f;
+            if (a == 0 || a > 0x80 - 20) { *off += 1; continue; }
+            *off += 5;
+            return p;
+        }
+        ++*g;
+        *off = 0;
+    }
+    return 0;
+}
+
+/* Counter reads already rewritten to plain timer reads. The kernel is patched while the loader
+ * is still filling it in, before anyone knows it is the kernel; these are upgraded afterwards. */
+static volatile uint32_t *read_site[4096];
+static uint32_t read_sites, read_lost;
+
+/* Turns the read at site into a branch to a stub that reads, scales and returns. */
+static int scaled_read(volatile uint32_t *site, uint32_t rt)
+{
+    volatile uint32_t *stub = next_slot(&gap_i, &gap_off);
+    int64_t back, out;
+    if (!stub) return 0;
+    back = (int64_t)(uint64_t)(site + 1) - (int64_t)(uint64_t)(stub + 4);
+    out = (int64_t)(uint64_t)stub - (int64_t)(uint64_t)site;
+    stub[0] = 0xd53be040u | rt;                                          /* mrs xN, CNTVCT_EL0 */
+    emit_scale(stub + 1, rt);
+    stub[4] = 0x14000000u | ((uint32_t)(back >> 2) & 0x03ffffffu);      /* b site + 4 */
+    flush_code((void *)stub, 20);
+    *site = 0x14000000u | ((uint32_t)(out >> 2) & 0x03ffffffu);         /* b stub */
+    flush_code((void *)site, 4);
+    return 1;
+}
+
+/* A run of free padding for a trap stub: the first gap big enough, taken from its start.
+ * Only non-paged, kept code qualifies, because the trap stubs run inside exception handling. */
+static uint8_t *take_space(uint32_t bytes)
+{
+    uint32_t g, words = (bytes + 3) / 4;
+    for (g = 0; g < gaps; ++g) {
+        uint8_t *p;
+        if (gap_words[g] < words) continue;
+        p = (uint8_t *)gap_at[g];
+        gap_at[g] += words;
+        gap_words[g] -= words;
+        return p;
+    }
+    return 0;
+}
+
+static uint32_t count_reads(uint64_t base)
+{
+    uint32_t pe = *(const uint32_t *)(base + 0x3c), nsec, optsz, i, total = 0;
+    const uint8_t *hdr = (const uint8_t *)(base + pe);
+    nsec = *(const uint16_t *)(hdr + 6);
+    optsz = *(const uint16_t *)(hdr + 20);
+    for (i = 0; i < nsec && i < 32; ++i) {
+        const uint8_t *sec = hdr + 24 + optsz + i * 40;
+        uint32_t vsize = *(const uint32_t *)(sec + 8), va = *(const uint32_t *)(sec + 12), n;
+        const volatile uint32_t *w = (const volatile uint32_t *)(base + va);
+        if (!(*(const uint32_t *)(sec + 36) & 0x20000000u) || vsize > 0x2000000u) continue;
+        for (n = 0; n < vsize / 4; ++n) if ((w[n] & 0xffffffe0u) == 0xd53b9d00u) ++total;
+    }
+    return total;
+}
+#endif
+
 /* AVF runs crosvm with --no-pmu, so any access to a PMU register is an UNDEF. Windows boot
  * code reads the cycle counter (PMCCNTR_EL0) as its clock and programs PMCR_EL0 and friends
  * without checking for a PMU. Rewrite those instructions in the loaded copy: cycle-counter
@@ -104,7 +264,16 @@ static uint32_t patch_pmu(uint64_t base)
             if (top != 0xd5380000u && top != 0xd5180000u) continue;   /* MRS / MSR, op0 = 3 */
             if (!((crn == 9 && (op1 == 3 || op1 == 0)) || (crn == 14 && op1 == 3 && crm >= 8))) continue;
             if (top == 0xd5180000u) w[n] = 0xd503201fu;                              /* msr -> nop */
-            else if (crn == 9 && crm == 13 && op2 == 0 && op1 == 3) w[n] = 0xd53be040u | rt; /* PMCCNTR -> CNTVCT */
+            else if (crn == 9 && crm == 13 && op2 == 0 && op1 == 3) {                 /* PMCCNTR -> CNTVCT */
+#ifdef HYPERWIN_STANDALONE_COMPAT
+                if (scale_on && base == kernel_base && rt != 31 && scaled_read(&w[n], rt)) {
+                    ++total;
+                    continue;
+                }
+                if (read_sites < 4096) read_site[read_sites++] = &w[n]; else read_lost = 1;
+#endif
+                w[n] = 0xd53be040u | rt;
+            }
             else if (crn == 9 && crm == 12 && op2 == 0 && op1 == 3)
                 w[n] = rt == 31 ? 0xd503201fu : (0xd2800020u | rt);                  /* PMCR.E reads as 1 */
             else if (crn == 9 && crm == 12 && op2 == 1 && op1 == 3)
@@ -137,6 +306,20 @@ static void write_b(uint32_t *site, uint64_t target)
 {
     int64_t delta = (int64_t)target - (int64_t)(uint64_t)site;
     *site = 0x14000000u | ((uint32_t)(delta >> 2) & 0x03ffffffu);
+}
+
+/* The trap stubs answer counter reads the in-place rewrite cannot reach (user programs, drivers
+ * loaded later). They scale the same way: the three NOPs after their timer read are the slots. */
+static void scale_stub(uint8_t *stub, uint32_t bytes)
+{
+    uint32_t n;
+    if (!scale_on || !stub) return;
+    for (n = 0; n + 16 <= bytes; n += 4)
+        if (*(const uint32_t *)(stub + n) == (0xd53be040u | 17)) {
+            emit_scale((volatile uint32_t *)(stub + n + 4), 17);
+            flush_code(stub + n + 4, 12);
+            return;
+        }
 }
 
 static void install_el0_pmccntr(uint64_t base)
@@ -180,6 +363,9 @@ static void install_el0_pmccntr(uint64_t base)
         }
     }
     if (!vec) { el0_stub_status = 2; return; }
+    /* Kernels differ (another Windows build, or the recovery environment's own kernel): when the
+     * usual spot is not there, any free padding in the kernel's resident code does. */
+    if (!cave) cave = take_space(sizeof(pmcc_stub));
     if (!cave) { el0_stub_status = 3; return; }
     for (i = 0; i < sizeof(pmcc_stub); ++i) cave[i] = pmcc_stub[i];
     write_b((uint32_t *)(cave + sizeof(pmcc_stub) - 4), (uint64_t)(vec + 4));
@@ -213,21 +399,10 @@ static void install_el1_trap_logger(uint64_t base)
     if (pe < 0x40u || pe > 0x400u || *(const uint32_t *)(base + pe) != 0x4550u) return;
     nsec = *(const uint16_t *)(base + pe + 6);
     optsz = *(const uint16_t *)(base + pe + 20);
-    for (i = 0; i < nsec && i < 32 && !cave; ++i) {
-        const uint8_t *sec = (const uint8_t *)(base + pe + 24 + optsz + i * 40);
-        uint32_t vsize = *(const uint32_t *)(sec + 8), va = *(const uint32_t *)(sec + 12);
-        uint32_t flags = *(const uint32_t *)(sec + 36);
-        uint8_t *p = (uint8_t *)(base + va);
-        uint32_t n;
-        if (!(flags & 0x20000000u) || vsize < sizeof(el1_stub) || vsize > 0x2000000u) continue;
-        for (n = 0; n + sizeof(el1_stub) <= vsize && !cave; n += 4) {
-            uint32_t z;
-            uint8_t *cand = p + n;
-            if (cand >= el0_cave_addr && cand < el0_cave_addr + sizeof(pmcc_stub) + 16) continue;
-            for (z = 0; z < sizeof(el1_stub); ++z) if (cand[z]) break;
-            if (z == sizeof(el1_stub)) cave = cand;
-        }
-    }
+    (void)nsec; (void)optsz; (void)i;
+    /* Resident padding only: this stub runs while handling an exception, where a page fault on
+     * pageable code would recurse until the kernel gives up (PANIC_STACK_SWITCH). */
+    cave = take_space(sizeof(el1_stub));
     if (!cave) { el1_stub_status = 3; return; }
     for (i = 0; i < sizeof(el1_stub); ++i) cave[i] = el1_stub[i];
     *(volatile uint32_t *)(cave + sizeof(el1_stub) - 8) = *(const uint32_t *)el1_vec;
@@ -285,9 +460,24 @@ static uint64_t loader_spans[8];
 static uint32_t loader_patched_count[8];
 static uint32_t loader_base_n;
 
+/* Only boot applications (winload, winresume) run before ExitBootServices, so only they need
+ * patching while they load. The kernel and boot drivers wait until ExitBootServices: the loader
+ * checks their signatures after loading them, and an image changed before that check fails it
+ * (0xc0000221, "a critical system driver is missing or contains errors"). */
+static int is_boot_application(uint64_t base)
+{
+    uint32_t pe = *(const uint32_t *)(base + 0x3c);
+    uint16_t subsystem;
+    if (pe < 0x40u || pe > 0x400u || *(const uint32_t *)(base + pe) != 0x4550u) return 0;
+    subsystem = *(const uint16_t *)(base + pe + 24 + 68);
+    /* 16: Windows boot application (bootmgr, winload, winresume); 10-13: plain EFI images */
+    return subsystem == 16 || (subsystem >= 10 && subsystem <= 13);
+}
+
 static void repatch_loader(uint64_t base, uint64_t span)
 {
     uint32_t i, n;
+    if (!is_boot_application(base)) return;
     n = patch_pmu(base);
     for (i = 0; i < loader_base_n; ++i) if (loader_bases[i] == base) {
         if (n > loader_patched_count[i]) {
@@ -346,6 +536,8 @@ static void patch_os_images(void)
             const uint8_t *p = (const uint8_t *)(os_alloc[i].addr + off);
             if (!is_arm64_image(p, bytes - off, &size)) continue;
             total += patch_pmu((uint64_t)p);
+            /* [32 + n]: TimeDateStamp << 32 | SizeOfImage of each OS image, to tell which drivers winload loaded. */
+            if (images < 128) DBG_MARK[32 + images] = (uint64_t)*(const uint32_t *)(p + *(const uint32_t *)(p + 0x3c) + 8) << 32 | size;
             ++images;
             off += (((uint64_t)size + 4095u) & ~4095ull) - 4096;
         }
@@ -396,8 +588,36 @@ static void mark_kernel_entry(void)
             flush_code((void *)(best + 0x5ac65cu), 4);
             DBG_MARK[8] |= 0x100000000ull;
         }
+        /* Scaling needs a place for every counter read in the kernel, with room to spare for
+         * the two trap stubs, which take their space first. Otherwise nothing is scaled. */
+        kernel_base = best;
+        plan_scale();
+        find_gaps(best);                      /* free padding: the trap stubs take theirs first */
         install_el0_pmccntr(best);
         install_el1_trap_logger(best);
+        find_gaps(best);                      /* again: what is left is for the scaled reads */
+        {
+            /* All or nothing: a counter scaled at some reads and not at others runs backwards. */
+            uint32_t g = 0, off = 0, room = 0, reads = count_reads(best), k;
+            for (k = 0; k < read_sites; ++k)
+                if ((uint64_t)read_site[k] >= best && (uint64_t)read_site[k] < best + best_size) ++reads;
+            while (next_slot(&g, &off)) ++room;
+            scale_on = scale_ready && !read_lost && el0_stub_status == 1 && el1_stub_status == 1 && room >= reads;
+            DBG_MARK[10] = (uint64_t)room << 32 | reads;
+        }
+        scale_stub(el0_cave_addr, sizeof(pmcc_stub));
+        scale_stub(el1_cave_addr, sizeof(el1_stub));
+        if (scale_on) {
+            uint32_t k, done = 0;
+            for (k = 0; k < read_sites; ++k) {
+                volatile uint32_t *site = read_site[k];
+                if ((uint64_t)site < best || (uint64_t)site >= best + best_size) continue;
+                if ((*site & 0xffffffe0u) != 0xd53be040u || (*site & 31u) == 31u) continue;
+                done += scaled_read(site, *site & 31u);
+            }
+            DBG_MARK[12] = done;
+        }
+        DBG_MARK[11] = (uint64_t)scale_on << 32 | scale_shift << 24 | (scale_op[0] >> 10 & 0x3f) << 8 | (scale_op[1] >> 10 & 0x3f);
         DBG_MARK[6] = el0_stub_status;
         DBG_MARK[7] = best;
         DBG_MARK[9] = el1_stub_status;
@@ -490,8 +710,8 @@ static uint64_t hook_exit_boot_services(uint64_t image, uint64_t key, uint64_t c
         uint32_t image_bytes = *(const uint32_t *)(base + pe + 24 + 56);
         put("PMU-PATCH stamp="); puthex(stamp); put(" soi="); puthex(image_bytes); put("\r\n");
     }
+    mark_kernel_entry();       /* first: it finds the kernel and decides how its counter reads are patched */
     patch_os_images();
-    mark_kernel_entry();
     DBG_MARK[0] = 1;
     r = orig[ID_EXIT_BOOT_SERVICES](image, key, c, d, e, f);
     DBG_MARK[1] = r;

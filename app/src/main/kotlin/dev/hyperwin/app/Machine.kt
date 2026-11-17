@@ -21,10 +21,21 @@ data class Machine(
     var password: String = "",
     var computerName: String = "HYPERWIN",
     var testSigning: Boolean = true,
+    /** Guest uses the phone's own Wi-Fi address instead of a private NAT address. */
+    var lanMode: Boolean = false,
+    /** Checksum of our boot files as last written to this disk's boot partition. */
+    var loaderStamp: Long = 0,
     var prepared: Boolean = false,
 ) {
     val json get() = File(dir, "machine.json")
     val disk get() = File(dir, "system.img")
+
+    /** Guest frame size from [screenSize], or the default when it is not one the display path takes. */
+    fun frameSize(): Pair<Int, Int> {
+        val parts = screenSize.split('x').mapNotNull { it.trim().toIntOrNull() }
+        return if (parts.size == 2 && AvfPlan.validFrame(parts[0], parts[1])) parts[0] to parts[1]
+        else AvfPlan.FRAME_WIDTH to AvfPlan.FRAME_HEIGHT
+    }
 
     fun save() {
         dir.mkdirs()
@@ -44,6 +55,8 @@ data class Machine(
             .put("password", password)
             .put("computerName", computerName)
             .put("testSigning", testSigning)
+            .put("lanMode", lanMode)
+            .put("loaderStamp", loaderStamp)
             .put("prepared", prepared)
         val tmp = File(dir, "machine.json.tmp")
         tmp.writeText(data.toString(2))
@@ -77,6 +90,8 @@ data class Machine(
                 password = d.optString("password"),
                 computerName = d.optString("computerName", "HYPERWIN"),
                 testSigning = d.optBoolean("testSigning", true),
+                lanMode = d.optBoolean("lanMode", false),
+                loaderStamp = d.optLong("loaderStamp", 0),
                 prepared = d.optBoolean("prepared", false),
             )
         }.getOrNull()

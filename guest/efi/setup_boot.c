@@ -17,9 +17,8 @@ static efi_fn proto_fn(void *protocol, int index)
 static void paint(uint32_t bgra)
 {
     struct hw_header *h = (struct hw_header *)HW_WINDOW_PA;
-    uint32_t *px = (uint32_t *)(HW_WINDOW_PA + HW_FRAME0);
-    uint32_t i;
-    for (i = 0; i < HW_WIDTH * HW_HEIGHT; i++) px[i] = bgra;
+    uint32_t *px = (uint32_t *)(HW_WINDOW_PA + hw_frame_off(h, 0)), i;
+    if (hw_mode_ok(h)) for (i = 0; i < h->width * h->height; i++) px[i] = bgra;
     __atomic_or_fetch(&h->guest_flags, HW_GUEST_RING_RESERVED | HW_GUEST_GOP, __ATOMIC_RELEASE);
 }
 
@@ -141,7 +140,7 @@ uint64_t SetupBootEntry(void *image, void *system)
             address = HW_WINDOW_PA + i;
             bs_fn(bs, 2)(2, 0, (2u * 1024u * 1024u) / 4096, (uint64_t)&address, 0, 0);
         }
-        paint(0xff2030c0u);
+        paint(0);                 /* black, and byte-for-byte the frame the host starts with */
     }
     status = bs_fn(bs, 16)((uint64_t)image, (uint64_t)li_guid, (uint64_t)&loaded, 0, 0, 0);
     if (status || !loaded) return status;
@@ -150,7 +149,6 @@ uint64_t SetupBootEntry(void *image, void *system)
     if (status || !fs) return status;
     status = proto_fn(fs, 0)((uint64_t)fs, (uint64_t)&ours, 0, 0, 0, 0);
     if (status || !ours) return status;
-    if (has_window) paint(0xff20a040u);
     start_path(bs, image, ours, gop_path);
     status = start_path(bs, image, ours, compat_path);
     if (status) return status;
@@ -158,7 +156,6 @@ uint64_t SetupBootEntry(void *image, void *system)
         volatile uint32_t *diag = (volatile uint32_t *)(HW_WINDOW_PA + HW_DIAG);
         diag[1] = (uint32_t)HyperwinInstallPciSsdt(system);
     }
-    if (has_window) paint(0xffc0a020u);
     /* A prepared machine disk carries Windows on this same disk. */
     {
         void *probe = 0;

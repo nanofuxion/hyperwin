@@ -18,9 +18,20 @@ object AvfPlan {
     const val WINDOWS_MEMORY_MIB = 3072
     const val WINDOWS_VM_MEMORY_MIB = WINDOWS_MEMORY_MIB + WINDOW_SIZE_MIB
     const val WINDOW_GUARD_BELOW_TOP_MIB = 16
+    /** Default guest frame size. A machine may ask for another; see include/hw_abi.h for the limits. */
     const val FRAME_WIDTH = 1280
     const val FRAME_HEIGHT = 720
-    const val FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * 4
+    /** Frame size of the window made last, which is the running guest's. */
+    @Volatile var frameWidth = FRAME_WIDTH
+        private set
+    @Volatile var frameHeight = FRAME_HEIGHT
+        private set
+    val frameBytes get() = frameWidth * frameHeight * 4
+    /** hw_frame_off(h, 0): big frames start past the audio ring. */
+    val frameOffset get() = if (2 * frameBytes > 0x800000 - 0x10000) 0x1000000 else 0x10000
+
+    fun validFrame(width: Int, height: Int) =
+        width in 640..4096 && height in 480..2304 && 0x1000000L + 2L * width * height * 4 <= 0x7f00000L
     /** Keep the ring inside UEFI conventional RAM, with room below its top boundary. */
     const val WINDOW_PA = RAM_BASE_PA + (WINDOWS_MEMORY_MIB - WINDOW_SIZE_MIB - WINDOW_GUARD_BELOW_TOP_MIB).toLong() * 1024 * 1024
     const val VSOCK_PORT = 5601
@@ -41,10 +52,21 @@ object AvfPlan {
     }
 
     /** ashmem region crosvm maps with --file-backed-mapping. Same hook SweetCider uses. */
-    fun createWindow(seed: ByteArray): SharedWindow {
+    fun createWindow(seed: ByteArray, width: Int = FRAME_WIDTH, height: Int = FRAME_HEIGHT): SharedWindow {
         val shm = SharedMemory.create("hyperwin", WINDOW_SIZE)
         val map = shm.mapReadWrite().order(ByteOrder.LITTLE_ENDIAN)
         WindowBridge.nativeInit(map, seed)
+        val valid = validFrame(width, height)
+        frameWidth = if (valid) width else FRAME_WIDTH
+        frameHeight = if (valid) height else FRAME_HEIGHT
+        // Windows shows these as the computer and processor instead of the firmware's "Gunyah" text.
+        val soc = listOf(android.os.Build.SOC_MANUFACTURER, android.os.Build.SOC_MODEL)
+            .filter { it.isNotBlank() && it != android.os.Build.UNKNOWN }
+        WindowBridge.nativeConfigure(
+            map, frameWidth, frameHeight, hostCpuMhz(),
+            android.os.Build.MANUFACTURER, android.os.Build.MODEL,
+            soc.firstOrNull().orEmpty(), soc.joinToString(" "),
+        )
         val parcel = android.os.Parcel.obtain()
         shm.writeToParcel(parcel, 0)
         parcel.setDataPosition(0)
@@ -53,6 +75,12 @@ object AvfPlan {
         val link = runCatching { Os.readlink("/proc/self/fd/${pfd.fd}") }.getOrDefault("?")
         return SharedWindow(shm, map, pfd, link)
     }
+
+    /** Top clock of the phone's fastest core, in MHz. */
+    fun hostCpuMhz(): Int =
+        (File("/sys/devices/system/cpu").listFiles { f -> f.name.matches(Regex("cpu\\d+")) } ?: emptyArray())
+            .mapNotNull { runCatching { File(it, "cpufreq/cpuinfo_max_freq").readText().trim().toInt() / 1000 }.getOrNull() }
+            .maxOrNull() ?: 0
 
     /**
      * The public Java custom-image builder currently serializes no custom memory backing files.
