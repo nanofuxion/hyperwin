@@ -2,6 +2,7 @@
 // nativeStop(), nativeSetLayer(surfaceControl, width, height). window is the direct ByteBuffer the
 // app already maps for the shared window.
 #include <jni.h>
+#include <android/native_window_jni.h>
 #include <android/surface_control_jni.h>
 
 #include "hwgpu_host.h"
@@ -33,4 +34,11 @@ extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeSetLaye
 
 extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeSetVsync(JNIEnv*, jobject, jboolean on) {
     hwgpu_host_set_vsync(on ? 1 : 0);
+}
+
+// HwD3D's layer and a Surface on it, or nulls.
+extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeSetD3dLayer(JNIEnv* env, jobject, jobject layer,
+                                                                                    jobject surface) {
+    hwgpu_host_set_d3d_layer(layer ? ASurfaceControl_fromJava(env, layer) : nullptr,
+                             surface ? ANativeWindow_fromSurface(env, surface) : nullptr);
 }

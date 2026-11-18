@@ -8,12 +8,18 @@
 //
 // The swap chain presents into an AImageReader's window, which a thread drains, so frames go through
 // a real Android buffer queue without a display.
+//
+// Built for Windows too (gpu/guest/hwd3d/build.sh, d3dcube-*.exe), it is HwD3D's phase-2 test: the
+// same cube through HwD3D's d3d11.dll beside it, onto the phone's screen.
+//   d3dcube.exe [seconds] [width] [height]
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
 
+#ifndef _WIN32
 #include <android/native_window.h>
 #include <media/NdkImageReader.h>
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -69,16 +75,40 @@ void build_cube(Vertex* out) {
         }
 }
 
+#ifdef _WIN32
+// Windows (HwD3D's guest test): a plain window to name in the swap chain, kept answering.
+HWND make_window(int w, int h) {
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "hwd3d_cube";
+    RegisterClassA(&wc);
+    HWND wnd = CreateWindowA("hwd3d_cube", "HwD3D cube", WS_POPUP | WS_VISIBLE, 0, 0, w, h, nullptr, nullptr,
+                             wc.hInstance, nullptr);
+    return wnd;
+}
+
+void pump() {
+    MSG m;
+    while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageA(&m);
+}
+#else
 void drain(void*, AImageReader* reader) {
     AImage* img = nullptr;
     while (AImageReader_acquireNextImage(reader, &img) == AMEDIA_OK && img) AImage_delete(img);
 }
+
+void pump() {}
+#endif
 
 }  // namespace
 
 int main(int argc, char** argv) {
     int seconds = argc > 1 ? atoi(argv[1]) : 10;
     int w = argc > 2 ? atoi(argv[2]) : 1280, h = argc > 3 ? atoi(argv[3]) : 720;
+#ifdef _WIN32
+    HWND window = make_window(w, h);
+#else
     setenv("DXVK_WSI_DRIVER", "Android", 0);
 
     AImageReader* reader = nullptr;
@@ -91,6 +121,7 @@ int main(int argc, char** argv) {
     AImageReader_setImageListener(reader, &listener);
     ANativeWindow* window = nullptr;
     AImageReader_getWindow(reader, &window);
+#endif
 
     DXGI_SWAP_CHAIN_DESC scd{};
     scd.BufferCount = 1;
@@ -200,6 +231,7 @@ int main(int argc, char** argv) {
         ctx->PSSetShader(ps, nullptr, 0);
         ctx->Draw(36, 0);
         hr = swap->Present(0, 0);
+        pump();
         if (FAILED(hr)) {
             printf("FAIL Present 0x%08x after %llu frames\n", unsigned(hr), frames);
             break;

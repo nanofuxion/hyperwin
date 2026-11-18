@@ -14,6 +14,7 @@ import android.os.Message
 import android.os.Messenger
 import android.os.Process
 import android.os.SharedMemory
+import android.view.Surface
 import android.view.SurfaceControl
 import android.util.Log
 import java.io.File
@@ -98,6 +99,7 @@ object HwGpu {
     // The compositor layer GPU frames go on (SGPU_CMD_SCANOUT), above the CPU-drawn desktop. This
     // process owns it and lends it to each renderer, so it outlives a renderer that is replaced.
     private var layer: SurfaceControl? = null
+    private var d3dLayer: SurfaceControl? = null
     private var layerWidth = 0
     private var layerHeight = 0
     private var service: Messenger? = null
@@ -115,14 +117,17 @@ object HwGpu {
 
     private fun layerBundle() = Bundle().apply {
         putParcelable("layer", layer)
+        putParcelable("d3dLayer", d3dLayer)
         putInt("layerWidth", layerWidth)
         putInt("layerHeight", layerHeight)
     }
 
-    /** The layer scanout frames go on and the size it covers, or null when the view has none. */
-    fun setLayer(sc: SurfaceControl?, width: Int, height: Int) {
+    /** The layers scanout and HwD3D frames go on and the size they cover, or nulls when the view
+     *  has none. */
+    fun setLayer(sc: SurfaceControl?, d3d: SurfaceControl?, width: Int, height: Int) {
         val sameLayer = sc != null && sc === layer
         layer = sc
+        d3dLayer = d3d
         layerWidth = width
         layerHeight = height
         val msg = Message.obtain(null, if (sameLayer) GpuService.LAYER_SIZE else GpuService.LAYER).apply { data = layerBundle() }
@@ -132,6 +137,7 @@ object HwGpu {
     /** Takes the GPU's frame off the screen, for when nobody will replace it (renderer or VM gone). */
     fun hideLayer() {
         layer?.let { sc -> runCatching { SurfaceControl.Transaction().setVisibility(sc, false).apply() } }
+        d3dLayer?.let { sc -> runCatching { SurfaceControl.Transaction().setVisibility(sc, false).apply() } }
     }
 
     private val connection = object : ServiceConnection {
@@ -347,9 +353,17 @@ class GpuService : Service() {
             "loader ${System.getenv("ANDROID_EMU_VK_LOADER_PATH") ?: "phone"}, driver ${System.getenv("HWGPU_VK_DRIVER") ?: "phone"}")
     }
 
+    // HwD3D's layer and the Surface its swap chains draw into, made here so the buffers come from this process.
+    private var d3dSurface: Surface? = null
+
     private fun setLayer(data: Bundle) {
         val sc = data.getParcelable("layer", SurfaceControl::class.java)
         nativeSetLayer(sc, data.getInt("layerWidth"), data.getInt("layerHeight"))
+        val d3d = data.getParcelable("d3dLayer", SurfaceControl::class.java)
+        val surface = d3d?.let { runCatching { Surface(it) }.onFailure { e -> Log.e(TAG, "no HwD3D surface", e) }.getOrNull() }
+        nativeSetD3dLayer(d3d, surface)
+        d3dSurface?.release()
+        d3dSurface = surface
     }
 
     override fun onBind(intent: Intent): IBinder = messenger.binder
@@ -366,4 +380,5 @@ class GpuService : Service() {
     private external fun nativeSetLayer(layer: SurfaceControl?, width: Int, height: Int)
     private external fun nativeSetLayerSize(width: Int, height: Int)
     private external fun nativeSetVsync(on: Boolean)
+    private external fun nativeSetD3dLayer(layer: SurfaceControl?, surface: Surface?)
 }

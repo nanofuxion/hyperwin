@@ -53,7 +53,11 @@ done
 # Phone storage as drives: the service and the WinFsp installer it needs.
 [ -f "$ROOT/build/files/hwfiles.exe" ] || sh "$ROOT/guest/files/build.sh"
 cp "$ROOT/build/files/hwfiles.exe" "$ROOT/build/files/winfsp.msi" "$OUT/guest/gpu/"
-# DXVK, vkd3d-proton and Zink, which use.cmd puts beside a program (Send To in Explorer).
+# HwD3D's DLLs (d3d/README.md), rebuilt when their sources or the thunk generator changed.
+for f in "$ROOT"/gpu/guest/hwd3d/* "$ROOT/gpu/host/hwd3d/gen_thunks.py" "$ROOT/include/hw_d3d.h"; do
+  [ "$ROOT/gpu/work/out/dx/hwd3d/d3d11.dll" -nt "$f" ] || { bash "$ROOT/gpu/guest/hwd3d/build.sh" >/dev/null; break; }
+done
+# DXVK, vkd3d-proton, Zink and HwD3D, which use.cmd puts beside a program (Send To in Explorer).
 cp -R "$ROOT/gpu/work/out/dx" "$OUT/guest/gpu/"
 perl -pe 's/\r?\n/\r\n/' "$ROOT/gpu/guest/dx/use.cmd" > "$OUT/guest/gpu/dx/use.cmd"
 # The app compares this with C:\HyperWin\gpu\stamp.txt and sends the files again when they differ.

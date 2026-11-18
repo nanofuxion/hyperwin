@@ -1111,6 +1111,69 @@ int hwgpu_host_set_layer(void* layer, int view_width, int view_height) {
     return 0;
 }
 
+// ---- HwD3D's surface ----
+
+namespace {
+std::mutex g_d3d_lock;
+#ifdef __ANDROID__
+ASurfaceControl* g_d3d_layer = nullptr;
+ANativeWindow* g_d3d_window = nullptr;
+#endif
+bool g_d3d_shown = false;
+}  // namespace
+
+void hwgpu_host_set_d3d_layer(void* layer, void* window) {
+#ifdef __ANDROID__
+    std::lock_guard<std::mutex> l(g_d3d_lock);
+    if (g_d3d_layer) ASurfaceControl_release(g_d3d_layer);
+    if (g_d3d_window) ANativeWindow_release(g_d3d_window);
+    g_d3d_layer = static_cast<ASurfaceControl*>(layer);
+    g_d3d_window = static_cast<ANativeWindow*>(window);
+    if (g_d3d_layer && g_d3d_shown) {
+        ASurfaceTransaction* t = ASurfaceTransaction_create();
+        ASurfaceTransaction_setVisibility(t, g_d3d_layer, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+        ASurfaceTransaction_apply(t);
+        ASurfaceTransaction_delete(t);
+    }
+#else
+    (void)layer;
+    (void)window;
+#endif
+}
+
+void* hwgpu_host_d3d_window_acquire(void) {
+#ifdef __ANDROID__
+    std::lock_guard<std::mutex> l(g_d3d_lock);
+    if (g_d3d_window) ANativeWindow_acquire(g_d3d_window);
+    return g_d3d_window;
+#else
+    return nullptr;
+#endif
+}
+
+void hwgpu_host_d3d_window_release(void* window) {
+#ifdef __ANDROID__
+    if (window) ANativeWindow_release(static_cast<ANativeWindow*>(window));
+#else
+    (void)window;
+#endif
+}
+
+void hwgpu_host_d3d_show(int on) {
+    std::lock_guard<std::mutex> l(g_d3d_lock);
+    g_d3d_shown = on != 0;
+#ifdef __ANDROID__
+    if (!g_d3d_layer) return;
+    ASurfaceTransaction* t = ASurfaceTransaction_create();
+    ASurfaceTransaction_setVisibility(t, g_d3d_layer, on ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
+                                                         : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+    ASurfaceTransaction_apply(t);
+    ASurfaceTransaction_delete(t);
+#endif
+}
+
+int hwgpu_host_vsync(void) { return (g_scanout_flags.load() & HWGPU_SCANOUT_VSYNC) != 0; }
+
 void hwgpu_host_set_vsync(int on) {
     g_scanout_flags = on ? HWGPU_SCANOUT_VSYNC : 0;
     if (!g_window) return;

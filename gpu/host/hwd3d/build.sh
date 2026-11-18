@@ -18,13 +18,16 @@ if [ ! -d "$SRC" ]; then
   git clone --branch "$DXVK_TAG" --depth 1 --recurse-submodules --shallow-submodules https://github.com/doitsujin/dxvk.git "$SRC"
   git -C "$SRC" apply "$HERE/dxvk-android.patch"
 fi
+# 16 KB pages: Android 15+ warns at install about libraries aligned for 4 KB.
+PAGES=-Wl,-z,max-page-size=16384
 [ -d "$BUILD" ] || meson setup "$BUILD" "$SRC" --cross-file "$WORK/gfx-android.ini" --buildtype release \
   -Dnative_sdl2=disabled -Dnative_sdl3=disabled -Dnative_glfw=disabled
+meson configure "$BUILD" -Dc_link_args="$PAGES" -Dcpp_link_args="$PAGES"
 ninja -C "$BUILD"
 mkdir -p "$OUT"
 for p in d3d11 dxgi d3d10 d3d9 d3d8; do cp "$BUILD"/src/$p/libdxvk_*.so "$OUT/"; done
 "$CXX" -std=c++17 -O2 -fPIE -pie -Wall -Wno-extern-c-compat \
   -I"$SRC/include/native/windows" -I"$SRC/include/native/directx" -I"$SRC/include/native" \
   -I"$SRC/include/vulkan/include" "$HERE/cube.cpp" -L"$OUT" -ldxvk_d3d11 -ldxvk_dxgi -lmediandk -landroid \
-  -o "$OUT/hwd3d_cube"
+  "$PAGES" -o "$OUT/hwd3d_cube"
 ls "$OUT"

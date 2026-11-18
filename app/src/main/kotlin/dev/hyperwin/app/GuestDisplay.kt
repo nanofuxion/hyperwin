@@ -36,7 +36,8 @@ class GuestDisplay(
                 startIfReady()
             }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                layer?.let { HwGpu.setLayer(it, width, height) }
+                d3dLayer?.let { SurfaceControl.Transaction().setBufferSize(it, width, height).apply() }
+                layer?.let { HwGpu.setLayer(it, d3dLayer, width, height) }
             }
             override fun surfaceDestroyed(holder: SurfaceHolder) {
                 dropLayer()
@@ -54,6 +55,8 @@ class GuestDisplay(
 
     /** GPU frames from Windows go here, a layer just above this view's own CPU-drawn picture. */
     private var layer: SurfaceControl? = null
+    /** HwD3D's swap chains draw here (d3d/README.md), a layer above that one. */
+    private var d3dLayer: SurfaceControl? = null
 
     private fun makeLayer() {
         if (layer != null) return
@@ -71,15 +74,30 @@ class GuestDisplay(
             }
         }.apply()
         layer = sc
-        HwGpu.setLayer(sc, view.width, view.height)
+        // A buffer layer the size of the view: a swap chain's frames are scaled to it.
+        val d3d = SurfaceControl.Builder()
+            .setName("hyperwin-d3d")
+            .setParent(view.surfaceControl)
+            .setBufferSize(view.width.coerceAtLeast(1), view.height.coerceAtLeast(1))
+            .setOpaque(true)
+            .setHidden(true)   // shown while a program has a swap chain
+            .build()
+        SurfaceControl.Transaction().setLayer(d3d, 2).apply()
+        d3dLayer = d3d
+        HwGpu.setLayer(sc, d3d, view.width, view.height)
     }
 
     private fun dropLayer() {
         val sc = layer ?: return
+        val d3d = d3dLayer
         layer = null
-        HwGpu.setLayer(null, 0, 0)
-        SurfaceControl.Transaction().reparent(sc, null).apply()
+        d3dLayer = null
+        HwGpu.setLayer(null, null, 0, 0)
+        SurfaceControl.Transaction().reparent(sc, null).apply {
+            d3d?.let { reparent(it, null) }
+        }.apply()
         sc.release()
+        d3d?.release()
     }
 
     fun vmStarted(sharedWindow: AvfPlan.SharedWindow?) {

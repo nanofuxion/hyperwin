@@ -16,10 +16,19 @@ mkdir -p "$OUT"
   -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/hwgpu_host.cpp" "$HERE/hwgpu_jni.cpp" \
   -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -ldl -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
   -o "$OUT/libhwgpu.so"
-# libhwd3d.so (hwd3d/hwd3d.cpp): HwD3D channels, which libhwgpu.so hands over (d3d/README.md).
-"$CXX" -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra -Wno-missing-field-initializers \
-  -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -llog -nostdlib++ -lc++_shared \
-  -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
+# libhwd3d.so (hwd3d/hwd3d.cpp): HwD3D channels, which libhwgpu.so hands over (d3d/README.md), on
+# DXVK built for Android (hwd3d/build.sh, run first when missing). The thunks come from the mingw
+# headers through hwd3d/gen_thunks.py.
+DXVK=$HERE/../work/hwd3d
+[ -f "$DXVK/libdxvk_d3d11.so" ] || "$HERE/hwd3d/build.sh"
+GEN=$HERE/../work/hwd3d-gen
+python3 "$HERE/hwd3d/gen_thunks.py" "$HERE/../../build/third_party/win/llvm-mingw/generic-w64-mingw32/include" "$GEN"
+DXN=$HERE/../work/dxvk-native/include
+"$CXX" -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wno-unused-function -Wno-extern-c-compat \
+  -I"$DXN/native/windows" -I"$DXN/native/directx" -I"$DXN/native" -I"$GEN" \
+  -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -L"$DXVK" -L"$OUT" -ldxvk_d3d11 -ldxvk_dxgi \
+  -lhwgpu -llog -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
+for l in d3d11 dxgi; do "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" -o "$OUT/libdxvk_$l.so" "$DXVK/libdxvk_$l.so"; done
 cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"
 # ring_test for the phone's shell: adb push gpu/work/android/arm64-v8a /data/local/tmp/hwgpu, then

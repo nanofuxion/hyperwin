@@ -263,6 +263,56 @@ each answer cost two of them. It now only yields for 200 us after each
 request, as the sgpu loop does. Vulkan programs still run on the other
 channels.
 
+## Phase 2 result (2026-11-18): a D3D11 cube on the phone's screen
+
+- **The thunks.** `gpu/host/hwd3d/gen_thunks.py` reads the mingw `d3d11.h`
+  and `dxgi.h` vtables and writes both sides: the guest methods that pack the
+  arguments, and the host functions that unpack them and call DXVK. Each
+  argument gets a kind from its type and name: values, GUIDs, objects,
+  arrays sized by a `Num*` argument, structures, byte buffers, outputs. 44
+  interfaces, 233 methods. Ten have an argument no kind fits; they log once
+  and return `E_NOTIMPL`. A method that returns nothing and has no outputs is
+  not waited for: every state change and draw.
+- **By hand** (`gpu/guest/hwd3d/d3d11.c`, `gpu/host/hwd3d/hwd3d.cpp`):
+  `QueryInterface`, buffers and textures with first contents, input layouts,
+  `UpdateSubresource`, `Map`/`Unmap` (a copy each way for now; phase 3 makes
+  it shared memory), `CreateSwapChain`, `Present`, and the adapter
+  description, whose `WCHAR` is two bytes in Windows and four here.
+  Outputs and display modes are Windows' own screen, answered in Windows.
+- **Objects.** The phone keeps one table per channel. A handle carries a
+  generation and is checked for type on every use. One object has one handle
+  per interface, so `IUnknown` identity holds. The guest keeps one shell per
+  handle and counts references itself; the last `Release` tells the phone.
+- **Sizes.** `gpu/guest/hwd3d/build.sh` compiles every structure that crosses
+  as bytes with both compilers and stops the build if one differs.
+- **The surface.** The app makes a second layer, `hyperwin-d3d`, above the
+  scanout one. The renderer wraps it in a `Surface` and DXVK's Android WSI
+  draws into it. It shows while a program has a swap chain.
+- **Rotation.** Android calls every present suboptimal while the screen is
+  turned against the swap chain, and DXVK rebuilt its swap chain each time:
+  305 times in 8 seconds, capped near 60 FPS. `dxvk-android.patch` now
+  takes suboptimal as success on Android; the compositor rotates.
+- **Limit to screen refresh** holds `Present(0)` to one frame per refresh,
+  as the sgpu scanout does.
+- **Using it:** `use.cmd hwd3d <program>` (Send To: "GPU - HwD3D") puts
+  `d3d11.dll` and `dxgi.dll` beside a program. dxgi.dll hands over to
+  d3d11.dll, so a process has one channel and one set of objects. With no
+  HwD3D on the phone they hand over to Windows' own.
+
+| Pixel 6 Pro, Mali, 1280x720 | D3D11 spin cube |
+|---|---|
+| DXVK in Windows, through gfxstream | 104 FPS |
+| **HwD3D, ARM64 program** | **303 FPS** |
+| **HwD3D, x64 program** | **455 FPS** |
+| HwD3D, Limit to screen refresh on | 60 FPS (the screen is set to 60 Hz) |
+| `dxtest` (clear, copy, read back) ARM64 and x64 | PASS |
+
+The test is `d3dcube-*.exe`: the phase-0 cube (`cube.cpp`) built for Windows.
+Left for later phases: one swap chain at a time, always full screen, no
+`ID3D11Device1` and newer, `Map` copies the whole subresource, DXVK needs
+Vortek switched on. AIO's own D3D11 cube was not run: its command line for
+that mode is unknown here.
+
 ## Things to check early
 
 - DXVK's native build on bionic: its threading, `dlopen` of Vulkan, and the

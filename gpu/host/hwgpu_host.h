@@ -26,6 +26,15 @@ int hwgpu_host_set_layer(void* layer, int view_width, int view_height);
 void hwgpu_host_set_vsync(int on);
 // The same layer now covers another size.
 void hwgpu_host_set_layer_size(int view_width, int view_height);
+
+/* HwD3D's surface (d3d/README.md): a layer above the scanout one, as an ASurfaceControl, and the
+ * ANativeWindow its buffers come from (taking a reference), or both null. libhwd3d.so draws on it
+ * through these: */
+void hwgpu_host_set_d3d_layer(void* layer, void* window);
+void* hwgpu_host_d3d_window_acquire(void);    /* a reference, or null when there is no surface */
+void hwgpu_host_d3d_window_release(void* window);
+void hwgpu_host_d3d_show(int on);
+int hwgpu_host_vsync(void);                   /* "Limit to screen refresh" is on */
 // How many scanout frames went to the layer so far.
 uint64_t hwgpu_host_scanout_frames(void);
 

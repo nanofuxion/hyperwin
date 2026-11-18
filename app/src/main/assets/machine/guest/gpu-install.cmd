@@ -49,5 +49,6 @@ if not exist "%~1" mkdir "%~1"
 (echo @call %G%\dx\use.cmd sarek %%*^& timeout /t 3 ^>nul)> "%~1\GPU - DXVK-Sarek, Direct3D 8 to 11.cmd"
 (echo @call %G%\dx\use.cmd vkd3d %%*^& timeout /t 3 ^>nul)> "%~1\GPU - vkd3d-proton, Direct3D 12.cmd"
 (echo @call %G%\dx\use.cmd zink %%*^& timeout /t 3 ^>nul)> "%~1\GPU - Zink, OpenGL.cmd"
+(echo @call %G%\dx\use.cmd hwd3d %%*^& timeout /t 3 ^>nul)> "%~1\GPU - HwD3D, Direct3D 11 on the phone.cmd"
 (echo @call %G%\dx\use.cmd off %%*^& timeout /t 3 ^>nul)> "%~1\GPU - Windows default.cmd"
 exit /b 0
