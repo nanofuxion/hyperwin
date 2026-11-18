@@ -253,6 +253,77 @@ ICD entry points.
 Phase 5 needs no WDK. If the WDK answer is still pending at phase 4, do 5
 first.
 
+## Phase 1 findings (2026-11-18)
+
+Read before writing the kernel driver. Found by looking at what Windows' own
+`BasicRender.sys` and `BasicDisplay.sys` do on this machine, and at the public
+documentation.
+
+**`DxgkInitialize` needs no `displib.lib`.** Neither basic driver imports it from
+`dxgkrnl.sys`, and `dxgkrnl.sys` does not export it. The WDK's `displib.lib` links
+a small shim into each miniport. What the shim does, seen from the two drivers:
+
+1. `ZwLoadDriver` on `\Registry\Machine\System\CurrentControlSet\Services\DXGKrnl`.
+   `STATUS_IMAGE_ALREADY_LOADED` (0xC000010E) counts as success.
+2. `IoGetDeviceObjectPointer(L"\\Device\\DxgKrnl", GENERIC_READ|GENERIC_WRITE)`,
+   retried up to ten times, 5 ms apart, when step 1 had to load it.
+3. One **internal** device control to that device with no input and an 8-byte
+   output, `IoBuildDeviceIoControlRequest(..., InternalDeviceIoControl = TRUE)`.
+   The code is 0x00230047 on Windows 8 and later. If that returns
+   `STATUS_INVALID_DEVICE_REQUEST` (0xC0000010) it asks again with 0x0023003F.
+4. The 8 bytes are a function pointer inside `dxgkrnl.sys`. The shim calls it as
+   `(DriverObject, RegistryPath, DRIVER_INITIALIZATION_DATA*)` and returns that
+   status. It first rejects a null argument with `STATUS_INVALID_PARAMETER` and a
+   `Version` it does not know with `STATUS_REVISION_MISMATCH` (0xC0000059). It
+   also swaps `DxgkDdiStartDevice` for a thunk of its own that jumps to the real
+   one. That is control-flow-guard plumbing, and a driver of ours can skip it.
+
+So the driver can carry its own twenty-line `DxgkInitialize`. Do that, and note
+here if a later Windows needs a different code.
+
+**The reactos-ddk headers are a display-only subset.** `dispmprt.h` has
+`DRIVER_INITIALIZATION_DATA`, `DXGKRNL_INTERFACE` and the VidPN types. But
+`d3dkmddi.h` leaves out the render side. It has no `DXGK_QUERYSEGMENTOUT`,
+`DXGK_SEGMENTDESCRIPTOR`, `DXGKARG_BUILDPAGINGBUFFER`, `DXGKARG_SUBMITCOMMAND`,
+`DXGKARG_PATCH`, `DXGKARG_DESCRIBEALLOCATION`, the engine and node types, or the
+`DXGKDDI_*` prototypes for the allocation, scheduling and paging DDIs. Its
+function-pointer typedefs for those are `UINT32*` placeholders. Two ways
+forward, and the choice is the user's:
+
+- **The WDK's `d3dkmddi.h` and `dispmprt.h`** (the real headers). One more file
+  to take from the WDK than phase 4 needs, and it removes guessing.
+- **Write the missing definitions from the public documentation** on Microsoft
+  Learn. It shows each structure's fields and bit-fields, but not the
+  `#if DXGKDDI_INTERFACE_VERSION` widths of the reserved bits, and a wrong bit
+  position fails quietly inside `dxgkrnl.sys`. Roughly a hundred pages.
+
+The documented parts needed are already in hand for `DXGK_DRIVERCAPS`,
+`DXGK_VIDSCHCAPS`, `DXGK_VIDMMCAPS`, `DXGK_PRESENTATIONCAPS`, the segment
+structures, `DXGKARG_BUILDPAGINGBUFFER`, `DXGKARG_SUBMITCOMMAND`.
+
+**Designs settled while reading:**
+
+- **A crash-loop breaker.** A miniport that bugchecks while it starts would stop
+  Windows booting. `DriverEntry` counts attempts in
+  `HKLM\SOFTWARE\HyperWin\GpuAdapter\Attempts`, clears the count ten seconds
+  after the adapter starts, and refuses to load when the count is already two.
+  The third boot comes up without it.
+- **Mappings need a cleanup in the right process.** Unmapped user mappings of
+  driver memory bugcheck when their process exits
+  (`DRIVER_LEFT_LOCKED_PAGES_IN_PROCESS`). A WDDM miniport cannot own IRP
+  create/cleanup, so channel and heap mappings made in `DxgkDdiEscape` are
+  tracked per process and undone by a `PsSetCreateProcessNotifyRoutine` exit
+  callback, which runs in the exiting process.
+- **The adapter's name** is the phone's GPU. `libhwgpu.so` asks Vulkan for the
+  device name once and writes it into the ring header. The miniport writes it
+  to `HardwareInformation.AdapterString` and the device's friendly name.
+- **The first counters** are in the ring header: bytes the phone copied to and
+  from Windows memory for resources that could not be shared, plus the sgpu
+  copies in `SGPU_CMD_SYNC`. An escape returns them, and a small tool prints
+  them.
+- **Windows' own driver files** for study are copied to `P:\Download\wdsys` on
+  the phone. They are Microsoft's and stay out of the repository.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
