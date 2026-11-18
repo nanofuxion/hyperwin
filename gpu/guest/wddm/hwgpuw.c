@@ -80,6 +80,8 @@ static BOOLEAN g_notify_set;
 
 #include "hwdisplay.inc"
 
+static struct { ULONG submits, last_submit, last_flags, resets; } g_diag;
+
 static void *window(void) { return (UCHAR *)g.ring - HWGPU_RING_OFF; }
 
 /* ---- the crash-loop breaker ---- */
@@ -665,9 +667,11 @@ static BOOLEAN NTAPI HwInterrupt(CONST PVOID ctx, ULONG message)
     return FALSE;  /* no interrupt line: completions come from the polling timer */
 }
 
+/* Each interrupt notification (a finished fence, a vsync) is only acted on once the DPC tells dxgkrnl. */
 static VOID NTAPI HwDpc(CONST PVOID ctx)
 {
     (void)ctx;
+    g.dxgk.DxgkCbNotifyDpc(g.dxgk.DeviceHandle);
 }
 
 static NTSTATUS NTAPI HwQueryChildRelations(CONST PVOID ctx, PDXGK_CHILD_DESCRIPTOR rel, ULONG size)
@@ -912,6 +916,9 @@ static NTSTATUS NTAPI HwBuildPagingBuffer(const HANDLE hAdapter, DXGKARG_BUILDPA
 static NTSTATUS NTAPI HwSubmitCommand(const HANDLE hAdapter, const DXGKARG_SUBMITCOMMAND *sc)
 {
     (void)hAdapter;
+    g_diag.submits++;
+    g_diag.last_submit = sc->SubmissionFenceId;
+    g_diag.last_flags = sc->Flags.Value | (sc->NodeOrdinal << 24);
     const struct hww_marker *m = (const struct hww_marker *)sc->pDmaBufferPrivateData;
     if (!sc->Flags.Paging && m && sc->DmaBufferPrivateDataSize >= sizeof *m &&
         sc->DmaBufferPrivateDataSubmissionEndOffset - sc->DmaBufferPrivateDataSubmissionStartOffset >= sizeof *m) {
@@ -963,6 +970,18 @@ static NTSTATUS NTAPI HwQueryCurrentFence(const HANDLE hAdapter, DXGKARG_QUERYCU
 static NTSTATUS NTAPI HwResetFromTimeout(const HANDLE hAdapter)
 {
     (void)hAdapter;
+    /* What the GPU looked like when Windows gave up on it, for the display bring-up. */
+    report(L"T_Submits", g_diag.submits);
+    report(L"T_LastSubmit", g_diag.last_submit);
+    report(L"T_LastFlags", g_diag.last_flags);
+    report(L"T_LastFence", g.last_fence);
+    report(L"T_Vsyncs", d.vsyncs);
+    report(L"T_VsyncOn", (ULONG)hwd_vsync_on);
+    report(L"T_SourceSets", d.source_sets);
+    report(L"T_Presents", d.presents);
+    report(L"T_SourceAddr", (ULONG)d.source_addr.QuadPart);
+    report(L"T_Pending", g.pend_count);
+    report(L"T_Resets", ++g_diag.resets);
     /* Whatever Windows was waiting on is abandoned. */
     KIRQL irql;
     KeAcquireSpinLock(&g.pending_lock, &irql);
