@@ -115,6 +115,11 @@ MIT), is a Basic Display clone that a driver can build on:
 This is also the first piece of the WDDM work in `gpu/README.md`. A later
 render driver can share its mode and vsync code.
 
+`wddm/README.md` phase 6 plans a full display and render driver that does all
+of this too, and replaces this one. Build this display-only driver only if
+that phase is far off. Otherwise put the modes and the vsync timer straight
+into the full driver.
+
 ### 5. Match the screen to the game
 
 When a scanout program holds a steady rate, set the layer's frame rate to match:
