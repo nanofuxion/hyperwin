@@ -88,6 +88,74 @@ object HwGpu {
         saveStack(ctx, stack(ctx))
     }
 
+    // ---- Direct3D: which DXVK the phone runs (d3d/README.md, "Choosing the DXVK version") ----
+
+    const val DXVK_SHIPPED = "shipped"
+    /** The HwD3D ABI a DXVK zip must have been built for: dxvk-android.patch's hwd3d_abi_version. */
+    const val DXVK_ABI = 1
+    private const val DXVK_CHOICE = "dxvkChoice"
+    const val DXVK_SHIPPED_NAME = "DXVK 3.1.1"
+
+    data class Dxvk(val id: String, val name: String, val builtIn: Boolean)
+
+    fun dxvkDir(ctx: Context) = File(ctx.filesDir, "dxvk").apply { mkdirs() }
+
+    private fun dxvkMeta(dir: File): org.json.JSONObject? =
+        runCatching { org.json.JSONObject(File(dir, "meta.json").readText()) }.getOrNull()
+            ?.takeIf { it.optInt("abi") == DXVK_ABI && File(dir, "libdxvk_dxgi.so").isFile && File(dir, "libdxvk_d3d11.so").isFile }
+
+    /** The shipped DXVK, then every one added from a zip, by name. */
+    fun dxvkList(ctx: Context): List<Dxvk> = listOf(Dxvk(DXVK_SHIPPED, DXVK_SHIPPED_NAME, true)) +
+        dxvkDir(ctx).listFiles { f -> f.isDirectory }.orEmpty().sortedBy { it.name }
+            .mapNotNull { d -> dxvkMeta(d)?.let { Dxvk(d.name, it.optString("name", d.name), false) } }
+
+    /** The one in use; the shipped one when the chosen one is gone. */
+    fun dxvkChoice(ctx: Context): String =
+        prefs(ctx).getString(DXVK_CHOICE, DXVK_SHIPPED)!!.takeIf { id -> dxvkList(ctx).any { it.id == id } } ?: DXVK_SHIPPED
+
+    fun dxvkName(ctx: Context): String = dxvkList(ctx).first { it.id == dxvkChoice(ctx) }.name
+
+    fun useDxvk(ctx: Context, id: String) {
+        prefs(ctx).edit().putString(DXVK_CHOICE, id).apply()
+    }
+
+    fun deleteDxvk(ctx: Context, id: String) {
+        if (id != DXVK_SHIPPED) File(dxvkDir(ctx), id).deleteRecursively()
+    }
+
+    /**
+     * Unpacks a DXVK zip: meta.json (name, abi) and libdxvk_*.so. Returns its id, or an error to show.
+     * A zip built for another HwD3D ABI is refused: its libraries would call into the renderer wrongly.
+     */
+    fun importDxvk(ctx: Context, uri: Uri): Pair<String?, String?> {
+        val tmp = File(dxvkDir(ctx), ".incoming").apply { deleteRecursively(); mkdirs() }
+        try {
+            val input = ctx.contentResolver.openInputStream(uri) ?: return null to "That file could not be opened."
+            var libs = 0
+            ZipInputStream(input).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    val base = entry.name.substringAfterLast('/')
+                    if (entry.isDirectory || !(base == "meta.json" || (base.startsWith("libdxvk_") && base.endsWith(".so")))) continue
+                    File(tmp, base).outputStream().use { zip.copyTo(it) }
+                    if (base != "meta.json") libs++
+                }
+            }
+            val meta = runCatching { org.json.JSONObject(File(tmp, "meta.json").readText()) }.getOrNull()
+                ?: return null to "No meta.json in that zip. Make one with gpu/host/hwd3d/build.sh."
+            if (meta.optInt("abi") != DXVK_ABI)
+                return null to "Built for HwD3D ABI ${meta.optInt("abi")}; this app speaks $DXVK_ABI. Build it again with the app's patch."
+            if (libs == 0 || dxvkMeta(tmp) == null) return null to "That zip has no libdxvk_dxgi.so and libdxvk_d3d11.so."
+            val id = meta.optString("name", "dxvk").lowercase().replace(Regex("[^a-z0-9.]+"), "-").trim('-').ifEmpty { "dxvk" }
+            val dest = File(dxvkDir(ctx), id)
+            dest.deleteRecursively()
+            tmp.renameTo(dest)
+            return id to null
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
     private var ctx: Context? = null
     private var window: AvfPlan.SharedWindow? = null
     private var width = 0
@@ -288,6 +356,9 @@ object HwGpu {
             } else {
                 putString("ANDROID_EMU_VK_LOADER_PATH", "libvulkan_passthrough.so")
             }
+            // The DXVK HwD3D draws Direct3D with: the shipped one is found by name, an added one by folder.
+            val dxvk = dxvkChoice(ctx)
+            if (dxvk != DXVK_SHIPPED) putString("HWD3D_DXVK_DIR", File(dxvkDir(ctx), dxvk).absolutePath)
             // Compiled shaders, kept between runs by the bottom wrapper (shader-cache/README.md).
             putString("HWGPU_VK_CACHE_DIR", shaderCacheDir(ctx).absolutePath)
             if (driver != null) putString("HWGPU_VK_DRIVER", driver.absolutePath)

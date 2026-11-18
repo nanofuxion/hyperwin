@@ -41,6 +41,8 @@ fi
 T=$ROOT/build/third_party/win/llvm-mingw/bin
 mkdir -p "$ROOT/gpu/work/out/dx/test"
 for a in aarch64:arm64 x86_64:x64; do
+  "$T/${a%%:*}-w64-mingw32-clang++" -std=c++17 -O2 -static -o "$ROOT/gpu/work/out/dx/test/d3dfeat-${a##*:}.exe" \
+    "$HERE/d3dfeat.cpp" -ld3d11 -ldxgi
   "$T/${a%%:*}-w64-mingw32-clang++" -std=c++17 -O2 -static -o "$ROOT/gpu/work/out/dx/test/d3dcube-${a##*:}.exe" \
     "$ROOT/gpu/host/hwd3d/cube.cpp" -ld3d11 -ldxgi
 done

@@ -69,6 +69,22 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     private val pickIso = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) setup?.onIsoPicked(uri)
     }
+    private val pickDxvk = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        Thread {
+            val (id, error) = runCatching { HwGpu.importDxvk(this, uri) }.getOrElse { null to (it.message ?: "Could not read that file.") }
+            runOnUiThread {
+                if (id == null) {
+                    MaterialAlertDialogBuilder(this).setTitle("Not a DXVK for this app")
+                        .setMessage(error).setPositiveButton("OK", null).show()
+                    return@runOnUiThread
+                }
+                HwGpu.useDxvk(this, id)
+                HwGpu.restart()
+                home.refreshGraphics()
+            }
+        }.start()
+    }
     private val pickDriver = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@registerForActivityResult
         Thread {
@@ -559,6 +575,8 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             .setPositiveButton("Close", null)
             .show()
     }
+
+    override fun importDxvk() = pickDxvk.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
 
     override fun importDriver() = pickDriver.launch(arrayOf("application/octet-stream", "application/zip", "application/x-sharedlib", "*/*"))
 

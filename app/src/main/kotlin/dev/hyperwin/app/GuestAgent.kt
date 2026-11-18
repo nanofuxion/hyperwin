@@ -43,6 +43,8 @@ object GuestAgent {
     const val ACTION_MOUSE = "dev.hyperwin.app.MOUSE"
     /** Debug builds: --ei slot, buttons, lx, --ez connected: a made-up controller; --es kind xbox|ds4: player 1's kind. */
     const val ACTION_PAD = "dev.hyperwin.app.PAD"
+    /** Debug builds: --es zip /sdcard/Download/x.zip adds a DXVK and switches to it; --es use shipped|<id> switches. */
+    const val ACTION_DXVK = "dev.hyperwin.app.DXVK"
 
     private val writeLock = Any()
     @Volatile private var vm: Any? = null
@@ -279,6 +281,18 @@ object GuestAgent {
                         ACTION_PUSH -> runCatching {
                             push(File(intent.getStringExtra("src")!!), intent.getStringExtra("dst")!!)
                         }.onFailure { Log.e(TAG, "push failed", it) }
+                        ACTION_DXVK -> {
+                            val id = intent.getStringExtra("zip")?.let { path ->
+                                val (id, error) = HwGpu.importDxvk(c, android.net.Uri.fromFile(File(path)))
+                                Log.i(TAG, "dxvk zip $path: ${id ?: error}")
+                                id
+                            } ?: intent.getStringExtra("use")
+                            if (id != null) {
+                                HwGpu.useDxvk(c, id)
+                                HwGpu.restart()
+                                Log.i(TAG, "dxvk now ${HwGpu.dxvkName(c)}; have ${HwGpu.dxvkList(c).map { it.id }}")
+                            }
+                        }
                         ACTION_PAD -> if (intent.hasExtra("kind")) {
                             c.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).edit()
                                 .putString(GamepadInput.PLAYER1, intent.getStringExtra("kind")).apply()
@@ -294,6 +308,6 @@ object GuestAgent {
                 }.start()
             }
         }
-        ctx.registerReceiver(receiver, IntentFilter().apply { addAction(ACTION_EXEC); addAction(ACTION_PUSH); addAction(ACTION_MOUSE); addAction(ACTION_PAD) }, Context.RECEIVER_EXPORTED)
+        ctx.registerReceiver(receiver, IntentFilter().apply { addAction(ACTION_EXEC); addAction(ACTION_PUSH); addAction(ACTION_MOUSE); addAction(ACTION_PAD); addAction(ACTION_DXVK) }, Context.RECEIVER_EXPORTED)
     }
 }

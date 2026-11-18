@@ -26,8 +26,8 @@ python3 "$HERE/hwd3d/gen_thunks.py" "$HERE/../../build/third_party/win/llvm-ming
 DXN=$HERE/../work/dxvk-native/include
 "$CXX" -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wno-unused-function -Wno-extern-c-compat \
   -I"$DXN/native/windows" -I"$DXN/native/directx" -I"$DXN/native" -I"$GEN" \
-  -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -L"$DXVK" -L"$OUT" -ldxvk_d3d11 -ldxvk_dxgi \
-  -lhwgpu -llog -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
+  -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -L"$OUT" \
+  -lhwgpu -llog -ldl -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
 for l in d3d11 dxgi; do "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" -o "$OUT/libdxvk_$l.so" "$DXVK/libdxvk_$l.so"; done
 cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"

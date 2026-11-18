@@ -12,6 +12,7 @@
 #include <hw_d3d.h>
 #include <hwgpu_ring.h>
 
+#include <dlfcn.h>
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <map>
+#include <string>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -36,6 +38,16 @@ extern "C" void* hwgpu_host_d3d_window_acquire(void);
 extern "C" void hwgpu_host_d3d_window_release(void* window);
 extern "C" void hwgpu_host_d3d_show(int on);
 extern "C" int hwgpu_host_vsync(void);
+// DXVK, loaded at run time (setup_dxvk): the version the app's Direct3D setting names, or the shipped one.
+namespace {
+constexpr unsigned kDxvkAbi = 1;  // dxvk-android.patch's hwd3d_abi_version
+struct Dxvk {
+    HRESULT(WINAPI* create_factory)(REFIID, void**) = nullptr;
+    PFN_D3D11_CREATE_DEVICE create_device = nullptr;
+    void (*set_program)(const char*, const char*) = nullptr;
+};
+Dxvk g_dxvk;
+}  // namespace
 extern "C" void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
 extern "C" void hwgpu_host_heap_free(void* p);
 
@@ -156,6 +168,7 @@ struct Chan {
     ID3D11DeviceContext* immediate = nullptr;  // the first device's, for unmapping at the end
     void* window = nullptr;                    // the surface, while this program has it
     uint32_t swapchain = 0;
+    std::string exe, conf;                     // the program this channel draws for, and its dxvk.conf
     uint8_t* stage = nullptr;                  // the staging area in the heap (hw_d3d.h)
     uint64_t stage_size = 0;
     // Queries ended and not yet answered in the query page.
@@ -694,10 +707,45 @@ int32_t hc_IDXGIAdapter1_GetDesc1(Chan&, void* self, Rd&, Wr& w) { return adapte
 
 // ---- the channel ----
 
+// Opens DXVK's two libraries from dir (or by name, from the app's own libraries when dir is null),
+// dxgi first so d3d11's link to it finds the same copy. False when one is missing or its ABI differs.
+bool load_dxvk(const char* dir) {
+    auto open = [&](const char* name) -> void* {
+        std::string path = dir ? std::string(dir) + "/" + name : std::string(name);
+        void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (!h) LOG("DXVK: %s: %s", path.c_str(), dlerror());
+        return h;
+    };
+    void* dxgi = open("libdxvk_dxgi.so");
+    if (!dxgi) return false;
+    auto abi = reinterpret_cast<unsigned (*)()>(dlsym(dxgi, "hwd3d_abi_version"));
+    if (!abi || abi() != kDxvkAbi) {
+        LOG("DXVK in %s was built for HwD3D ABI %u, this renderer speaks %u: refused", dir ? dir : "the app", abi ? abi() : 0, kDxvkAbi);
+        dlclose(dxgi);
+        return false;
+    }
+    void* d3d11 = open("libdxvk_d3d11.so");
+    if (!d3d11) {
+        dlclose(dxgi);
+        return false;
+    }
+    g_dxvk.create_factory = reinterpret_cast<decltype(g_dxvk.create_factory)>(dlsym(dxgi, "CreateDXGIFactory1"));
+    g_dxvk.create_device = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(dlsym(d3d11, "D3D11CreateDevice"));
+    g_dxvk.set_program = reinterpret_cast<decltype(g_dxvk.set_program)>(dlsym(dxgi, "hwd3d_set_program"));
+    return g_dxvk.create_factory && g_dxvk.create_device && g_dxvk.set_program;
+}
+
 void setup_dxvk() {
     static bool done = false;
     if (done) return;
     done = true;
+    const char* dir = getenv("HWD3D_DXVK_DIR");
+    if (!(dir && load_dxvk(dir))) {
+        if (dir) LOG("DXVK: falling back to the shipped one");
+        g_dxvk = Dxvk{};
+        load_dxvk(nullptr);
+    }
+    LOG("DXVK from %s", g_dxvk.create_factory ? (dir && getenv("HWD3D_DXVK_DIR") ? dir : "the app") : "nowhere");
     // Vulkan comes from the same driver wrapper gfxstream uses (Vortek's fixes, the shader cache).
     if (!getenv("HWGPU_VK_LOADER") && getenv("ANDROID_EMU_VK_LOADER_PATH"))
         setenv("HWGPU_VK_LOADER", getenv("ANDROID_EMU_VK_LOADER_PATH"), 1);
@@ -718,8 +766,10 @@ int32_t create_factory(Chan& c, Rd& r, Wr& w) {
     uint32_t want = r.u32();
     if (!r.ok || want >= HI_COUNT) return E_INVALIDARG;
     setup_dxvk();
+    if (g_dxvk.set_program) g_dxvk.set_program(c.exe.c_str(), c.conf.c_str());
     void* f = nullptr;
-    HRESULT hr = CreateDXGIFactory1(hi_iid[want], &f);
+    if (!g_dxvk.create_factory) return E_FAIL;
+    HRESULT hr = g_dxvk.create_factory(hi_iid[want], &f);
     w.u32(SUCCEEDED(hr) ? c.put(f, int(want)) : 0);
     return hr;
 }
@@ -731,10 +781,12 @@ int32_t create_device(Chan& c, uint32_t adapter_h, Rd& r, Wr& w) {
     auto* levels = static_cast<const D3D_FEATURE_LEVEL*>(r.arr(sizeof(D3D_FEATURE_LEVEL), &n));
     if (!r.ok || adapter == BAD || n > 16) return E_INVALIDARG;
     setup_dxvk();
+    if (g_dxvk.set_program) g_dxvk.set_program(c.exe.c_str(), c.conf.c_str());
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     D3D_FEATURE_LEVEL level{};
-    HRESULT hr = D3D11CreateDevice(static_cast<IDXGIAdapter*>(adapter),
+    if (!g_dxvk.create_device) return E_FAIL;
+    HRESULT hr = g_dxvk.create_device(static_cast<IDXGIAdapter*>(adapter),
                                    adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels,
                                    UINT(n), D3D11_SDK_VERSION, &dev, &level, &ctx);
     LOG("channel %u: D3D11CreateDevice 0x%x, feature level 0x%x", c.slot, unsigned(hr), unsigned(level));
@@ -793,6 +845,18 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
             }
         }
         return (h.flags & HWD3D_NO_REPLY) || send(c, &r, sizeof r);
+    }
+    case HWD3D_OP_PROGRAM: {
+        if (m.size() < sizeof(hwd3d_program)) return false;
+        hwd3d_program p;
+        memcpy(&p, m.data(), sizeof p);
+        uint64_t pad_path = (uint64_t(p.path_bytes) + 3) & ~3ull, pad_conf = (uint64_t(p.conf_bytes) + 3) & ~3ull;
+        if (sizeof p + pad_path + pad_conf != m.size() || p.path_bytes > 4096 || p.conf_bytes > (256u << 10)) return false;
+        const char* at = reinterpret_cast<const char*>(m.data() + sizeof p);
+        c.exe.assign(at, p.path_bytes);  // Windows' path: DXVK's profiles match it with backslashes
+        c.conf.assign(at + pad_path, p.conf_bytes);
+        LOG("channel %u: program %s%s", c.slot, c.exe.c_str(), c.conf.empty() ? "" : ", with a dxvk.conf");
+        return true;
     }
     case HWD3D_OP_NOP:
         return true;

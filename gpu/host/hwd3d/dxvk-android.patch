@@ -16,6 +16,19 @@ index 4964301..4fe4270 100644
      error('SDL3, SDL2, or GLFW are required to build dxvk-native')
    endif
    
+diff --git a/src/dxgi/dxgi.sym b/src/dxgi/dxgi.sym
+index d527d64..6d9260f 100644
+--- a/src/dxgi/dxgi.sym
++++ b/src/dxgi/dxgi.sym
+@@ -5,6 +5,8 @@
+     CreateDXGIFactory;
+     DXGIDeclareAdapterRemovalSupport;
+     DXGIGetDebugInterface1;
++    hwd3d_set_program;
++    hwd3d_abi_version;
+ 
+   local:
+     *;
 diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
 index f93ae8d..ee857d9 100644
 --- a/src/dxvk/dxvk_presenter.cpp
@@ -57,6 +70,102 @@ index f93ae8d..ee857d9 100644
      }
  
      // Recreate the swapchain on the next acquire, even if we get suboptimal.
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index 2b7ced4..ede217d 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -1761,7 +1761,9 @@ namespace dxvk {
+     // Open the file if it exists
+     std::ifstream stream(str::topath(filePath.c_str()).c_str());
+ 
+-    if (!stream && confLine.empty())
++    const std::string& hwConf = env::getHwd3dConf();
++
++    if (!stream && confLine.empty() && hwConf.empty())
+       return config;
+ 
+     // Initialize parser context
+@@ -1780,6 +1782,20 @@ namespace dxvk {
+         parseUserConfigLine(config, ctx, line);
+     }
+ 
++    // HyperWin: the program's own dxvk.conf, sent with its hello.
++    if (!hwConf.empty()) {
++      Logger::info("Found the program's dxvk.conf");
++
++      std::istringstream hw(hwConf);
++      std::string line;
++
++      while (std::getline(hw, line)) {
++        if (!line.empty() && line.back() == '\r')
++          line.pop_back();
++        parseUserConfigLine(config, ctx, line);
++      }
++    }
++
+     if (!confLine.empty()) {
+       ctx.active = true;
+ 
+diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
+index 556327c..e13b3e4 100644
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -64,7 +64,8 @@ namespace dxvk::env {
+ 
+   std::string getExeName() {
+     std::string fullPath = getExePath();
+-    auto n = fullPath.find_last_of(env::PlatformDirSlash);
++    // HyperWin: the program's path is Windows' (backslashes), which DXVK's profiles are written for.
++    auto n = fullPath.find_last_of("/\\");
+     
+     return (n != std::string::npos)
+       ? fullPath.substr(n + 1)
+@@ -85,7 +86,15 @@ namespace dxvk::env {
+   }
+ 
+ 
++  // HyperWin: the program being drawn for is not this process. libhwd3d.so names it, per channel
++  // thread, before it creates a factory or a device (hwd3d_set_program).
++  thread_local std::string g_hwd3dExe, g_hwd3dConf;
++
++  const std::string& getHwd3dConf() { return g_hwd3dConf; }
++
+   std::string getExePath() {
++    if (!g_hwd3dExe.empty())
++      return g_hwd3dExe;
+ #if defined(_WIN32)
+     std::vector<WCHAR> exePath;
+     exePath.resize(MAX_PATH + 1);
+@@ -161,3 +170,14 @@ namespace dxvk::env {
+   }
+   
+ }
++
++extern "C" __attribute__((visibility("default"))) void hwd3d_set_program(const char* exe, const char* conf) {
++  dxvk::env::g_hwd3dExe = exe ? exe : "";
++  dxvk::env::g_hwd3dConf = conf ? conf : "";
++}
++
++// HyperWin: the HwD3D ABI this build was patched for. libhwd3d.so refuses a DXVK whose number differs
++// from its own (the app does the same with the zip's meta.json), since the two sides call each other.
++extern "C" __attribute__((visibility("default"))) unsigned hwd3d_abi_version() {
++  return 1;
++}
+diff --git a/src/util/util_env.h b/src/util/util_env.h
+index 80b4a65..d698e80 100644
+--- a/src/util/util_env.h
++++ b/src/util/util_env.h
+@@ -66,6 +66,10 @@ namespace dxvk::env {
+    * \returns Path to executable
+    */
+   std::string getExePath();
++
++  // HyperWin: the dxvk.conf of the program being drawn for, or empty.
++  const std::string& getHwd3dConf();
++  extern thread_local std::string g_hwd3dExe, g_hwd3dConf;
+   
+   /**
+    * \brief Sets name of the calling thread
 diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
 index f9d1e98..d20b30b 100644
 --- a/src/vulkan/vulkan_loader.cpp

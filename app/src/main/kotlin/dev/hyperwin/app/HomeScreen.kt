@@ -31,6 +31,7 @@ class HomeScreen(
         fun showLogs()
         fun reinstall()
         fun importDriver()
+        fun importDxvk()
     }
 
     private val title = Ui.text(ctx, M.attr.textAppearanceDisplaySmall)
@@ -212,12 +213,70 @@ class HomeScreen(
             Ui.row(ctx, "Add a driver file", "A Vulkan driver as a .so, or a .zip that holds one, such as Turnip or PanVK.", Ui.chevron(ctx)) {
                 actions.importDriver()
             },
+            direct3d(),
+            Ui.row(ctx, "Add a DXVK file", "A Direct3D layer built for HyperWin: a .zip with meta.json and libdxvk_*.so (gpu/host/hwd3d/build.sh makes one).", Ui.chevron(ctx)) {
+                actions.importDxvk()
+            },
             shaderCacheRow(),
             Ui.text(ctx, M.attr.textAppearanceBodySmall, M.attr.colorOnSurfaceVariant,
                 "Fixes that are on run top first, over the one driver that is on. Drag to reorder. " +
                     "Changes apply at once. Programs using the GPU need to start again.").apply {
                 setPadding(ctx.dp(20), ctx.dp(4), ctx.dp(20), ctx.dp(12))
             })
+    }
+
+    private var direct3dBox: LinearLayout? = null
+
+    /** Which DXVK draws Direct3D: exactly one on. Switching restarts the renderer, like a driver swap. */
+    private fun direct3d(): View {
+        val box = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        direct3dBox = box
+        fillDirect3d()
+        return box
+    }
+
+    fun refreshGraphics() = fillDirect3d()
+
+    private fun fillDirect3d() {
+        val box = direct3dBox ?: return
+        box.removeAllViews()
+        val choice = HwGpu.dxvkChoice(ctx)
+        for (d in HwGpu.dxvkList(ctx)) {
+            box.addView(LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = ctx.dp(64)
+                setPadding(ctx.dp(20), ctx.dp(6), ctx.dp(8), ctx.dp(6))
+                setBackgroundColor(themeColor(M.attr.colorSurfaceContainer))
+                addView(Ui.column(ctx,
+                    Ui.text(ctx, M.attr.textAppearanceBodyLarge, value = d.name),
+                    Ui.text(ctx, M.attr.textAppearanceBodyMedium, M.attr.colorOnSurfaceVariant,
+                        "Direct3D. " + if (d.builtIn) "The version the app ships." else "Added from a file."),
+                ), LinearLayout.LayoutParams(0, Ui.WRAP, 1f).apply { marginEnd = ctx.dp(8) })
+                addView(Ui.switch(ctx, d.id == choice) { on ->
+                    if (on && d.id != choice) {
+                        HwGpu.useDxvk(ctx, d.id)
+                        HwGpu.restart()
+                        if (HwGpu.running) setStatus("Direct3D now uses ${d.name}. Programs using it need to start again.")
+                    }
+                    post { fillDirect3d() }
+                }.apply { contentDescription = "${d.name} on" })
+                if (d.builtIn) addView(View(ctx), LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
+                else addView(Ui.iconButton(ctx, R.drawable.ic_close, "Remove ${d.name}") {
+                    MaterialAlertDialogBuilder(ctx)
+                        .setTitle("Remove ${d.name}?")
+                        .setMessage("You can add it again from its file later.")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Remove") { _, _ ->
+                            val was = d.id == choice
+                            HwGpu.deleteDxvk(ctx, d.id)
+                            if (was) HwGpu.restart()
+                            fillDirect3d()
+                        }
+                        .show()
+                }, LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
+            }, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP))
+        }
     }
 
     /** Compiled shaders kept between runs, with a Clear button for when Windows is off. */

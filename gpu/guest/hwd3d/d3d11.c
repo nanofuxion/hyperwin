@@ -49,6 +49,42 @@ static void hlog(const char *fmt, ...)
 static int raw_send(const void *m, uint32_t n) { return hwgpu_write_all(g_chan, g_gen, 1, m, n); }
 static int raw_recv(void *m, uint32_t n) { return hwgpu_read_all(g_chan, g_gen, 1, m, n); }
 
+/* Tells the phone which program this is and what its dxvk.conf says, so DXVK's per-game settings apply. */
+static void send_program(void)
+{
+    WCHAR path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    char utf8[4 * MAX_PATH];
+    int pb = WideCharToMultiByte(CP_UTF8, 0, path, (int)n, utf8, sizeof utf8, NULL, NULL);
+    if (pb <= 0) return;
+    /* dxvk.conf beside the program: up to 64 KiB of it. */
+    WCHAR conf[MAX_PATH + 16];
+    lstrcpyW(conf, path);
+    WCHAR *slash = conf + n;
+    while (slash > conf && slash[-1] != L'\\') slash--;
+    lstrcpyW(slash, L"dxvk.conf");
+    static char text[64 << 10];
+    DWORD got = 0;
+    HANDLE f = CreateFileW(conf, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        if (!ReadFile(f, text, sizeof text, &got, NULL)) got = 0;
+        CloseHandle(f);
+    }
+    uint32_t pp = ((uint32_t)pb + 3) & ~3u, cp = (got + 3) & ~3u;
+    uint32_t total = (uint32_t)sizeof(struct hwd3d_program) + pp + cp;
+    uint8_t *m = calloc(1, total);
+    if (!m) return;
+    struct hwd3d_program *p = (struct hwd3d_program *)m;
+    p->hdr = (struct hwd3d_msg){total, HWD3D_MAGIC, HWD3D_OP_PROGRAM, HWD3D_NO_REPLY, ++g_seq};
+    p->path_bytes = (uint32_t)pb;
+    p->conf_bytes = got;
+    memcpy(m + sizeof *p, utf8, (size_t)pb);
+    memcpy(m + sizeof *p + pp, text, got);
+    raw_send(m, total);
+    free(m);
+}
+
 static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
     (void)once; (void)param; (void)ctx;
@@ -105,6 +141,7 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
             g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
             g_qpage = (volatile struct hwd3d_query_slot *)(g_stage + r.staging_size - HWD3D_QUERY_PAGE);
         }
+        send_program();
     } else
         hlog("hwd3d: the phone has no HwD3D %u (status 0x%lx), using Windows' Direct3D\n", HWD3D_VERSION,
              (unsigned long)r.r.status);

@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 #define HWD3D_MAGIC    0x44334448u   /* "HD3D" little endian */
-#define HWD3D_VERSION  4u
+#define HWD3D_VERSION  5u
 
 /* hwd3d_msg.flags */
 #define HWD3D_NO_REPLY 0x0001u   /* the phone answers nothing, not even an error */
@@ -24,6 +24,7 @@
 #define HWD3D_OP_HELLO 0x0001u   /* hwd3d_hello -> hwd3d_hello_reply */
 #define HWD3D_OP_NOP   0x0002u   /* nothing; counted (transport tests) */
 #define HWD3D_OP_PING  0x0003u   /* -> hwd3d_ping_reply: how many messages arrived */
+#define HWD3D_OP_PROGRAM 0x0004u /* hwd3d_program: which program this channel draws for; no answer */
 /* The rest are a struct hwd3d_call and its arguments; the answer, a struct hwd3d_reply and its
  * outputs. Arguments and outputs are packed as gpu/host/hwd3d/gen_thunks.py describes: each one
  * 4-byte aligned, an array as a u32 "present", a u32 count and the elements. Present 2 means the
@@ -79,6 +80,15 @@ struct hwd3d_hello {
     uint32_t pid;      /* for the phone's log */
     uint32_t arch;     /* 1 ARM64, 2 x64, 3 i686: which DLL sent it */
     uint32_t reserved;
+};
+
+/* After the hello, before any Create: the program's path (UTF-8) and the text of the dxvk.conf beside it,
+ * if there is one, so DXVK picks its per-game settings by the program, not by the renderer's name. Each
+ * is padded to 4 bytes. */
+struct hwd3d_program {
+    struct hwd3d_msg hdr;
+    uint32_t path_bytes;
+    uint32_t conf_bytes;
 };
 
 struct hwd3d_call {
@@ -176,6 +186,7 @@ HWD3D_ASSERT(sizeof(struct hwd3d_msg) == 16, "hwd3d_msg");
 HWD3D_ASSERT(sizeof(struct hwd3d_hello) == 32, "hwd3d_hello");
 HWD3D_ASSERT(sizeof(struct hwd3d_reply) == 24, "hwd3d_reply");
 HWD3D_ASSERT(sizeof(struct hwd3d_call) == 24, "hwd3d_call");
+HWD3D_ASSERT(sizeof(struct hwd3d_program) == 24, "hwd3d_program");
 HWD3D_ASSERT(sizeof(struct hwd3d_hello_reply) == 48, "hwd3d_hello_reply");
 HWD3D_ASSERT(sizeof(struct hwd3d_staging) == HWD3D_STAGING_DATA, "hwd3d_staging");
 HWD3D_ASSERT(sizeof(struct hwd3d_query_slot) == 128, "hwd3d_query_slot");

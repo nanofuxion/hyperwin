@@ -410,6 +410,46 @@ ran at 98 FPS through HwD3D against 66 FPS and later 30 FPS for DXVK inside
 Windows. Left: `UpdateSubresource` to a buffer the GPU is using still copies
 on the phone, and a read-back `Map` sends the whole subresource.
 
+## Phase 4 result (2026-11-18): games' settings and the DXVK picker
+
+- **The program's name and `dxvk.conf` per device.** The Windows DLL sends
+  `HWD3D_OP_PROGRAM` after its hello: the program's path and the text of the
+  `dxvk.conf` beside it (version 5). `dxvk-android.patch` makes DXVK's program
+  path and user config come from a thread-local that `libhwd3d.so` sets on the
+  channel's thread before it creates a factory or a device
+  (`hwd3d_set_program`, exported from `libdxvk_dxgi.so`). Each program has its
+  own thread, so several share one renderer. `getExeName` splits on backslashes,
+  because DXVK's profiles are written for Windows paths. Tested with a copy of
+  the cube named `Diablo IV.exe` and a `dxvk.conf` of `d3d11.maxFeatureLevel =
+  10_1`: DXVK logged "Game: Diablo IV.exe" and the built-in profile, the device
+  came out at feature level 10_1, and both settings were in the effective
+  configuration. The logs are named by program in the cache folder.
+- **The DXVK picker.** Settings, Graphics has a "Direct3D" row per DXVK: the one
+  the app ships (3.1.1) and every zip added with "Add a DXVK file". Exactly one
+  is on, and switching restarts the renderer, like a driver swap. A zip holds
+  `meta.json` (`name`, `dxvk`, `abi`) and `libdxvk_*.so`. The app refuses one
+  whose `abi` is not its own and says why. `libhwd3d.so` now opens DXVK at run
+  time: `HWD3D_DXVK_DIR` first (`libdxvk_dxgi.so` by full path, then
+  `libdxvk_d3d11.so`), checks `hwd3d_abi_version`, and falls back to the shipped
+  one with a log line. `gpu/host/hwd3d/build.sh zip <tag> [url]` makes a zip of
+  any DXVK 2.1 or newer. Debug builds take `am broadcast -a dev.hyperwin.app.DXVK
+  --es zip <path>` or `--es use shipped|<id>`.
+  Tested: a zip made from the 3.1.1 build was added, chosen, and a program ran on
+  it; switching back to the shipped one ran it again; a zip with `abi` 2 was
+  refused. DXVK 2.7.1 builds with the patch after three small signature fixes
+  (the Android WSI), but it will not run here: it needs
+  `VK_KHR_pipeline_library`, which Vortek on this Mali lacks. The device
+  creation fails with `E_FAIL` and DXVK's log says why.
+- **Features games lean on**, `d3dfeat` (`gpu/guest/hwd3d/d3dfeat.cpp`), as
+  ARM64 and x64: a deferred context and its command list, 4x MSAA and a resolve,
+  a compute shader writing a structured buffer through a UAV and read back, and
+  an occlusion query. All pass. AIO's scenes (compute, tessellation, instanced,
+  geometry shader, atomics, cel, matcap, ocean and more) draw.
+
+Not done: the Direct3D 10 faces (`d3d10core.dll`), and windowed present through
+GDI. A windowed program is drawn full screen on the phone until the display
+phase (`wddm/README.md` phase 6) lets DWM compose it.
+
 ## Things to check early
 
 - DXVK's native build on bionic: its threading, `dlopen` of Vulkan, and the
