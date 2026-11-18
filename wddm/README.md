@@ -390,6 +390,46 @@ What it does:
 Not done: the x86 Vulkan driver (`VulkanDriverNameWow`), and the marker path
 under load.
 
+## Phase 4, as read from the headers (2026-11-18)
+
+Not started in code. What reading `d3d10umddi.h` and the public documentation
+settles, so the work can be cut into steps that each run:
+
+- **Size.** The Direct3D 10 and 11 driver interface is about 240 function
+  prototypes, collected in a few tables the runtime asks `OpenAdapter10_2` for:
+  adapter functions, device functions, and (from Windows 8) device-context
+  functions. Most are one line each. A generator that reads the header at build
+  time, as `gen_thunks.py` reads the COM headers, can write every entry as a stub
+  that logs once and returns an error, so the table is complete from the first
+  build. Then about eighty are written by hand.
+- **The wire stays.** Each hand-written entry builds the same `HWD3D_OP_CALL`
+  the per-program DLL builds (`hwd3d_guest_pre.inc` has the method numbers).
+  Only the Windows side changes, from COM shells to driver entries. The phone
+  side does not.
+- **Two things the COM route never faced:**
+  - Shader code arrives as a bare token stream, with the input and output
+    signatures as separate arguments, not as a DXBC container. DXVK reads the
+    container. The driver part wraps the tokens in one (a `SHDR` chunk and
+    `ISGN`/`OSGN`/`PCSG` chunks built from the signatures). About a hundred
+    lines.
+  - The runtime wants every resource to have a kernel allocation, because it
+    shares, presents and tracks them through the kernel. A render-only adapter
+    gets those from the memory manager (our aperture segment), which costs
+    nothing: the allocation is a token, and the bytes live on the phone.
+- **Present.** The runtime hands the driver the back buffer and then asks the
+  kernel to present it. For a render-only adapter that is a cross-adapter present
+  to the display adapter. Until phase 6 (a display on our own adapter), that
+  path is Windows' blit through system memory: the one known copy, in the open
+  next to the counters, and only for windowed programs. A fullscreen program can
+  keep presenting on the phone's own surface as it does now.
+- **First run target:** `dxtest 11` with nothing beside it. It needs adapter
+  creation, device creation, a 2D resource, a render target view, a clear, a
+  copy, and a staging map: perhaps twenty of the eighty.
+- **Order inside the phase:** the generator and the table, then those twenty,
+  then the cube, then everything the AIO scenes use, then compute and the
+  rest. d3d10core (Direct3D 10 programs) comes with it, since the runtime's
+  Direct3D 10 faces sit on the same driver.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
