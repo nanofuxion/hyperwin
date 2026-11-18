@@ -211,6 +211,19 @@ Two things the build taught:
 Still to do in this phase: the same run on PanVK (the `panvk-lab` thread has the stack for it), and the
 extension list as OpenGL would see it (that needs Mesa's state tracker, which phase 2 brings).
 
+## System-wide ICD: first experiment (2026-11-18)
+
+Mesa's `libgallium_wgl.dll` exports the whole ICD interface (`DrvCreateContext`, `DrvGetProcAddress`,
+`DrvSetCallbackProcs` and the rest), so it can be named as an ICD with no new code. With
+`OpenGLDriverName`, `OpenGLVersion` and `OpenGLFlags` set on the HyperWin adapter's driver key
+(and, as a second try, on Basic Display's), Windows' own `opengl32.dll` in a user's session still
+picked "GDI Generic". The reason is the one that holds D3D back: a window lives on the display
+adapter, and Windows asks that adapter for its OpenGL driver. So the ICD needs phase 6 of
+`wddm/README.md` (the HyperWin adapter owning the screen) before it can load for a normal window.
+Per program (`use.cmd zink`, or the Gallium split of phase 2) keeps working meanwhile: `gltest` passes
+as ARM64 and x64 with Zink beside it, found Vulkan through the adapter with the Khronos key removed, and
+the byte counters show no copy into or out of Windows.
+
 ## Things to check early
 
 - Which OpenGL version Zink reaches on the Mali driver, and which missing
