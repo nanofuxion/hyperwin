@@ -1172,6 +1172,24 @@ void hwgpu_host_d3d_show(int on) {
 #endif
 }
 
+void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset) {
+    if (!g_window || slot >= HWGPU_CHANNELS) return nullptr;
+    auto* b = static_cast<uint8_t*>(heap_alloc(kHeapPage, size));
+    if (!b) return nullptr;
+    auto* ctl = hwgpu_chan_ctl(chan_base(slot));
+    for (uint32_t i = 0; i < HWGPU_GRANTS; i++) {
+        if (__atomic_load_n(&ctl->grant[i].size, __ATOMIC_ACQUIRE)) continue;
+        ctl->grant[i].offset = uint64_t(b - g_heap);
+        __atomic_store_n(&ctl->grant[i].size, (size + kHeapPage - 1) & ~(kHeapPage - 1), __ATOMIC_RELEASE);
+        *offset = uint64_t(b - g_heap);
+        return b;
+    }
+    heap_release(b);
+    return nullptr;
+}
+
+void hwgpu_host_heap_free(void* p) { heap_release(p); }
+
 int hwgpu_host_vsync(void) { return (g_scanout_flags.load() & HWGPU_SCANOUT_VSYNC) != 0; }
 
 void hwgpu_host_set_vsync(int on) {

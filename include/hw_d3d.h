@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 #define HWD3D_MAGIC    0x44334448u   /* "HD3D" little endian */
-#define HWD3D_VERSION  2u
+#define HWD3D_VERSION  4u
 
 /* hwd3d_msg.flags */
 #define HWD3D_NO_REPLY 0x0001u   /* the phone answers nothing, not even an error */
@@ -26,11 +26,40 @@
 #define HWD3D_OP_PING  0x0003u   /* -> hwd3d_ping_reply: how many messages arrived */
 /* The rest are a struct hwd3d_call and its arguments; the answer, a struct hwd3d_reply and its
  * outputs. Arguments and outputs are packed as gpu/host/hwd3d/gen_thunks.py describes: each one
- * 4-byte aligned, an array as a u32 "present", a u32 count and the elements. */
+ * 4-byte aligned, an array as a u32 "present", a u32 count and the elements. Present 2 means the
+ * elements are in the staging area instead: a u64 position follows the count (HWD3D_STAGED). */
 #define HWD3D_OP_CALL           0x0010u   /* object.method(arguments) */
 #define HWD3D_OP_RELEASE        0x0011u   /* the guest let go of object; no answer */
 #define HWD3D_OP_CREATE_FACTORY 0x0012u   /* CreateDXGIFactory1: riid -> handle, interface */
 #define HWD3D_OP_CREATE_DEVICE  0x0013u   /* D3D11CreateDevice -> device, level, context */
+
+/* hwd3d_msg arrays: inline, or in the staging area. */
+#define HWD3D_INLINE 1u
+#define HWD3D_STAGED 2u
+
+/* The staging area: part of the shared GPU heap the phone grants each HwD3D channel at hello, which
+ * Windows maps (IOCTL_HWGPU_MAP). Bulk data (uploads, written maps) goes there; the ring carries
+ * only its position. It is used as a ring: positions only grow, the data of position p is at
+ * HWD3D_STAGING_DATA + p % cap, with cap = size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE, and one
+ * array never wraps. The phone
+ * publishes in done how far it has read, so the guest knows what it may write over. */
+#define HWD3D_STAGING_DATA 64u
+struct hwd3d_staging {
+    uint64_t done;     /* phone: every staged byte before this position has been used */
+    uint64_t reserved[7];
+};
+
+/* The query page: the last HWD3D_QUERY_PAGE bytes of the staging area, outside its ring. Each query
+ * the guest ends gets a slot; the phone writes the result there when the GPU has it and then sets
+ * seq to the End it answers, so GetData is a memory read. */
+#define HWD3D_QUERY_PAGE  (64u << 10)
+#define HWD3D_QUERY_DATA  120u
+struct hwd3d_query_slot {
+    uint32_t seq;      /* phone, written last: the End this result is for */
+    uint32_t size;
+    uint8_t data[HWD3D_QUERY_DATA];
+};
+#define HWD3D_QUERY_SLOTS (HWD3D_QUERY_PAGE / sizeof(struct hwd3d_query_slot))
 
 /* A message can hold a texture's first contents. */
 #define HWD3D_MAX_MSG  (256u << 20)
@@ -68,6 +97,7 @@ struct hwd3d_hello_reply {
     struct hwd3d_reply r;
     uint32_t version;  /* HWD3D_VERSION the phone speaks */
     uint32_t caps;     /* none yet */
+    uint64_t staging_offset, staging_size;  /* in the heap; size 0 for none */
 };
 
 struct hwd3d_ping_reply {
@@ -146,7 +176,9 @@ HWD3D_ASSERT(sizeof(struct hwd3d_msg) == 16, "hwd3d_msg");
 HWD3D_ASSERT(sizeof(struct hwd3d_hello) == 32, "hwd3d_hello");
 HWD3D_ASSERT(sizeof(struct hwd3d_reply) == 24, "hwd3d_reply");
 HWD3D_ASSERT(sizeof(struct hwd3d_call) == 24, "hwd3d_call");
-HWD3D_ASSERT(sizeof(struct hwd3d_hello_reply) == 32, "hwd3d_hello_reply");
+HWD3D_ASSERT(sizeof(struct hwd3d_hello_reply) == 48, "hwd3d_hello_reply");
+HWD3D_ASSERT(sizeof(struct hwd3d_staging) == HWD3D_STAGING_DATA, "hwd3d_staging");
+HWD3D_ASSERT(sizeof(struct hwd3d_query_slot) == 128, "hwd3d_query_slot");
 HWD3D_ASSERT(sizeof(struct hwd3d_ping_reply) == 32, "hwd3d_ping_reply");
 /* The sgpu server reads 4 + 24 bytes before it knows which protocol a channel speaks. */
 HWD3D_ASSERT(sizeof(struct hwd3d_hello) >= 28, "a hello covers the server's first read");

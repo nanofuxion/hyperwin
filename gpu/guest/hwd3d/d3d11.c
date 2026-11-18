@@ -25,6 +25,10 @@
 
 static void *g_chan;
 static uint32_t g_gen, g_seq;
+static uint8_t *g_stage;               /* the staging area (hw_d3d.h), or null */
+static uint64_t g_stage_cap, g_stage_pos;
+static volatile struct hwd3d_query_slot *g_qpage;  /* query results (hw_d3d.h), or null */
+static uint8_t g_qused[HWD3D_QUERY_SLOTS];
 static SRWLOCK g_lock = SRWLOCK_INIT;  /* one call at a time on the channel */
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static int g_ok;                       /* the phone speaks HwD3D */
@@ -67,11 +71,20 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
                             1,
 #endif
                             0};
-    struct hwd3d_hello_reply r;
+    struct hwd3d_hello_reply r = {0};
     if (raw_send(&h, sizeof h) && raw_recv(&r, sizeof r) && r.r.hdr.magic == HWD3D_MAGIC && r.r.status == 0 &&
-        r.version == HWD3D_VERSION)
+        r.version == HWD3D_VERSION) {
         g_ok = 1;
-    else
+        /* The staging area, where uploads go instead of the ring. Without it they ride inline. */
+        struct hwgpu_map_in in = {r.staging_offset, r.staging_size};
+        struct hwgpu_map_out out = {0};
+        if (r.staging_size > HWD3D_STAGING_DATA &&
+            DeviceIoControl(dev, IOCTL_HWGPU_MAP, &in, sizeof in, &out, sizeof out, &got, NULL) && out.user) {
+            g_stage = (uint8_t *)(uintptr_t)out.user;
+            g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
+            g_qpage = (volatile struct hwd3d_query_slot *)(g_stage + r.staging_size - HWD3D_QUERY_PAGE);
+        }
+    } else
         hlog("hwd3d: the phone has no HwD3D %u (status 0x%lx), using Windows' Direct3D\n", HWD3D_VERSION,
              (unsigned long)r.r.status);
     return TRUE;
@@ -111,14 +124,48 @@ static void put(struct wbuf *b, const void *v, uint32_t n)
 static void put32(struct wbuf *b, uint32_t v) { put(b, &v, 4); }
 static void put_want(struct wbuf *b, const void *p) { put32(b, p != NULL); }
 
-/* An array: present, count, the elements. A count past any real use (D3D11_KEEP_*) sends none. */
+/* Room for n bytes in the staging area, or null when it is missing or the data is too big for it.
+ * Waits while the phone still needs what is there. Under g_lock, before the request is sent: every
+ * request the phone is waiting on to free room has gone already. */
+static uint8_t *stage_alloc(uint64_t n, uint64_t *pos)
+{
+    if (!g_stage || n > g_stage_cap / 2) return NULL;
+    uint64_t at = g_stage_pos % g_stage_cap;
+    if (at + n > g_stage_cap) g_stage_pos += g_stage_cap - at;  /* one array never wraps */
+    const struct hwd3d_staging *sc = (const struct hwd3d_staging *)g_stage;
+    struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
+    while (g_stage_pos + n > __atomic_load_n(&sc->done, __ATOMIC_ACQUIRE) + g_stage_cap) {
+        if (!hwgpu_alive(c, g_gen)) return NULL;
+        SwitchToThread();
+    }
+    *pos = g_stage_pos;
+    g_stage_pos += (n + 15) & ~15ull;
+    return g_stage + HWD3D_STAGING_DATA + *pos % g_stage_cap;
+}
+
+static void put_staged(struct wbuf *b, uint64_t count, uint64_t pos)
+{
+    put32(b, HWD3D_STAGED);
+    put32(b, (uint32_t)count);
+    put(b, &pos, 8);
+}
+
+/* An array: present, count, the elements, or where they are staged. A count past any real use
+ * (D3D11_KEEP_*) sends none. */
 static void put_arr(struct wbuf *b, const void *p, uint64_t n, uint32_t el)
 {
     if (!p || n > (HWD3D_MAX_MSG / (el ? el : 1))) {
         put32(b, 0);
         return;
     }
-    put32(b, 1);
+    uint64_t pos;
+    uint8_t *d = n * el >= 256 ? stage_alloc(n * el, &pos) : NULL;
+    if (d) {
+        memcpy(d, p, (size_t)(n * el));
+        put_staged(b, n, pos);
+        return;
+    }
+    put32(b, HWD3D_INLINE);
     put32(b, (uint32_t)n);
     put(b, p, (uint32_t)(n * el));
 }
@@ -224,6 +271,9 @@ struct shell {
     struct res_info *res;   /* a resource's description, when one was needed */
     struct shadow *shadows; /* mapped memory by subresource */
     HWND hwnd;              /* a swap chain's window */
+    int qslot;              /* a query's slot in the query page, -1 for none yet */
+    uint32_t qseq;          /* its last End */
+    int qflushed;           /* a flush went for that End */
 };
 
 #include "hwd3d_guest_pre.inc"
@@ -313,6 +363,9 @@ static struct shell *shell_for(uint32_t handle, int iface)
     s->res = NULL;
     s->shadows = NULL;
     s->hwnd = NULL;
+    s->qslot = -1;
+    s->qseq = 0;
+    s->qflushed = 0;
     g_shells[i] = s;
     return s;
 }
@@ -364,6 +417,8 @@ static ULONG STDMETHODCALLTYPE m_IUnknown_Release(void *This)
         free_shadows(s);
         free(s->res);
         s->res = NULL;
+        if (s->qslot >= 0) g_qused[s->qslot] = 0;
+        s->qslot = -1;
         s->handle = 0;
         s->next_free = g_free;
         g_free = s;
@@ -463,10 +518,17 @@ static struct res_info *res_info(struct shell *s)
 static void put_rows(struct wbuf *b, const uint8_t *src, uint32_t row, uint32_t rows, uint32_t slices, uint32_t pitch,
                      uint32_t slice_pitch)
 {
-    uint64_t total = (uint64_t)row * rows * slices, padded = (total + 3) & ~3ull;
+    uint64_t total = (uint64_t)row * rows * slices, padded = (total + 3) & ~3ull, pos;
     put32(b, row);
     put32(b, rows);
-    put32(b, 1);
+    uint8_t *st = stage_alloc(total, &pos);
+    if (st) {
+        for (uint32_t z = 0; z < slices; z++)
+            for (uint32_t y = 0; y < rows; y++, st += row) memcpy(st, src + (size_t)z * slice_pitch + (size_t)y * pitch, row);
+        put_staged(b, total, pos);
+        return;
+    }
+    put32(b, HWD3D_INLINE);
     put32(b, (uint32_t)total);
     reserve(b, (uint32_t)padded);
     uint8_t *d = b->p + b->n;
@@ -590,6 +652,7 @@ struct shadow {
     UINT sub;
     D3D11_MAP type;
     uint32_t size, row_pitch, depth_pitch;
+    int local;  /* answered without the phone: Unmap does the map */
     uint8_t *mem;
 };
 
@@ -609,6 +672,40 @@ static HRESULT STDMETHODCALLTYPE m_ID3D11DeviceContext_Map(void *This, ID3D11Res
     if (out) memset(out, 0, sizeof *out);
     if (!res || !is_shell(res)) return E_INVALIDARG;
     struct shell *s = (struct shell *)res;
+    if (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE) {
+        /* Answered here: the program writes into a copy kept beside the resource, and Unmap sends
+         * it through the staging area. No wait. Dynamic resources are written only this way, so
+         * the copy is always what the resource holds. */
+        struct res_info *ri = res_info(s);
+        uint32_t row, rows, slices;
+        if (!hwd3d_region(&ri->r, sub, NULL, &row, &rows, &slices)) return E_INVALIDARG;
+        uint32_t size = row * rows * slices;
+        AcquireSRWLockExclusive(&g_lock);
+        struct shadow *m = s->shadows;
+        while (m && m->sub != sub) m = m->next;
+        if (!m) {
+            m = calloc(1, sizeof *m);
+            m->sub = sub;
+            m->next = s->shadows;
+            s->shadows = m;
+        }
+        if (m->size != size) {
+            free(m->mem);
+            m->mem = calloc(1, size ? size : 1);
+            m->size = size;
+        }
+        m->type = type;
+        m->row_pitch = row;
+        m->depth_pitch = row * rows;
+        m->local = 1;
+        ReleaseSRWLockExclusive(&g_lock);
+        if (out) {
+            out->pData = m->mem;
+            out->RowPitch = row;
+            out->DepthPitch = row * rows;
+        }
+        return S_OK;
+    }
     struct wbuf *b = begin(((struct shell *)This)->handle, HM_ID3D11DeviceContext_Map, HWD3D_OP_CALL);
     put32(b, s->handle);
     put32(b, sub);
@@ -637,6 +734,7 @@ static HRESULT STDMETHODCALLTYPE m_ID3D11DeviceContext_Map(void *This, ID3D11Res
     m->type = type;
     m->row_pitch = row_pitch;
     m->depth_pitch = depth_pitch;
+    m->local = 0;
     if (has) take(&r, m->mem, size);
     call_end(&r);
     if (out) {
@@ -656,10 +754,18 @@ static void STDMETHODCALLTYPE m_ID3D11DeviceContext_Unmap(void *This, ID3D11Reso
     while (m && m->sub != sub) m = m->next;
     put32(b, s->handle);
     put32(b, sub);
-    if (m && m->type != D3D11_MAP_READ)
+    put32(b, m && m->local);
+    if (m && m->local) {
+        put32(b, m->type);
+        put32(b, m->row_pitch);
+        put32(b, m->row_pitch ? m->depth_pitch / m->row_pitch : 0);
         put_arr(b, m->mem, m->size, 1);
-    else
+        m->local = 0;
+    } else if (m && m->type != D3D11_MAP_READ) {
+        put_arr(b, m->mem, m->size, 1);
+    } else {
         put32(b, 0);
+    }
     call_async(b);
 }
 
@@ -685,6 +791,60 @@ static HRESULT STDMETHODCALLTYPE m_IDXGIFactory_CreateSwapChain(void *This, IUnk
     take_obj(&r, (void **)out, HI_IDXGISwapChain);
     call_end(&r);
     if (*out) ((struct shell *)*out)->hwnd = desc->OutputWindow;
+    return hr;
+}
+
+/* Queries: End gives the query a slot in the query page, and GetData reads it there. Only a
+ * query whose result has not come yet costs a message: one flush, as Windows' GetData does. */
+static void STDMETHODCALLTYPE m_ID3D11DeviceContext_End(void *This, ID3D11Asynchronous *q)
+{
+    if (!q || !is_shell(q)) return;
+    struct shell *s = (struct shell *)q;
+    struct wbuf *b = call_begin(This, HM_ID3D11DeviceContext_End);
+    if (g_qpage && s->qslot < 0)
+        for (int i = 0; i < (int)HWD3D_QUERY_SLOTS; i++)
+            if (!g_qused[i]) {
+                g_qused[i] = 1;
+                s->qslot = i;
+                break;
+            }
+    if (s->qslot >= 0) {
+        s->qseq++;
+        if (!s->qseq) s->qseq = 1;
+        s->qflushed = 0;
+    }
+    put32(b, s->handle);
+    put32(b, s->qslot >= 0 ? (uint32_t)s->qslot : 0);
+    put32(b, s->qslot >= 0 ? s->qseq : 0);
+    call_async(b);
+}
+
+static HRESULT STDMETHODCALLTYPE m_ID3D11DeviceContext_GetData(void *This, ID3D11Asynchronous *q, void *data, UINT size,
+                                                               UINT flags)
+{
+    if (!q || !is_shell(q)) return E_INVALIDARG;
+    struct shell *s = (struct shell *)q;
+    if (s->qslot >= 0 && s->qseq) {
+        volatile struct hwd3d_query_slot *slot = &g_qpage[s->qslot];
+        if (__atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE) == s->qseq) {
+            uint32_t n = slot->size < size ? slot->size : size;
+            if (data && n) memcpy(data, (const void *)slot->data, n);
+            return S_OK;
+        }
+        if (!(flags & D3D11_ASYNC_GETDATA_DONOTFLUSH) && !s->qflushed) {
+            s->qflushed = 1;
+            ID3D11DeviceContext_Flush((ID3D11DeviceContext *)This);
+        }
+        return S_FALSE;
+    }
+    struct wbuf *b = call_begin(This, HM_ID3D11DeviceContext_GetData);
+    put32(b, s->handle);
+    put32(b, data ? size : 0);
+    put32(b, flags);
+    struct rd r;
+    HRESULT hr = call_wait(b, &r);
+    take(&r, data, data ? size : 0);
+    call_end(&r);
     return hr;
 }
 

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <map>
@@ -35,6 +36,8 @@ extern "C" void* hwgpu_host_d3d_window_acquire(void);
 extern "C" void hwgpu_host_d3d_window_release(void* window);
 extern "C" void hwgpu_host_d3d_show(int on);
 extern "C" int hwgpu_host_vsync(void);
+extern "C" void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
+extern "C" void hwgpu_host_heap_free(void* p);
 
 namespace {
 
@@ -44,6 +47,10 @@ void* const BAD = reinterpret_cast<void*>(uintptr_t(1));
 struct Rd {
     const uint8_t *p, *end;
     bool ok = true;
+    const uint8_t* stage = nullptr;  // the channel's staging area, when it has one
+    uint64_t stage_cap = 0;          // its data bytes
+    uint64_t stage_end = 0;          // the furthest staged byte this request used
+    uint64_t staged = 0;             // bytes it took from there
     const void* take(uint64_t n) {
         uint64_t padded = (n + 3) & ~3ull;
         if (uint64_t(end - p) < padded) {
@@ -65,11 +72,26 @@ struct Rd {
         get(&v, 4);
         return v;
     }
-    // An array: present, count, elements. Null when absent; n gets the count.
+    // An array: present, count, elements (or their position in the staging area). Null when
+    // absent; n gets the count.
     const void* arr(uint32_t el, uint64_t* n) {
         *n = 0;
-        if (!u32()) return nullptr;
+        uint32_t how = u32();
+        if (!how) return nullptr;
         uint64_t count = u32();
+        if (how == HWD3D_STAGED) {
+            uint64_t pos;
+            get(&pos, 8);
+            uint64_t bytes = count * el, at = stage_cap ? pos % stage_cap : 0;
+            if (!stage || bytes > stage_cap || at + bytes > stage_cap) {
+                ok = false;
+                return nullptr;
+            }
+            stage_end = std::max(stage_end, pos + bytes);
+            staged += bytes;
+            *n = count;
+            return stage + HWD3D_STAGING_DATA + at;
+        }
         const void* at = take(count * el);
         if (at) *n = count;
         return at;
@@ -134,6 +156,39 @@ struct Chan {
     ID3D11DeviceContext* immediate = nullptr;  // the first device's, for unmapping at the end
     void* window = nullptr;                    // the surface, while this program has it
     uint32_t swapchain = 0;
+    uint8_t* stage = nullptr;                  // the staging area in the heap (hw_d3d.h)
+    uint64_t stage_size = 0;
+    // Queries ended and not yet answered in the query page.
+    struct Pending {
+        ID3D11Asynchronous* q;  // a reference of its own
+        ID3D11DeviceContext* ctx;
+        uint32_t slot, seq;
+    };
+    std::vector<Pending> pending;
+
+    // Writes the results the GPU has for ended queries into the query page.
+    void poll_queries() {
+        if (pending.empty()) return;
+        auto* page = reinterpret_cast<hwd3d_query_slot*>(stage + stage_size - HWD3D_QUERY_PAGE);
+        for (auto p = pending.begin(); p != pending.end();) {
+            uint8_t data[HWD3D_QUERY_DATA];
+            UINT size = std::min<UINT>(p->q->GetDataSize(), HWD3D_QUERY_DATA);
+            if (p->ctx->GetData(p->q, size ? data : nullptr, size, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+                ++p;
+                continue;
+            }
+            hwd3d_query_slot& s = page[p->slot];
+            memcpy(s.data, data, size);
+            s.size = size;
+            __atomic_store_n(&s.seq, p->seq, __ATOMIC_RELEASE);
+            p->q->Release();
+            p->ctx->Release();
+            p = pending.erase(p);
+        }
+    }
+
+    // What crossed, for the log at the end: requests and their bytes, answers, staged bytes.
+    uint64_t presents = 0, ring_bytes = 0, answers = 0, staged_bytes = 0;
 
     static uint32_t handle(uint32_t i, uint16_t gen) { return i | (uint32_t(gen & 0xFFF) << 20); }
 
@@ -202,6 +257,25 @@ struct Chan {
         return r.ok;
     }
 
+    // Waits until the GPU has finished all this program sent. DXVK's swap chain leaves a
+    // callback on its frame-latency fence; destroying it with frames in flight lets the queue
+    // thread call into freed memory, so a swap chain only goes once the GPU is idle.
+    void idle() {
+        if (!immediate) return;
+        ID3D11Device* dev = nullptr;
+        immediate->GetDevice(&dev);
+        D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+        ID3D11Query* q = nullptr;
+        if (dev && SUCCEEDED(dev->CreateQuery(&qd, &q))) {
+            immediate->End(q);
+            immediate->Flush();
+            BOOL done = FALSE;
+            for (int i = 0; i < 2000 && immediate->GetData(q, &done, sizeof done, 0) != S_OK; i++) usleep(1000);
+            q->Release();
+        }
+        if (dev) dev->Release();
+    }
+
     void release(uint32_t h) {
         uint32_t i = h & 0xFFFFF;
         if (!h || i >= table.size() || !table[i].ptr || handle(i, table[i].gen) != h) return;
@@ -209,6 +283,7 @@ struct Chan {
         found.erase({o.ident, o.iface});
         if (h == swapchain) {
             swapchain = 0;
+            idle();
             hwgpu_host_d3d_show(0);
         }
         void* p = o.ptr;
@@ -220,6 +295,12 @@ struct Chan {
 
     // What the program still held, newest first, as it would have let go.
     void release_all() {
+        idle();
+        for (auto& p : pending) {
+            p.q->Release();
+            p.ctx->Release();
+        }
+        pending.clear();
         if (immediate) {
             for (auto& m : maps) immediate->Unmap(static_cast<ID3D11Resource*>(m.res), m.sub);
             maps.clear();
@@ -233,6 +314,8 @@ struct Chan {
         for (auto& l : live) release(l.second);
         if (window) hwgpu_host_d3d_window_release(window);
         window = nullptr;
+        if (stage) hwgpu_host_heap_free(stage);
+        stage = nullptr;
     }
 };
 
@@ -445,6 +528,35 @@ int32_t hc_ID3D11DeviceContext_Map(Chan& c, void* self, Rd& r, Wr& w) {
 int32_t hc_ID3D11DeviceContext_Unmap(Chan& c, void* self, Rd& r, Wr&) {
     void* p = c.obj(r.u32(), HI_ID3D11Resource);
     uint32_t sub = r.u32();
+    if (r.u32()) {
+        // A map the guest answered alone (WRITE_DISCARD, WRITE_NO_OVERWRITE): map, copy, unmap.
+        uint32_t type = r.u32(), row = r.u32(), rows = r.u32(), want_row, want_rows, slices;
+        uint64_t n = 0;
+        const auto* data = static_cast<const uint8_t*>(r.arr(1, &n));
+        if (!r.ok || !p || p == BAD || !data || (type != D3D11_MAP_WRITE_DISCARD && type != D3D11_MAP_WRITE_NO_OVERWRITE))
+            return E_INVALIDARG;
+        auto* res = static_cast<ID3D11Resource*>(p);
+        hwd3d_res s = shape(res);
+        if (!hwd3d_region(&s, sub, nullptr, &want_row, &want_rows, &slices) || row != want_row || rows != want_rows ||
+            n != uint64_t(row) * rows * slices)
+            return E_INVALIDARG;
+        auto* ctx = static_cast<ID3D11DeviceContext*>(self);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        HRESULT hr = ctx->Map(res, sub, D3D11_MAP(type), 0, &m);
+        if (FAILED(hr)) return hr;
+        auto* dst = static_cast<uint8_t*>(m.pData);
+        if (s.dim == 1 || m.RowPitch == row) {
+            for (uint32_t z = 0; z < slices; z++)
+                memcpy(dst + size_t(z) * m.DepthPitch, data + size_t(z) * row * rows, size_t(row) * rows);
+        } else {
+            for (uint32_t z = 0; z < slices; z++)
+                for (uint32_t y = 0; y < rows; y++)
+                    memcpy(dst + size_t(z) * m.DepthPitch + size_t(y) * m.RowPitch,
+                           data + (size_t(z) * rows + y) * row, row);
+        }
+        ctx->Unmap(res, sub);
+        return 0;
+    }
     uint64_t n = 0;
     const void* data = r.arr(1, &n);
     if (!r.ok || !p || p == BAD) return E_INVALIDARG;
@@ -487,12 +599,48 @@ int32_t hc_IDXGIFactory_CreateSwapChain(Chan& c, void* self, Rd& r, Wr& w) {
     return hr;
 }
 
+// End: a query the guest gave a slot in the query page is watched until the GPU has its result
+// (Chan::poll_queries); one without (no staging area) is asked with GetData as before.
+int32_t hc_ID3D11DeviceContext_End(Chan& c, void* self, Rd& r, Wr&) {
+    void* q = c.obj(r.u32(), HI_ID3D11Asynchronous);
+    uint32_t slot = r.u32(), seq = r.u32();
+    if (!r.ok || !q || q == BAD) return E_INVALIDARG;
+    auto* ctx = static_cast<ID3D11DeviceContext*>(self);
+    auto* a = static_cast<ID3D11Asynchronous*>(q);
+    ctx->End(a);
+    if (seq && c.stage && slot < HWD3D_QUERY_SLOTS) {
+        for (auto p = c.pending.begin(); p != c.pending.end(); ++p)
+            if (p->slot == slot) {  // ended again before its result came: the new End wins
+                p->q->Release();
+                p->ctx->Release();
+                c.pending.erase(p);
+                break;
+            }
+        a->AddRef();
+        ctx->AddRef();
+        c.pending.push_back({a, ctx, slot, seq});
+    }
+    return 0;
+}
+
+int32_t hc_ID3D11DeviceContext_GetData(Chan& c, void* self, Rd& r, Wr& w) {
+    void* q = c.obj(r.u32(), HI_ID3D11Asynchronous);
+    uint32_t size = r.u32(), flags = r.u32();
+    if (!r.ok || !q || q == BAD || size > 4096) return E_INVALIDARG;
+    std::vector<uint8_t> data(size);
+    HRESULT hr = static_cast<ID3D11DeviceContext*>(self)->GetData(static_cast<ID3D11Asynchronous*>(q),
+                                                                  size ? data.data() : nullptr, size, flags);
+    w.put(data.data(), size);
+    return hr;
+}
+
 // "Limit to screen refresh" (the app's switch) holds a program that asks for no wait to one
 // frame per refresh, as the sgpu scanout does.
-int32_t hc_IDXGISwapChain_Present(Chan&, void* self, Rd& r, Wr&) {
+int32_t hc_IDXGISwapChain_Present(Chan& c, void* self, Rd& r, Wr&) {
     uint32_t sync = r.u32(), flags = r.u32();
     if (!r.ok) return E_INVALIDARG;
     if (!sync && hwgpu_host_vsync()) sync = 1;
+    c.presents++;
     return static_cast<IDXGISwapChain*>(self)->Present(sync, flags);
 }
 
@@ -610,11 +758,17 @@ bool answer(Chan& c, const hwd3d_msg& req, int32_t status, const Wr& w) {
     return send(c, &r, sizeof r) && (w.b.empty() || send(c, w.b.data(), w.b.size()));
 }
 
+int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, Wr& w);
+
+// Bytes of the shared GPU heap each HwD3D channel stages its uploads in.
+constexpr uint64_t kStaging = 32u << 20;
+
 // One request. False ends the channel: a broken stream cannot be resynchronized.
 bool handle(Chan& c, const std::vector<uint8_t>& m) {
     hwd3d_msg h;
     memcpy(&h, m.data(), sizeof h);
     c.received++;
+    c.ring_bytes += m.size();
     Wr w;
     switch (h.op) {
     case HWD3D_OP_HELLO: {
@@ -626,6 +780,18 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
         r.r.hdr = {uint32_t(sizeof r), HWD3D_MAGIC, h.op, HWD3D_REPLY, h.seq};
         r.r.status = hello.version == HWD3D_VERSION ? 0 : int32_t(0x80004005);  // E_FAIL
         r.version = HWD3D_VERSION;
+        if (!c.stage && hello.version == HWD3D_VERSION) {
+            uint64_t off = 0;
+            c.stage = static_cast<uint8_t*>(hwgpu_host_heap_grant(c.slot, kStaging, &off));
+            if (c.stage) {
+                c.stage_size = kStaging;
+                memset(c.stage, 0, HWD3D_STAGING_DATA);
+                r.staging_offset = off;
+                r.staging_size = kStaging;
+            } else {
+                LOG("channel %u: no room in the GPU heap for staging; data rides in the ring", c.slot);
+            }
+        }
         return (h.flags & HWD3D_NO_REPLY) || send(c, &r, sizeof r);
     }
     case HWD3D_OP_NOP:
@@ -644,10 +810,34 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
         hwd3d_call call;
         memcpy(&call, m.data(), sizeof call);
         Rd r{m.data() + sizeof call, m.data() + m.size()};
+        if (c.stage) {
+            r.stage = c.stage;
+            r.stage_cap = c.stage_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
+        }
+        int32_t st = handle_call(c, h, call, r, w);
+        if (r.stage_end) {
+            // The data has been used (DXVK copied it): the guest may write over it.
+            auto* sc = reinterpret_cast<hwd3d_staging*>(c.stage);
+            if (r.stage_end > __atomic_load_n(&sc->done, __ATOMIC_RELAXED))
+                __atomic_store_n(&sc->done, r.stage_end, __ATOMIC_RELEASE);
+        }
+        c.staged_bytes += r.staged;
+        if (h.op == HWD3D_OP_RELEASE) return true;
+        c.answers += !(h.flags & HWD3D_NO_REPLY);
+        return answer(c, h, st, w);
+    }
+    default:
+        LOG("channel %u: unknown op 0x%x", c.slot, h.op);
+        return answer(c, h, int32_t(0x80004001), w);
+    }
+}
+
+int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, Wr& w) {
+    {
         int32_t st;
         if (h.op == HWD3D_OP_RELEASE) {
             c.release(call.object);
-            return true;
+            return 0;
         } else if (h.op == HWD3D_OP_CREATE_FACTORY) {
             st = create_factory(c, r, w);
         } else if (h.op == HWD3D_OP_CREATE_DEVICE) {
@@ -664,11 +854,7 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
             st = (!self || self == BAD) ? int32_t(0x80070057) /* E_INVALIDARG */
                                         : hm_table[call.method].fn(c, self, r, w);
         }
-        return answer(c, h, st, w);
-    }
-    default:
-        LOG("channel %u: unknown op 0x%x", c.slot, h.op);
-        return answer(c, h, int32_t(0x80004001), w);
+        return st;
     }
 }
 
@@ -690,12 +876,19 @@ uint64_t now_ns() {
 
 // Programs wait on answers in bursts (Map, queries, Present). For 200 us after a request only
 // yield, so the next is seen within microseconds; after that hwgpu_read_all's growing sleeps.
-void wait_request(void* chan, uint32_t generation) {
-    hwgpu_ctl* c = hwgpu_chan_ctl(chan);
+// Ended queries are polled meanwhile: a program spinning on GetData sends nothing, so the answer
+// must come while this side waits.
+void wait_request(Chan& ch) {
+    hwgpu_ctl* c = hwgpu_chan_ctl(ch.chan);
     const uint64_t start = now_ns();
+    uint32_t misses = 0;
     while (__atomic_load_n(&c->tx_head, __ATOMIC_ACQUIRE) == __atomic_load_n(&c->tx_tail, __ATOMIC_RELAXED) &&
-           hwgpu_alive(c, generation) && now_ns() - start < 200000ull)
-        sched_yield();
+           hwgpu_alive(c, ch.generation)) {
+        ch.poll_queries();
+        if (now_ns() - start < 200000ull) sched_yield();
+        else if (!ch.pending.empty()) hwgpu_pause(100);
+        else hwgpu_backoff(&misses);
+    }
 }
 
 }  // namespace
@@ -710,11 +903,18 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
     bool ok = read_message(c, m, first_len) && handle(c, m);
     while (ok) {
         m.resize(sizeof(hwd3d_msg));
-        wait_request(chan, generation);
+        wait_request(c);
         if (!hwgpu_read_all(chan, generation, 0, m.data(), sizeof(hwd3d_msg))) break;  // the channel ended
         ok = read_message(c, m, sizeof(hwd3d_msg)) && handle(c, m);
+        c.poll_queries();
     }
     if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation)) LOG("channel %u: bad HwD3D stream, dropping it", slot);
     c.release_all();
     LOG("channel %u: HwD3D ends after %llu messages", slot, (unsigned long long)c.received);
+    if (c.presents) {
+        double f = double(c.presents);
+        LOG("channel %u: %llu frames; each one %.0f requests, %.0f bytes in the ring, %.1f answers waited for, "
+            "%.0f bytes staged in the heap", slot, (unsigned long long)c.presents, c.received / f, c.ring_bytes / f,
+            c.answers / f, c.staged_bytes / f);
+    }
 }

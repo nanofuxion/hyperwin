@@ -11,7 +11,7 @@
 //
 // Built for Windows too (gpu/guest/hwd3d/build.sh, d3dcube-*.exe), it is HwD3D's phase-2 test: the
 // same cube through HwD3D's d3d11.dll beside it, onto the phone's screen.
-//   d3dcube.exe [seconds] [width] [height]
+//   d3dcube.exe [seconds] [width] [height] [cubes] [1: wait for each frame with a query]
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -106,6 +106,13 @@ void pump() {}
 int main(int argc, char** argv) {
     int seconds = argc > 1 ? atoi(argv[1]) : 10;
     int w = argc > 2 ? atoi(argv[2]) : 1280, h = argc > 3 ? atoi(argv[3]) : 720;
+    // More cubes: each one maps the constant buffer again (WRITE_DISCARD), a dynamic-buffer-heavy
+    // frame for HwD3D phase 3.
+    int cubes = argc > 4 ? atoi(argv[4]) : 1;
+    if (cubes < 1) cubes = 1;
+    // Wait for each frame with an event query, as games that keep one frame in flight do (HwD3D
+    // phase 3's query page).
+    bool sync = argc > 5 && atoi(argv[5]);
 #ifdef _WIN32
     HWND window = make_window(w, h);
 #else
@@ -195,6 +202,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    ID3D11Query* event = nullptr;
+    D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+    if (sync) dev->CreateQuery(&qd, &event);
+    unsigned long long polls = 0;
     auto start = std::chrono::steady_clock::now(), last = start;
     unsigned long long frames = 0, window_frames = 0;
     for (;;) {
@@ -215,13 +226,6 @@ int main(int argc, char** argv) {
         ctx->ClearRenderTargetView(rtv, clear);
         ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1, 0);
         float a = float(t) * 0.6f;
-        Mat4 mvp = mul(mul(mul(rotate(0, 1, 0, a), rotate(1, 0, 0, 0.5f)), translate(0, 0, -6.5f)),
-                       perspective(0.6f, float(w) / float(h), 0.1f, 100.0f));
-        D3D11_MAPPED_SUBRESOURCE map;
-        if (SUCCEEDED(ctx->Map(cbo, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-            memcpy(map.pData, mvp.m, sizeof mvp.m);
-            ctx->Unmap(cbo, 0);
-        }
         UINT stride = sizeof(Vertex), offset = 0;
         ctx->IASetInputLayout(layout);
         ctx->IASetVertexBuffers(0, 1, &vbo, &stride, &offset);
@@ -229,7 +233,26 @@ int main(int argc, char** argv) {
         ctx->VSSetShader(vs, nullptr, 0);
         ctx->VSSetConstantBuffers(0, 1, &cbo);
         ctx->PSSetShader(ps, nullptr, 0);
-        ctx->Draw(36, 0);
+        int side = 1;
+        while (side * side < cubes) side++;
+        for (int i = 0; i < cubes; i++) {
+            float x = cubes == 1 ? 0 : (float(i % side) - (side - 1) / 2.0f) * 2.6f;
+            float y = cubes == 1 ? 0 : (float(i / side) - (side - 1) / 2.0f) * 2.6f;
+            float z = cubes == 1 ? -6.5f : -3.2f * side;
+            Mat4 mvp = mul(mul(mul(rotate(0, 1, 0, a + i * 0.1f), rotate(1, 0, 0, 0.5f)), translate(x, y, z)),
+                           perspective(0.6f, float(w) / float(h), 0.1f, 1000.0f));
+            D3D11_MAPPED_SUBRESOURCE map;
+            if (SUCCEEDED(ctx->Map(cbo, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                memcpy(map.pData, mvp.m, sizeof mvp.m);
+                ctx->Unmap(cbo, 0);
+            }
+            ctx->Draw(36, 0);
+        }
+        if (event) {
+            ctx->End(event);
+            BOOL done = FALSE;
+            while (ctx->GetData(event, &done, sizeof done, 0) != S_OK) polls++;
+        }
         hr = swap->Present(0, 0);
         pump();
         if (FAILED(hr)) {
@@ -240,6 +263,7 @@ int main(int argc, char** argv) {
         window_frames++;
     }
     double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    printf("%llu frames in %.1f s: %.1f FPS at %dx%d\n", frames, total, frames / total, w, h);
+    printf("%llu frames in %.1f s: %.1f FPS at %dx%d, %d cubes\n", frames, total, frames / total, w, h, cubes);
+    if (event) printf("waited for every frame: %.0f GetData calls a frame\n", frames ? double(polls) / frames : 0.0);
     return 0;
 }

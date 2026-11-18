@@ -372,6 +372,44 @@ Left for later phases: one swap chain at a time, always full screen, no
 Vortek switched on. AIO's own D3D11 cube was not run: its command line for
 that mode is unknown here.
 
+## Phase 3 result (2026-11-18): data stays out of the ring
+
+- **Staging area.** The phone grants each HwD3D channel 32 MiB of the shared
+  GPU heap at hello (`hwgpu_host_heap_grant`), and the DLL maps it with
+  `IOCTL_HWGPU_MAP`. Arrays of 256 bytes or more and texture rows are written
+  there, and the ring carries a position (`HWD3D_STAGED`). It is used as a
+  ring. The phone publishes how far it has read (`hwd3d_staging.done`) and the
+  guest waits only if it would write over unread data. Without a heap, data
+  rides inline as before.
+- **Dynamic maps without a wait.** `Map` with `WRITE_DISCARD` or
+  `WRITE_NO_OVERWRITE` is answered in the guest from a copy kept beside the
+  resource. `Unmap` stages the bytes and the phone maps, copies and unmaps. Reads
+  still ask the phone.
+- **Query page.** The last 64 KiB of the staging area is 512 slots. `End`
+  gives the query a slot and a sequence number. The phone polls its ended
+  queries while its channel is idle and writes the result into the slot, then
+  the sequence. `GetData` is a memory read, and one flush if the result isn't
+  there yet. A query with no slot asks the phone as before.
+- **Counters.** At the end of a channel the phone logs, per frame, requests,
+  bytes in the ring, answers waited for, and bytes staged.
+- **A crash found with AIO:** closing a program mid-frame crashed `:gpu`,
+  because DXVK's swap chain leaves a callback on its latency fence. A swap
+  chain now goes only after the GPU is idle.
+
+| Pixel 6 Pro, 1280x720, no refresh limit | Before | After |
+|---|---|---|
+| 400 cubes, one `Map` each | 207 FPS | 450 to 555 FPS |
+| 1 cube | 435 FPS | 460 to 610 FPS |
+| Waits for answers per frame | one per `Map` | one, for `Present` |
+| 1 cube, waiting for an event query every frame | n/a | 297 FPS, 76,000 `GetData` reads a frame, no messages |
+| 100 cubes, the same | n/a | 217 FPS |
+| `dxtest` ARM64 and x64 | PASS | PASS |
+
+The phone's heat changes these by a third between runs. AIO's Showcase scene
+ran at 98 FPS through HwD3D against 66 FPS and later 30 FPS for DXVK inside
+Windows. Left: `UpdateSubresource` to a buffer the GPU is using still copies
+on the phone, and a read-back `Map` sends the whole subresource.
+
 ## Things to check early
 
 - DXVK's native build on bionic: its threading, `dlopen` of Vulkan, and the

@@ -35,6 +35,11 @@ void* hwgpu_host_d3d_window_acquire(void);    /* a reference, or null when there
 void hwgpu_host_d3d_window_release(void* window);
 void hwgpu_host_d3d_show(int on);
 int hwgpu_host_vsync(void);                   /* "Limit to screen refresh" is on */
+/* size bytes of the shared GPU heap, granted to channel slot so its Windows process may map them:
+ * the phone's address, and *offset in the heap. Null when the heap is missing or full. The grant
+ * ends with the connection; the memory with hwgpu_host_heap_free. */
+void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
+void hwgpu_host_heap_free(void* p);
 // How many scanout frames went to the layer so far.
 uint64_t hwgpu_host_scanout_frames(void);
 

@@ -41,6 +41,7 @@ CUSTOM = {
     ("IUnknown", "QueryInterface"), ("ID3D11Device", "CreateBuffer"), ("ID3D11Device", "CreateTexture1D"), ("ID3D11Device", "CreateTexture2D"),
     ("ID3D11Device", "CreateTexture3D"), ("ID3D11Device", "CreateInputLayout"),
     ("ID3D11DeviceContext", "Map"), ("ID3D11DeviceContext", "Unmap"), ("ID3D11DeviceContext", "UpdateSubresource"),
+    ("ID3D11DeviceContext", "End"), ("ID3D11DeviceContext", "GetData"),
     ("IDXGIFactory", "CreateSwapChain"), ("IDXGISwapChain", "GetDesc"), ("IDXGISwapChain", "Present"), ("IDXGIAdapter", "GetDesc"),
     ("IDXGIAdapter1", "GetDesc1"),
 }
