@@ -104,6 +104,59 @@ interfaces as on Windows. Build it with the NDK's clang against bionic, like
   `Surface`, and lends it to `:gpu` the way scanout borrows its layer. The host
   calls `vkCreateAndroidSurfaceKHR` on it.
 
+## Choosing the DXVK version
+
+Like the Vulkan drivers, the user picks which DXVK the phone runs. Some games
+work better on an older or newer DXVK, or on a fork.
+
+- **Settings, Graphics** gets a "Direct3D" row under the Vulkan stack: the
+  DXVK the app ships, plus any the user added from a file. Added versions have a
+  remove button, like added drivers.
+- **A DXVK is a zip:** `meta.json` (name, DXVK version or fork, HwD3D ABI
+  version) and the `libdxvk_*.so` files. The app unpacks it into its own
+  folder, as it does a driver zip.
+- **Only HyperWin builds work.** Stock DXVK releases are Windows DLLs or
+  desktop Linux libraries, and neither loads on Android. Each version needs
+  `dxvk-android.patch`: the Android WSI, and Vulkan from the driver wrapper.
+  `gpu/host/hwd3d/build.sh` takes a DXVK tag, branch or fork URL and writes a
+  ready zip, so making one is one command. The patch may need small fixes for
+  versions far from 3.1.1.
+- **DXVK 2.1 and newer only.** That's when DXVK gained its native build.
+  DXVK-Sarek is based on 1.10, so it would need the native build ported back
+  first.
+- **Loading:** the app passes the chosen folder to the renderer as
+  `HWD3D_DXVK_DIR`. `libhwd3d.so` loads `libdxvk_dxgi.so` from there by full
+  path first, then the others, so their links to each other find the right
+  copy.
+- **A safety check:** the patch exports the HwD3D ABI version it was built
+  for. A zip that doesn't match is refused, with a note in Settings, and the
+  shipped version is used instead.
+- **Switching** restarts the renderer, like a driver swap. Running Direct3D
+  programs get `DXGI_ERROR_DEVICE_REMOVED`. Programs started after get the new
+  DXVK.
+
+One version for everything comes first. A version per program can follow.
+Every zip's libraries then get version-stamped names at build time, such as
+`libdxvk_d3d11-2.7.so`, so two versions can load in one process. The
+program's choice comes from Windows' registry,
+`HKLM\SOFTWARE\HyperWin\Direct3D\Programs\<exe name>`, like the OpenGL
+picker, and rides in the hello.
+
+### DXVK must know which game it's running
+
+DXVK has fixes for hundreds of games, chosen by the program's file name, and
+it reads `dxvk.conf` from the program's folder. On the phone, every program
+runs inside the renderer, so DXVK would see the renderer's name for all of
+them, and no game's folder.
+
+- The hello carries the program's file name, and the contents of a
+  `dxvk.conf` beside it, if there is one.
+- `dxvk-android.patch` makes DXVK's program name and user config come from the
+  device being created, not from the process. Several programs share one
+  renderer, so a process-wide setting can't work.
+- Test: a game that has a DXVK profile, such as one with a known frame-rate
+  limit, shows the profile's log line.
+
 ## The guest: thin DLLs
 
 - **`d3d11.dll`, `dxgi.dll`** first, then `d3d10core.dll`, `d3d9.dll`,
@@ -119,8 +172,9 @@ interfaces as on Windows. Build it with the NDK's clang against bionic, like
   adapter's Direct3D driver part, for every program. The requests on the wire
   stay the same. Only the Windows side changes, from COM shells to the driver
   interface. That form needs the WDK's `d3d10umddi.h`. The per-program DLLs
-  don't, so they come first. Direct3D 9 and older keep the per-program DLLs
-  until a Direct3D 9 driver part is worth building.
+  don't, so they came first. The goal is every game with nothing beside it:
+  Direct3D 9 and 12 get driver parts too (`wddm/README.md`). The per-program
+  DLLs stay as a fallback and for testing.
 - **Falls back by itself.** If no channel opens, or the host's version
   differs, the DLL loads Microsoft's copy from System32 and passes everything
   on. The program then runs on WARP instead of failing.
@@ -165,6 +219,8 @@ Mali imports heap ranges as host memory for gfxstream today.
 - `UpdateSubresource` and texture uploads write into a heap staging range,
   then send a copy request with the offset. No data rides in the ring.
 - The ring only carries the small requests.
+- The rules in `wddm/README.md`, "GPU data stays on the phone", apply here
+  too. Data crosses only when the program reads it on the CPU, and only once.
 
 ### Present
 
@@ -198,7 +254,10 @@ exit, as they would when a PC's driver updates.
 3. **Shared memory.** Heap-backed `Map`, staged uploads, the query page.
    Test: a dynamic-buffer-heavy scene, and the bytes in the ring per frame.
 4. **D3D11 for games.** Compute, UAVs, deferred contexts, MSAA, D3D10 faces,
-   windowed present through GDI. Test: a few real D3D11 games.
+   windowed present through GDI. The program's name and `dxvk.conf` per
+   device, and the DXVK version picker with one version for everything. Test:
+   a few real D3D11 games, one with a DXVK profile, and switching between two
+   DXVK zips.
 5. **Direct3D 9 and 8, and 32-bit.** DXVK's `d3d9` and `d3d8`, and the i686
    DLLs. Test: AIO's D3D9 and D3D8 cubes as x86, then 32-bit games.
 6. **DirectDraw and Direct3D 7** on the Direct3D 9 device, from LinD3D's

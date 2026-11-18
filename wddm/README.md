@@ -137,6 +137,45 @@ This replaces the display-only driver in `vsync/README.md` section 4. Basic
 Display and the CPU copy in `nativePresent` then only serve boot and the
 recovery screen.
 
+## GPU data stays on the phone
+
+Pixels, textures and frames live on the phone. They cross to Windows only when
+a program asks to read them on the CPU, and then only once. Nothing goes
+across and back again to be shown. Every phase keeps to this:
+
+- **No copies in Windows of GPU-only memory.** The "video memory" segment has
+  no backing in Windows. Windows' paging calls on it never copy anything:
+  eviction, residency changes and moves to system memory are no-ops, since the
+  phone keeps the real object. Report a large memory budget, so Windows rarely
+  tries.
+- **CPU writes land once,** in the shared GPU heap, where the GPU reads them.
+  Uploads to GPU-only textures are copied by the GPU from the heap. The phone's
+  CPU doesn't touch the bytes.
+- **CPU reads happen only on request:** `Map` for reading, staging copies,
+  `glReadPixels`. The GPU writes straight into heap memory Windows has mapped.
+- **Frames go to the screen on the phone.** Fullscreen programs present to an
+  Android surface. Once the display phase is done, DWM composes on the GPU and
+  flips the desktop to the phone's screen. Windowed games stop being copied
+  back into GDI. Until then, the GDI copy is the one known round trip.
+- **Sharing stays on the phone.** A game's swap chain read by DWM, a Vulkan
+  image used by Direct3D, an overlay or a capture tool: they share the phone's
+  object by handle, as Android hardware buffers. Never through Windows'
+  memory.
+- **The cursor is its own layer.** `DxgkDdiSetPointerShape` and moves go to a
+  small Android layer over the screen, so a moving cursor doesn't redraw the
+  desktop.
+- **A reset loses the GPU objects.** After a driver swap, programs rebuild
+  from their own data, as on a PC. There are no backup copies in Windows to
+  restore from.
+
+Known exceptions, each kept to the area asked for: `GetDC` on a Direct3D
+surface, GDI drawing on a GDI-compatible swap chain, and screen capture through
+Desktop Duplication.
+
+**Counters:** the kernel driver and each phone-side renderer count bytes copied
+in each direction, per program. A debug overlay shows them, so a round trip
+that creeps in gets noticed.
+
 ## Each API
 
 **Vulkan.** Same ICD, same gfxstream, same speed. Only how it's found and how
@@ -147,11 +186,21 @@ user-mode driver. The driver interface is close to the API, so HwD3D's
 requests barely change. Before this phase, HwD3D runs per program as thin
 DLLs, which needs no WDK (`d3d/README.md`).
 
-**Direct3D 9, 8, 7 and DirectDraw.** Microsoft's runtime talks to a different,
-lower-level driver interface for these. Keep HwD3D's per-program DLLs for them
-first. A Direct3D 9 driver part comes later, if it proves worth it.
+**Direct3D 9, 8, 7 and DirectDraw.** Microsoft's runtime handles 8, 7 and
+DirectDraw itself, on top of the Direct3D 9 driver interface. So one Direct3D
+9 driver part covers all four. That interface (`d3dumddi.h`) is lower level
+than the API. Render states, stream sources and surfaces arrive as driver
+calls. The phone side maps them back onto DXVK's `d3d9`. It needs an i686
+build for 32-bit games, named by `UserModeDriverNameWow`.
 
-**Direct3D 12.** Not in this plan. vkd3d-proton per program keeps working.
+**Direct3D 12.** A driver part on `d3d12umddi.h`, with vkd3d-proton built
+for Android on the phone, the way DXVK is. Direct3D 12 is the hardest to send
+across. Command lists are recorded and submitted, which suits a ring well. But
+placed heaps and GPU addresses that programs write into their own buffers need
+care. vkd3d-proton per program keeps working until then.
+
+The goal: any game runs on the GPU with nothing copied beside it. HwD3D's
+per-program DLLs and `use.cmd` stay as a fallback and for testing.
 
 **OpenGL.** Microsoft's `opengl32.dll` loads our ICD from `OpenGLDriverName`.
 It's the same build as the per-program one in `opengl/README.md`, with Mesa's
@@ -161,8 +210,9 @@ ICD entry points.
 
 - The kernel driver only needs `d3dkmddi.h`, `dispmprt.h` and their friends.
   `gpu/work/reactos-ddk` already has them. **No WDK.**
-- The Direct3D driver part needs `d3d10umddi.h`, which only ships in the WDK.
-  That phase waits for your OK on the WDK license.
+- The Direct3D driver parts need `d3d10umddi.h` (10 and 11), `d3dumddi.h`
+  (9) and `d3d12umddi.h` (12). These only ship in the WDK. Those phases wait
+  for your OK on the WDK license.
 - HwD3D's per-program DLLs and the OpenGL ICD need neither.
 
 ## Prior art to read first
@@ -190,11 +240,18 @@ ICD entry points.
    refused Basic Render now starts.
 5. **The OpenGL ICD on the adapter.** Test: `gltest` with nothing beside it,
    as ARM64, x64 and x86.
-6. **Display and render.** Modes, flips, vsync, GOP takeover. Test: DWM draws
-   on the GPU, the host's CPU use on a still desktop is near zero, and boot
-   and recovery still show.
-7. **Direct3D 9 driver part,** decided after HwD3D's per-program DLLs have
-   been used for a while.
+6. **Display and render.** Modes, flips, vsync, GOP takeover, hardware
+   cursor. Test: DWM draws on the GPU, the host's CPU use on a still desktop is
+   near zero, a windowed game shows no read-back in the counters below, and
+   boot and recovery still show.
+7. **The Direct3D 9 driver part,** ARM64 and i686, which also covers 8, 7 and
+   DirectDraw. Waits on the WDK. Test: AIO's D3D9, D3D8 and D3D7 cubes and a
+   few 32-bit games, all with nothing beside them.
+8. **The Direct3D 12 driver part,** on vkd3d-proton for Android. Waits on the
+   WDK. Test: `dxtest 12` with nothing beside it, then games.
+
+Phase 5 needs no WDK. If the WDK answer is still pending at phase 4, do 5
+first.
 
 ## Things to check early
 
