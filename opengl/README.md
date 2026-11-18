@@ -190,6 +190,27 @@ a reset and can rebuild. Programs started afterwards get the new driver.
    `gltest` as x86, then a few old 32-bit OpenGL games.
 7. **System-wide ICD** on the WDDM adapter.
 
+## Phase 1 result (2026-11-18)
+
+`gpu/host/hwpipe/build-zink.sh run` builds Mesa's Zink for Android (Gallium zink only, the same Mesa
+revision as the Windows side, one small patch: `ZINK_VULKAN_LIB` names the Vulkan library) and runs
+`zink_test` on the phone. It makes a Zink screen with no window system, clears a render target and reads a
+pixel back, on the Pixel's Mali driver:
+
+- screen: `zink Vulkan 1.4 (Mali-G78 (ARM_PROPRIETARY))`
+- GLSL 4.60 in both profiles, compute, textures to 16384, 8 render targets
+- pixel `00 ff 00 ff`: PASS
+
+Two things the build taught:
+
+- Zink reads its own build id for its pipeline cache key and crashes in `build_id_length` when the
+  program has none, so the host library links with `--build-id`.
+- The static libraries needed are `libzink`, `libgallium`, `libnir`, `libvtn`, the compiler, the Vulkan
+  utilities and Mesa's utility libraries, plus expat. There is no libGL: the host talks Gallium.
+
+Still to do in this phase: the same run on PanVK (the `panvk-lab` thread has the stack for it), and the
+extension list as OpenGL would see it (that needs Mesa's state tracker, which phase 2 brings).
+
 ## Things to check early
 
 - Which OpenGL version Zink reaches on the Mali driver, and which missing
