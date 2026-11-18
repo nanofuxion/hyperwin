@@ -1,6 +1,8 @@
 // JNI entry for the app: dev.hyperwin.app.GpuService.nativeStart(window, heap, flags, width, height) and
-// nativeStop(). window is the direct ByteBuffer the app already maps for the shared window.
+// nativeStop(), nativeSetLayer(surfaceControl, width, height). window is the direct ByteBuffer the
+// app already maps for the shared window.
 #include <jni.h>
+#include <android/surface_control_jni.h>
 
 #include "hwgpu_host.h"
 
@@ -17,3 +19,18 @@ extern "C" JNIEXPORT jint JNICALL Java_dev_hyperwin_app_GpuService_nativeStart(J
 }
 
 extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeStop(JNIEnv*, jobject) { hwgpu_host_stop(); }
+
+// The layer the app process made for scanout, lent to this process, or null to stop using it.
+extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeSetLayer(JNIEnv* env, jobject, jobject layer,
+                                                                                 jint width, jint height) {
+    hwgpu_host_set_layer(layer ? ASurfaceControl_fromJava(env, layer) : nullptr, int(width), int(height));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeSetLayerSize(JNIEnv*, jobject, jint width,
+                                                                                     jint height) {
+    hwgpu_host_set_layer_size(int(width), int(height));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_dev_hyperwin_app_GpuService_nativeSetVsync(JNIEnv*, jobject, jboolean on) {
+    hwgpu_host_set_vsync(on ? 1 : 0);
+}

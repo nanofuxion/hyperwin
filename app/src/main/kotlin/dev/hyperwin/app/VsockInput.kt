@@ -12,6 +12,7 @@ import java.io.IOException
  * on HW_VSOCK_PORT_INPUT. Each message is one length byte, then:
  *   1, make code (u16), flags (1 break, 2 E0)           a set 1 scan code
  *   2, x (u16), y (u16), buttons, wheel                  absolute pointer, 0..65535
+ *   3, buttons (u16), lt, rt, lx ly rx ry (s16), connected   gamepad, XInput layout
  */
 object VsockInput {
     private const val TAG = "HyperWin"
@@ -67,6 +68,7 @@ object VsockInput {
                         buttons = 0
                     }
                     Log.i(TAG, "vsock input connected after $attempts attempts")
+                    GamepadInput.resend()  // a controller already plugged in shows up at once
                 } else {
                     attempts++
                 }
@@ -96,6 +98,15 @@ object VsockInput {
             closeLocked()
             false
         }
+    }
+
+    /** The controller's whole state, in XInput's terms; the guest shows it as an Xbox controller. */
+    fun pad(connected: Boolean, buttons: Int, lt: Int, rt: Int, lx: Int, ly: Int, rx: Int, ry: Int): Boolean {
+        val b = java.nio.ByteBuffer.allocate(14).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        b.put(3).putShort(buttons.toShort()).put(lt.toByte()).put(rt.toByte())
+            .putShort(lx.toShort()).putShort(ly.toShort()).putShort(rx.toShort()).putShort(ry.toShort())
+            .put(if (connected) 1 else 0)
+        return send(b.array())
     }
 
     fun key(event: KeyEvent): Boolean = synchronized(lock) {

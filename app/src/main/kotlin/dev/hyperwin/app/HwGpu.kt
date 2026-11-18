@@ -14,6 +14,7 @@ import android.os.Message
 import android.os.Messenger
 import android.os.Process
 import android.os.SharedMemory
+import android.view.SurfaceControl
 import android.util.Log
 import java.io.File
 import java.util.zip.ZipInputStream
@@ -94,20 +95,61 @@ object HwGpu {
     @Volatile var running = false
         private set
 
+    // The compositor layer GPU frames go on (SGPU_CMD_SCANOUT), above the CPU-drawn desktop. This
+    // process owns it and lends it to each renderer, so it outlives a renderer that is replaced.
+    private var layer: SurfaceControl? = null
+    private var layerWidth = 0
+    private var layerHeight = 0
+    private var service: Messenger? = null
+
+    const val VSYNC = "scanout_vsync"
+
+    /** Whether GPU frames wait for the phone's screen ("Limit to screen refresh"). On by default. */
+    fun vsync(ctx: Context) = prefs(ctx).getBoolean(VSYNC, true)
+
+    fun setVsync(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(VSYNC, on).apply()
+        val msg = Message.obtain(null, GpuService.SET_VSYNC).apply { data = Bundle().apply { putBoolean("vsync", on) } }
+        service?.let { m -> runCatching { m.send(msg) } }
+    }
+
+    private fun layerBundle() = Bundle().apply {
+        putParcelable("layer", layer)
+        putInt("layerWidth", layerWidth)
+        putInt("layerHeight", layerHeight)
+    }
+
+    /** The layer scanout frames go on and the size it covers, or null when the view has none. */
+    fun setLayer(sc: SurfaceControl?, width: Int, height: Int) {
+        val sameLayer = sc != null && sc === layer
+        layer = sc
+        layerWidth = width
+        layerHeight = height
+        val msg = Message.obtain(null, if (sameLayer) GpuService.LAYER_SIZE else GpuService.LAYER).apply { data = layerBundle() }
+        service?.let { m -> runCatching { m.send(msg) } }
+    }
+
+    /** Takes the GPU's frame off the screen, for when nobody will replace it (renderer or VM gone). */
+    fun hideLayer() {
+        layer?.let { sc -> runCatching { SurfaceControl.Transaction().setVisibility(sc, false).apply() } }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val w = window ?: return
             val c = ctx ?: return
             val msg = Message.obtain(null, GpuService.START).apply {
-                data = Bundle().apply {
+                data = layerBundle().apply {
                     putParcelable("window", w.memory)
                     putParcelable("heap", w.heap)
                     putInt("width", width)
                     putInt("height", height)
                     putBundle("env", env(c))
+                    putBoolean("vsync", vsync(c))
                 }
             }
-            runCatching { Messenger(binder).send(msg) }.onFailure { Log.e(TAG, "renderer did not take the window", it) }
+            service = Messenger(binder)
+            runCatching { service?.send(msg) }.onFailure { Log.e(TAG, "renderer did not take the window", it) }
             running = true
             Log.i(TAG, "renderer process connected: ${describe(c)}")
         }
@@ -117,6 +159,10 @@ object HwGpu {
             // delay, so bind afresh at once; Windows programs waiting on the GPU then get errors
             // instead of hanging.
             running = false
+            service = null
+            // Its last frame would stay up over the desktop; the next renderer shows the layer again
+            // with its first frame.
+            hideLayer()
             Log.w(TAG, "renderer process ended, starting another")
             Handler(Looper.getMainLooper()).postDelayed({ restart() }, 500)
         }
@@ -133,6 +179,8 @@ object HwGpu {
     }
 
     fun stop() {
+        hideLayer()
+        service = null
         window = null
         unbind()
         running = false
@@ -229,6 +277,9 @@ object HwGpu {
 class GpuService : Service() {
     companion object {
         const val START = 1
+        const val LAYER = 2       // a new scanout layer, or none
+        const val LAYER_SIZE = 3  // the same layer, another size
+        const val SET_VSYNC = 4
         private const val TAG = "HwGpu"
         /** STREAM_RENDERER_FLAGS_* (gfxstream virtio-gpu-gfxstream-renderer.h), as ring_test uses. */
         private const val USE_SURFACELESS = 1 shl 3
@@ -243,7 +294,12 @@ class GpuService : Service() {
     private var started = false
 
     private val messenger = Messenger(Handler(Looper.getMainLooper()) { msg ->
-        if (msg.what == START && !started) start(msg.data)
+        when (msg.what) {
+            START -> if (!started) start(msg.data)
+            LAYER -> if (started) setLayer(msg.data)
+            LAYER_SIZE -> if (started) nativeSetLayerSize(msg.data.getInt("layerWidth"), msg.data.getInt("layerHeight"))
+            SET_VSYNC -> if (started) nativeSetVsync(msg.data.getBoolean("vsync", true))
+        }
         true
     })
 
@@ -267,8 +323,15 @@ class GpuService : Service() {
             return
         }
         started = true
+        nativeSetVsync(data.getBoolean("vsync", true))
+        setLayer(data)
         Log.i(TAG, "renderer started ${data.getInt("width")}x${data.getInt("height")}, " +
             "loader ${System.getenv("ANDROID_EMU_VK_LOADER_PATH") ?: "phone"}, driver ${System.getenv("HWGPU_VK_DRIVER") ?: "phone"}")
+    }
+
+    private fun setLayer(data: Bundle) {
+        val sc = data.getParcelable("layer", SurfaceControl::class.java)
+        nativeSetLayer(sc, data.getInt("layerWidth"), data.getInt("layerHeight"))
     }
 
     override fun onBind(intent: Intent): IBinder = messenger.binder
@@ -282,4 +345,7 @@ class GpuService : Service() {
 
     private external fun nativeStart(window: java.nio.ByteBuffer, heap: java.nio.ByteBuffer?, flags: Int, width: Int, height: Int): Int
     private external fun nativeStop()
+    private external fun nativeSetLayer(layer: SurfaceControl?, width: Int, height: Int)
+    private external fun nativeSetLayerSize(width: Int, height: Int)
+    private external fun nativeSetVsync(on: Boolean)
 }

@@ -1,6 +1,8 @@
 // Drives hwgpu_host over a window in this process the way a Windows process will over the
 // shared window. Checks hello, capsets, a context, a buffer round trip through the renderer, a
-// fence in the control page, the id fence between channels, and that closing frees the channel.
+// fence in the control page, scanout of a ColorBuffer (its AHardwareBuffer is found and the buffer
+// comes back as released; with no layer in this process it is not shown), the id fence between
+// channels, and that closing frees the channel.
 //   ring_test [renderer_flags]   default: Vulkan, surfaceless
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,7 +83,8 @@ int main(int argc, char** argv) {
     auto* hr = reinterpret_cast<sgpu_hello_resp*>(r.data());
     CHECK(hr->hdr.type == SGPU_RESP_OK_HELLO && hr->num_capsets > 0, "hello 0x%x, %u capsets", hr->hdr.type,
           hr->num_capsets);
-    printf("channel %u: hello, %u capsets\n", a.slot, hr->num_capsets);
+    const bool scanout = hr->hdr.flags & SGPU_HELLO_SCANOUT;
+    printf("channel %u: hello, %u capsets, scanout %s\n", a.slot, hr->num_capsets, scanout ? "yes" : "no");
 
     uint32_t vk = 0;
     for (uint32_t i = 0; i < hr->num_capsets; i++) {
@@ -168,6 +171,34 @@ int main(int argc, char** argv) {
         printf("present: 4x2 red frame in the shared window, seq %u\n", wh->seq);
     }
 
+    // Scanout: a 64x64 BGRA ColorBuffer. Without a layer the phone lets go of it at once.
+    if (scanout) {
+        const uint32_t cb = HWGPU_RES_BASE(a.slot) + 30, cw = 64, chh = 64;
+        vgpu_resource_create_3d crc{H(VGPU_CMD_RESOURCE_CREATE_3D), cb, 2 /* TEXTURE_2D */, 67 /* R8G8B8A8 */,
+                                    1u << 1 /* render target */, cw, chh, 1, 1, 0, 0, 0, 0};
+        CHECK(a.type(&crc, sizeof(crc)) == VGPU_RESP_OK_NODATA, "color buffer create");
+        struct { vgpu_resource_attach_backing a; vgpu_mem_entry e; }
+            cab{{H(VGPU_CMD_RESOURCE_ATTACH_BACKING), cb, 1}, {0, cw * chh * 4, 0}};
+        CHECK(a.type(&cab, sizeof(cab)) == VGPU_RESP_OK_NODATA, "color buffer backing");
+        vgpu_resource_unref cat{H(VGPU_CMD_CTX_ATTACH_RESOURCE, ctx), cb, 0};
+        CHECK(a.type(&cat, sizeof(cat)) == VGPU_RESP_OK_NODATA, "color buffer attach");
+        for (uint32_t seq = 1; seq <= 3; seq++) {
+            sgpu_scanout so{H(SGPU_CMD_SCANOUT, ctx), cb, 2, seq, 0};
+            CHECK(a.type(&so, sizeof(so)) == VGPU_RESP_OK_NODATA, "scanout %u", seq);
+            for (int i = 0; i < 1000 && __atomic_load_n(&hwgpu_chan_ctl(a.chan)->scanout_free[2], __ATOMIC_ACQUIRE) != seq; i++)
+                hwgpu_pause(1000);
+            CHECK(hwgpu_chan_ctl(a.chan)->scanout_free[2] == seq, "buffer 2 not released after scanout %u (%u)", seq,
+                  hwgpu_chan_ctl(a.chan)->scanout_free[2]);
+        }
+        sgpu_scanout bad{H(SGPU_CMD_SCANOUT, ctx), res, 0, 1, 0};  // a plain buffer, no ColorBuffer
+        CHECK(a.type(&bad, sizeof(bad)) == VGPU_RESP_ERR_INVALID_RESOURCE_ID, "scanout of a non-ColorBuffer");
+        sgpu_scanout far{H(SGPU_CMD_SCANOUT, ctx), cb, HWGPU_SCANOUT_BUFFERS, 1, 0};
+        CHECK(a.type(&far, sizeof(far)) == VGPU_RESP_ERR_INVALID_PARAMETER, "scanout index out of range");
+        sgpu_scanout hide{H(SGPU_CMD_SCANOUT, ctx), 0, 0, 0, 0};
+        CHECK(a.type(&hide, sizeof(hide)) == VGPU_RESP_OK_NODATA, "scanout hide");
+        printf("scanout: ColorBuffer %u exported, released 3 times, refusals and hide work\n", cb);
+    }
+
     // A second process may not touch the first one's resource or context.
     Guest b;
     CHECK(b.slot != a.slot, "same slot twice");
@@ -181,6 +212,8 @@ int main(int argc, char** argv) {
     b.close();
     Guest again;
     CHECK(again.gen > 1 || again.slot != a.slot, "reuse");
+    for (uint32_t i = 0; i < HWGPU_SCANOUT_BUFFERS; i++)
+        CHECK(hwgpu_chan_ctl(again.chan)->scanout_free[i] == 0, "scanout count %u left from the last process", i);
     again.close();
     printf("channels freed and reused\n");
 

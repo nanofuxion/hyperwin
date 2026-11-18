@@ -179,6 +179,7 @@ object AvfPlan {
         val heapFd: ParcelFileDescriptor,
     ) {
         fun close() {
+            FileShare.stop()   // its threads read the window
             runCatching { SharedMemory.unmap(buffer) }
             runCatching { fd.close() }
             runCatching { memory.close() }

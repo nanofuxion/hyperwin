@@ -90,6 +90,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     private val hideBooting = Runnable { booting.visibility = View.GONE }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (screen == Screen.WINDOWS && GamepadInput.onKey(event)) return true
         if (screen == Screen.WINDOWS && event.keyCode !in HOST_KEYS &&
             (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) && AvfLaunch.key(event)
         ) return true
@@ -101,6 +102,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         VsockInput.touchMode = if (prefs.getBoolean(TRACKPAD, false)) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
+        GamepadInput.register(this)
 
         guest = GuestView(this).apply {
             contentDescription = "Windows display. Touch works as a touch screen, or as a trackpad in trackpad mode. " +
@@ -119,7 +121,8 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                 true
             }
             setOnGenericMotionListener { view, event ->
-                if ((event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) VsockInput.mouse(event, view.width, view.height)
+                if (GamepadInput.isGamepad(event.source)) GamepadInput.onMotion(event)
+                else if ((event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) VsockInput.mouse(event, view.width, view.height)
                 else false
             }
         }
@@ -209,6 +212,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
 
     override fun onResume() {
         super.onResume()
+        FileShare.publish(this)   // the all-files permission may have just been granted
         if (AvfLaunch.machine != null) guestDisplay.vmStarted(AvfLaunch.sharedWindow)
         if (screen == Screen.WINDOWS) immersive(true)
     }

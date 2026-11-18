@@ -207,6 +207,7 @@ object AvfLaunch {
             sharedWindow?.close()
             sharedWindow = window
             HwGpu.start(ctx, window, width, height)
+            FileShare.start(ctx, window.buffer)
             startDebugTap(window, File(dir, "frame.bgra"))
             startCppcCounter(window)
             val report = boot(
@@ -249,6 +250,7 @@ object AvfLaunch {
         sharedWindow?.close()
         sharedWindow = window
         HwGpu.start(ctx, window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
+        FileShare.start(ctx, window.buffer)
         startDebugTap(window, File(dir, "frame.bgra"))
         startCppcCounter(window)
         val report = boot(

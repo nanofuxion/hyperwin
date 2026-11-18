@@ -77,7 +77,7 @@ class HomeScreen(
         settings.removeAllViews()
         if (machine == null) return
         showSpecs(machine)
-        listOf(display(machine), graphics(), input(), network(machine), performance(machine), startup(), advanced(running)).forEach {
+        listOf(display(machine), graphics(), input(), network(machine), files(), performance(machine), startup(), advanced(running)).forEach {
             settings.addView(it, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP))
         }
         restartNote.visibility = if (running) View.VISIBLE else View.GONE
@@ -110,7 +110,10 @@ class HomeScreen(
                 .setNegativeButton("Cancel", null)
                 .show()
         }
-        return Ui.section(ctx, "Display", row)
+        val vsync = Ui.switchRow(ctx, "Limit to screen refresh",
+            "Fullscreen games draw one frame per refresh of the phone's screen. Smoother and cooler. Off: games choose, and may draw frames nobody sees.",
+            HwGpu.vsync(ctx)) { on -> HwGpu.setVsync(ctx, on) }
+        return Ui.section(ctx, "Display", row, vsync)
     }
 
     private fun sizeLabel(machine: Machine) =
@@ -272,6 +275,16 @@ class HomeScreen(
             machine.lanMode = on
             machine.save()
             GuestAgent.setLanMode(on)
+        })
+
+    private fun files() = Ui.section(ctx, "Files",
+        Ui.switchRow(ctx, "Phone storage in Windows",
+            if (FileShare.permitted()) "Internal storage, SD cards and USB drives show up as drives in Windows."
+            else "Shows internal storage, SD cards and USB drives as drives in Windows. Needs access to all files.",
+            FileShare.enabled(ctx) && FileShare.permitted()) { on ->
+            prefs.edit().putBoolean(FileShare.PREF, on).apply()
+            if (on && !FileShare.permitted()) FileShare.askPermission(ctx)
+            FileShare.publish(ctx)
         })
 
     private fun performance(machine: Machine): View {

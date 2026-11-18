@@ -55,6 +55,21 @@ index f2b9f422..d03c1c11 100644
  #include <GL/glx.h>
  #elif defined(WIN32)
  #include <windows.h>
+diff --git a/host/include/gfxstream/virtio-gpu-gfxstream-renderer-unstable.h b/host/include/gfxstream/virtio-gpu-gfxstream-renderer-unstable.h
+index 7d8d4314..b3806abd 100644
+--- a/host/include/gfxstream/virtio-gpu-gfxstream-renderer-unstable.h
++++ b/host/include/gfxstream/virtio-gpu-gfxstream-renderer-unstable.h
+@@ -117,6 +117,10 @@ struct GfxstreamMetrics {
+ 
+ VG_EXPORT int stream_renderer_get_metrics(struct GfxstreamMetrics* metrics);
+ 
++// HyperWin: an AHardwareBuffer* (acquired; the caller releases it) for a ColorBuffer resource,
++// or NULL. Android only.
++VG_EXPORT void* stream_renderer_resource_get_ahb(uint32_t res_handle);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif
 diff --git a/host/meson.build b/host/meson.build
 index 0bd599ef..6e710321 100644
 --- a/host/meson.build
@@ -111,6 +126,44 @@ index 320a1166..07437197 100644
  
      mAttachedResources.insert(resource.GetId());
  }
+diff --git a/host/virtio_gpu_gfxstream_renderer.cpp b/host/virtio_gpu_gfxstream_renderer.cpp
+index d6315ea3..73c84d32 100644
+--- a/host/virtio_gpu_gfxstream_renderer.cpp
++++ b/host/virtio_gpu_gfxstream_renderer.cpp
+@@ -22,6 +22,9 @@ extern "C" {
+ #include <string_view>
+ 
+ #include "frame_buffer.h"
++#if defined(__ANDROID__)
++#include <android/hardware_buffer.h>
++#endif
+ #include "gfxstream/strings.h"
+ #include "gfxstream/common/build_info.h"
+ #include "gfxstream/common/logging.h"
+@@ -449,6 +452,23 @@ VG_EXPORT int stream_renderer_resource_get_info(int res_handle,
+     return sFrontend()->getResourceInfo(res_handle, info);
+ }
+ 
++// HyperWin: the AHardwareBuffer behind a ColorBuffer resource, with a reference of its own the
++// caller releases (AHardwareBuffer_release), or null when the resource has none to give: not a
++// ColorBuffer, not on Android, or a Vulkan driver without VK_ANDROID_external_memory_android_
++// hardware_buffer, where ColorBuffer memory cannot be exported.
++VG_EXPORT void* stream_renderer_resource_get_ahb(uint32_t res_handle) {
++#if defined(__ANDROID__)
++    auto blob = FrameBuffer::getFB()->exportColorBuffer(res_handle);
++    if (!blob || blob->descriptorInfo.streamHandleType != STREAM_HANDLE_TYPE_PLATFORM_AHB) return nullptr;
++    auto* ahb = reinterpret_cast<AHardwareBuffer*>(blob->descriptorInfo.handle);
++    if (ahb) AHardwareBuffer_acquire(ahb);
++    return ahb;
++#else
++    (void)res_handle;
++    return nullptr;
++#endif
++}
++
+ VG_EXPORT void stream_renderer_flush(uint32_t res_handle) {
+     GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_STREAM_RENDERER_CATEGORY, "stream_renderer_flush()");
+ 
 diff --git a/host/virtio_gpu_pipe.cpp b/host/virtio_gpu_pipe.cpp
 index 896a9d6b..ddb952dc 100644
 --- a/host/virtio_gpu_pipe.cpp

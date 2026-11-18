@@ -1,10 +1,14 @@
-/* HyperWin keyboard and absolute mouse over virtio-vsock.
+/* HyperWin keyboard, absolute mouse and gamepad over virtio-vsock.
  * A keyboard and mouse port driver (the i8042prt role) under the inbox kbdclass and mouclass
- * filters, on two root-enumerated devices: ROOT\HWVSKBD and ROOT\HWVSMOU. It imports nothing but
+ * filters, on two root-enumerated devices: ROOT\HWVSKBD and ROOT\HWVSMOU. A third device, which
+ * the driver reports itself the first time it loads, is an Xbox controller to XInput: it offers
+ * the XUSB interface xinput1_4.dll looks for (the same calls Microsoft's xusb22.sys answers), so
+ * games see a controller without any of Windows' files changing. It imports nothing but
  * ntoskrnl, so it can start at boot. A system thread listens on vsock port HW_VSOCK_PORT_INPUT
  * through the stock viosock driver; the Android app connects and sends framed messages:
  *   [len] [1] [make lo] [make hi] [flags: 1 break, 2 E0]          keyboard scan code (set 1)
- *   [len] [2] [x lo] [x hi] [y lo] [y hi] [buttons] [wheel]       absolute pointer, 0..65535 */
+ *   [len] [2] [x lo] [x hi] [y lo] [y hi] [buttons] [wheel]       absolute pointer, 0..65535
+ *   [len] [3] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  gamepad, XInput layout */
 #include <ntddk.h>
 #include <kbdmou.h>
 #include <ntddkbd.h>
@@ -31,18 +35,44 @@ typedef struct {
     ULONG pad;
 } VSOCK_PARAMS;
 
+enum { KIND_KBD, KIND_MOU, KIND_PAD };
+
 typedef struct {
     PDEVICE_OBJECT self, lower;
     BOOLEAN mouse;
+    int kind;
     CONNECT_DATA connect;
+    UNICODE_STRING iface;   /* the pad's XUSB interface */
 } PORT_EXT;
+
+/* One controller, in XInput's terms. */
+typedef struct {
+    UCHAR connected;
+    ULONG packet;
+    USHORT buttons;
+    UCHAR lt, rt;
+    SHORT lx, ly, rx, ry;
+} PAD;
 
 static struct {
     KSPIN_LOCK lock;
     PORT_EXT *kbd, *mou;
     UCHAR buttons;
     BOOLEAN thread;
+    PAD pad;
 } g;
+
+/* XUSB, as xinput1_4.dll speaks it (interface class and calls; layouts are packed). */
+static const GUID XUSB_INTERFACE = { 0xEC87F1E3, 0xC13B, 0x4100, { 0xB5, 0xF7, 0x8B, 0x84, 0xD5, 0x42, 0x60, 0xCB } };
+#define XUSB_GET_INFORMATION   0x80006000u
+#define XUSB_GET_CAPABILITIES  0x8000E004u
+#define XUSB_GET_LED_STATE     0x8000E008u
+#define XUSB_GET_STATE         0x8000E00Cu
+#define XUSB_SET_STATE         0x8000A010u
+#define XUSB_GET_BATTERY       0x8000E018u
+#define XUSB_VERSION           0x0102
+#define PAD_VID 0x045E          /* an Xbox 360 controller, what games know best */
+#define PAD_PID 0x028E
 
 static void diag(ULONG index, ULONG value)
 {
@@ -91,6 +121,111 @@ static void on_message(const UCHAR *m, ULONG len)
         }
         g.buttons = b;
         deliver(TRUE, &d);
+    } else if (m[0] == 3 && len >= 14) {
+        KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
+        g.pad.buttons = (USHORT)(m[1] | m[2] << 8);
+        g.pad.lt = m[3];
+        g.pad.rt = m[4];
+        g.pad.lx = (SHORT)(m[5] | m[6] << 8);
+        g.pad.ly = (SHORT)(m[7] | m[8] << 8);
+        g.pad.rx = (SHORT)(m[9] | m[10] << 8);
+        g.pad.ry = (SHORT)(m[11] | m[12] << 8);
+        g.pad.connected = m[13];
+        g.pad.packet++;
+        KeReleaseSpinLock(&g.lock, irql);
+    }
+}
+
+static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information);
+
+static void put16(UCHAR *p, USHORT v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); }
+static void put32(UCHAR *p, ULONG v) { put16(p, (USHORT)v); put16(p + 2, (USHORT)(v >> 16)); }
+
+/* The XUSB calls, answered from the pad state the phone last sent. One controller, index 0. */
+static NTSTATUS pad_ioctl(PIRP irp, PIO_STACK_LOCATION st)
+{
+    ULONG code = st->Parameters.DeviceIoControl.IoControlCode;
+    ULONG in = st->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG out = st->Parameters.DeviceIoControl.OutputBufferLength;
+    UCHAR *b = irp->AssociatedIrp.SystemBuffer;
+    USHORT version = in >= 2 ? (USHORT)(b[0] | b[1] << 8) : 0x0100;
+    PAD p;
+    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
+    p = g.pad;
+    KeReleaseSpinLock(&g.lock, irql);
+    switch (code) {
+    case XUSB_GET_INFORMATION:   /* version, controllers, flags (0x80: none), ..., vid, pid */
+        if (out < 12) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        RtlZeroMemory(b, 12);
+        put16(b, XUSB_VERSION);
+        b[2] = 1;
+        put16(b + 8, PAD_VID);
+        put16(b + 10, PAD_PID);
+        return complete(irp, STATUS_SUCCESS, 12);
+    case XUSB_GET_STATE:
+        if (version == 0x0100) {   /* status, -, input id, packet, -, buttons, lt, rt, sticks */
+            if (out < 20) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+            RtlZeroMemory(b, 20);
+            b[0] = p.connected ? 1 : 0;
+            put32(b + 3, p.packet);
+            put16(b + 8, p.buttons);
+            b[10] = p.lt; b[11] = p.rt;
+            put16(b + 12, (USHORT)p.lx); put16(b + 14, (USHORT)p.ly);
+            put16(b + 16, (USHORT)p.rx); put16(b + 18, (USHORT)p.ry);
+            return complete(irp, STATUS_SUCCESS, 20);
+        }
+        /* version, status, -, input id, packet, -, -, buttons, lt, rt, sticks, 5 x -, extra buttons */
+        if (out < 29) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        RtlZeroMemory(b, 29);
+        put16(b, XUSB_VERSION);
+        b[2] = p.connected ? 1 : 0;
+        put32(b + 5, p.packet);
+        put16(b + 11, p.buttons);
+        b[13] = p.lt; b[14] = p.rt;
+        put16(b + 15, (USHORT)p.lx); put16(b + 17, (USHORT)p.ly);
+        put16(b + 19, (USHORT)p.rx); put16(b + 21, (USHORT)p.ry);
+        return complete(irp, STATUS_SUCCESS, 29);
+    case XUSB_GET_CAPABILITIES:
+        if (version == 0x0101) {   /* what XInput asks for here: version, type, subtype, buttons, ..., motors */
+            if (out < 24) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+            RtlZeroMemory(b, 24);
+            put16(b, 0x0101);
+            b[2] = 1;                   /* gamepad */
+            b[3] = 1;                   /* XINPUT_DEVSUBTYPE_GAMEPAD */
+            put16(b + 4, 0xF7FF);
+            b[6] = 0xFF; b[7] = 0xFF;
+            put16(b + 8, 0xFFC0); put16(b + 10, 0xFFC0); put16(b + 12, 0xFFC0); put16(b + 14, 0xFFC0);
+            b[22] = 0xFF; b[23] = 0xFF;
+            return complete(irp, STATUS_SUCCESS, 24);
+        }
+        /* version, type, subtype, flags, vid, pid, product version, -, then what each control reports. */
+        if (out < 36) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        RtlZeroMemory(b, 36);
+        put16(b, XUSB_VERSION);
+        b[2] = 1;                       /* gamepad */
+        b[3] = 1;                       /* XINPUT_DEVSUBTYPE_GAMEPAD */
+        put16(b + 6, PAD_VID);
+        put16(b + 8, PAD_PID);
+        put16(b + 16, 0xF7FF);          /* every button, guide included */
+        b[18] = 0xFF; b[19] = 0xFF;     /* triggers */
+        put16(b + 20, 0xFFC0); put16(b + 22, 0xFFC0); put16(b + 24, 0xFFC0); put16(b + 26, 0xFFC0);
+        b[34] = 0xFF; b[35] = 0xFF;     /* motors: reported, though rumble does not reach the phone yet */
+        return complete(irp, STATUS_SUCCESS, 36);
+    case XUSB_GET_LED_STATE:            /* version, LED: player 1 */
+        if (out < 3) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        put16(b, XUSB_VERSION);
+        b[2] = 6;
+        return complete(irp, STATUS_SUCCESS, 3);
+    case XUSB_GET_BATTERY:              /* version, type wired, level full */
+        if (out < 4) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        put16(b, XUSB_VERSION);
+        b[2] = 1;
+        b[3] = 3;
+        return complete(irp, STATUS_SUCCESS, 4);
+    case XUSB_SET_STATE:                /* LEDs and rumble: accepted */
+        return complete(irp, STATUS_SUCCESS, 0);
+    default:
+        return complete(irp, STATUS_NOT_SUPPORTED, 0);
     }
 }
 
@@ -291,6 +426,7 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
             KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
             status = irp->IoStatus.Status;
         }
+        if (NT_SUCCESS(status) && e->kind == KIND_PAD && e->iface.Buffer) IoSetDeviceInterfaceState(&e->iface, TRUE);
         if (NT_SUCCESS(status) && !g.thread) {
             HANDLE t;
             if (NT_SUCCESS(PsCreateSystemThread(&t, THREAD_ALL_ACCESS, NULL, NULL, NULL, listener, NULL))) {
@@ -298,7 +434,7 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
                 g.thread = TRUE;
             }
         }
-        diag(e->mouse ? 48 : 47, NT_SUCCESS(status) ? 1 : 0x100 | ((ULONG)status & 0xff));
+        diag(e->kind == KIND_PAD ? 51 : e->mouse ? 48 : 47, NT_SUCCESS(status) ? 1 : 0x100 | ((ULONG)status & 0xff));
         return complete(irp, status, irp->IoStatus.Information);
     }
     if (st->MinorFunction == IRP_MN_REMOVE_DEVICE) {
@@ -306,6 +442,10 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
         if (g.kbd == e) g.kbd = NULL;
         if (g.mou == e) g.mou = NULL;
         KeReleaseSpinLock(&g.lock, irql);
+        if (e->iface.Buffer) {
+            IoSetDeviceInterfaceState(&e->iface, FALSE);
+            RtlFreeUnicodeString(&e->iface);
+        }
         irp->IoStatus.Status = STATUS_SUCCESS;
         IoSkipCurrentIrpStackLocation(irp);
         status = IoCallDriver(lower, irp);
@@ -341,56 +481,112 @@ static NTSTATUS create_close(PDEVICE_OBJECT device, PIRP irp)
     return complete(irp, STATUS_SUCCESS, 0);
 }
 
-/* The PDO's hardware ID says which half this device is: ROOT\HWVSMOU is the mouse. */
-static BOOLEAN is_mouse(PDEVICE_OBJECT pdo)
+/* Programs talk to the pad; the keyboard and mouse only take their class drivers' internal calls. */
+static NTSTATUS device_control(PDEVICE_OBJECT device, PIRP irp)
+{
+    PORT_EXT *e = device->DeviceExtension;
+    if (e->kind == KIND_PAD) return pad_ioctl(irp, IoGetCurrentIrpStackLocation(irp));
+    IoSkipCurrentIrpStackLocation(irp);
+    return IoCallDriver(e->lower, irp);
+}
+
+static BOOLEAN has(const WCHAR *ids, ULONG chars, const WCHAR *word)
+{
+    ULONG i, j;
+    for (i = 0; i + 3 <= chars; ++i) {
+        for (j = 0; j < 3 && (ids[i + j] | 0x20) == (word[j] | 0x20); ++j) {}
+        if (j == 3) return TRUE;
+    }
+    return FALSE;
+}
+
+/* The PDO's hardware ID says which device this is: ROOT\HWVSMOU is the mouse, ROOT\HWVSKBD the
+ * keyboard. The pad is the device this driver reported itself, which has no hardware ID. */
+static int device_kind(PDEVICE_OBJECT pdo)
 {
     WCHAR ids[128];
-    ULONG len = 0, i;
-    if (!NT_SUCCESS(IoGetDeviceProperty(pdo, DevicePropertyHardwareID, sizeof ids, ids, &len))) return FALSE;
-    for (i = 0; i + 3 < len / sizeof(WCHAR); ++i)
-        if ((ids[i] == L'M' || ids[i] == L'm') && (ids[i + 1] == L'O' || ids[i + 1] == L'o') &&
-            (ids[i + 2] == L'U' || ids[i + 2] == L'u'))
-            return TRUE;
-    return FALSE;
+    ULONG len = 0;
+    if (!NT_SUCCESS(IoGetDeviceProperty(pdo, DevicePropertyHardwareID, sizeof ids, ids, &len)) || len < 8)
+        return KIND_PAD;
+    if (has(ids, len / sizeof(WCHAR), L"MOU")) return KIND_MOU;
+    if (has(ids, len / sizeof(WCHAR), L"KBD")) return KIND_KBD;
+    return KIND_PAD;
 }
 
 static NTSTATUS add_device(PDRIVER_OBJECT driver, PDEVICE_OBJECT pdo)
 {
-    BOOLEAN mouse = is_mouse(pdo);
+    int kind = device_kind(pdo);
+    BOOLEAN mouse = kind == KIND_MOU;
     PDEVICE_OBJECT d;
     PORT_EXT *e;
     KIRQL irql;
-    NTSTATUS s = IoCreateDevice(driver, sizeof *e, NULL, mouse ? FILE_DEVICE_MOUSE : FILE_DEVICE_KEYBOARD, 0, FALSE, &d);
+    NTSTATUS s = IoCreateDevice(driver, sizeof *e, NULL,
+                                kind == KIND_PAD ? FILE_DEVICE_UNKNOWN : mouse ? FILE_DEVICE_MOUSE : FILE_DEVICE_KEYBOARD,
+                                FILE_DEVICE_SECURE_OPEN, FALSE, &d);
     if (!NT_SUCCESS(s)) return s;
     e = d->DeviceExtension;
     RtlZeroMemory(e, sizeof *e);
     e->self = d;
     e->mouse = mouse;
+    e->kind = kind;
     e->lower = IoAttachDeviceToDeviceStack(d, pdo);
     if (!e->lower) {
         IoDeleteDevice(d);
         return STATUS_NO_SUCH_DEVICE;
     }
+    if (kind == KIND_PAD) {
+        if (!NT_SUCCESS(IoRegisterDeviceInterface(pdo, &XUSB_INTERFACE, NULL, &e->iface)))
+            RtlZeroMemory(&e->iface, sizeof e->iface);
+        /* A device the driver reported itself counts as started by it: no start request may come,
+         * so the interface goes on here (and again at a start, which is harmless). */
+        else
+            diag(54, (ULONG)IoSetDeviceInterfaceState(&e->iface, TRUE));
+    }
     d->Flags |= DO_BUFFERED_IO | DO_POWER_PAGABLE;
     d->Flags &= ~DO_DEVICE_INITIALIZING;
-    irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
-    if (mouse) g.mou = e; else g.kbd = e;
-    KeReleaseSpinLock(&g.lock, irql);
-    diag(mouse ? 50 : 49, 1);
+    if (kind != KIND_PAD) {
+        irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
+        if (mouse) g.mou = e; else g.kbd = e;
+        KeReleaseSpinLock(&g.lock, irql);
+    }
+    diag(kind == KIND_PAD ? 52 : mouse ? 50 : 49, 1);
     return STATUS_SUCCESS;
+}
+
+/* The pad's device: reported once, the first time this driver loads; Windows keeps it from then
+ * on and hands it to add_device at every boot. A value under the service key remembers. */
+static void report_pad(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
+{
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key;
+    UNICODE_STRING name;
+    ULONG one = 1, got = 0;
+    UCHAR info[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PDEVICE_OBJECT pdo = NULL;
+    InitializeObjectAttributes(&oa, registry, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ | KEY_WRITE, &oa))) return;
+    RtlInitUnicodeString(&name, L"PadReported");
+    if (!NT_SUCCESS(ZwQueryValueKey(key, &name, KeyValuePartialInformation, info, sizeof info, &got)) &&
+        NT_SUCCESS(IoReportDetectedDevice(driver, InterfaceTypeUndefined, (ULONG)-1, (ULONG)-1, NULL, NULL, FALSE, &pdo)) &&
+        NT_SUCCESS(add_device(driver, pdo))) {
+        ZwSetValueKey(key, &name, 0, REG_DWORD, &one, sizeof one);
+        diag(53, 1);
+    }
+    ZwClose(key);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 {
-    (void)registry;
     KeInitializeSpinLock(&g.lock);
     diag(43, 1);
     driver->MajorFunction[IRP_MJ_CREATE] = create_close;
     driver->MajorFunction[IRP_MJ_CLOSE] = create_close;
     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = internal_ioctl;
+    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = device_control;
     driver->MajorFunction[IRP_MJ_PNP] = pnp;
     driver->MajorFunction[IRP_MJ_POWER] = power;
     driver->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = pass_down;
     driver->DriverExtension->AddDevice = add_device;
+    report_pad(driver, registry);
     return STATUS_SUCCESS;
 }

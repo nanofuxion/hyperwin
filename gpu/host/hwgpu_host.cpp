@@ -6,6 +6,8 @@
 //   - Fences are not messages. The finished fence id lands in the channel's control page.
 //   - Each channel may only use its own context and resource ids (HWGPU_CTX, HWGPU_RES_BASE),
 //     so two Windows processes cannot touch each other's objects by id.
+//   - SGPU_CMD_SCANOUT puts a ColorBuffer's AHardwareBuffer on a layer of the phone's compositor
+//     (one the app process owns and lends to this renderer), so GPU frames never reach the CPU.
 
 #include "hwgpu_host.h"
 
@@ -14,6 +16,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <deque>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -32,6 +35,11 @@
 #include "sgpu_proto.h"
 
 #ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#include <android/surface_control.h>
+#include <dlfcn.h>
+#include <poll.h>
+#include <unistd.h>
 #include <android/log.h>
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "hwgpu", __VA_ARGS__)
 #else
@@ -186,6 +194,222 @@ void on_debug(void*, stream_renderer_debug* d) {
     if (d && d->message && (g_trace || d->debug_type <= STREAM_RENDERER_DEBUG_WARN)) LOG("gfxstream: %s", d->message);
 }
 
+// ---- scanout ----
+//
+// On Android 16 and later every buffer has a release callback of its own
+// (ASurfaceTransaction_setBufferWithRelease), which also comes for a buffer the compositor dropped
+// for a newer one. A frame without SGPU_SCANOUT_VSYNC goes to the layer as soon as it arrives: the
+// compositor shows the newest at each refresh (mailbox). A vsync frame waits until the one before
+// it has been latched (its commit callback), so every one is shown for a refresh, in order, and
+// the guest, short of free buffers, draws at the screen's pace. Older Android has only the transaction's completion callback: there frames go one at
+// a time, the next applied when the last is reported done, and a frame arriving meanwhile waits
+// (replacing one already waiting, which counts as released at once). That is slower, but no buffer
+// is ever dropped inside the compositor where its release could not be seen.
+
+bool g_scanout_ok = false;  // ColorBuffers export AHardwareBuffers with this driver
+std::atomic<uint32_t> g_scanout_flags{HWGPU_SCANOUT_VSYNC};  // hwgpu_ctl.scanout_flags for every channel
+std::map<uint32_t, void*> g_ahb;  // resource -> its AHardwareBuffer, our own reference
+
+struct Frame {
+    void* ahb = nullptr;  // a reference of the frame's own
+    uint32_t slot = 0, generation = 0, index = 0, seq = 0, width = 0, height = 0;
+    bool vsync = false;
+};
+
+struct Scan {
+    std::mutex lock;
+#ifdef __ANDROID__
+    ASurfaceControl* layer = nullptr;
+#endif
+    int view_w = 0, view_h = 0;
+    bool visible = false;
+    bool inflight = false;    // without release callbacks: a transaction applied, not yet done
+    bool has_queued = false, has_shown = false;
+    Frame queued, shown;      // shown: the last frame handed to the compositor
+    bool committing = false;  // a vsync frame applied, not yet latched
+    std::deque<Frame> paced;  // vsync frames waiting for that
+    uint64_t frames = 0;
+} g_scan;
+
+// Tells the guest it may draw into the frame's buffer again. Counts only go up, so a late release
+// of an older showing never takes back a newer one.
+void publish_free(const Frame& f) {
+    if (!g_window || f.slot >= HWGPU_CHANNELS || f.index >= HWGPU_SCANOUT_BUFFERS) return;
+    auto* c = hwgpu_chan_ctl(chan_base(f.slot));
+    if (__atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != f.generation) return;
+    uint32_t* at = &c->scanout_free[f.index];
+    uint32_t seen = __atomic_load_n(at, __ATOMIC_RELAXED);
+    while (int32_t(f.seq - seen) > 0 &&
+           !__atomic_compare_exchange_n(at, &seen, f.seq, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+    }
+}
+
+// The screen let go of a frame's buffer.
+void release_frame(Frame& f) {
+    if (!f.ahb) return;
+    publish_free(f);
+#ifdef __ANDROID__
+    AHardwareBuffer_release(static_cast<AHardwareBuffer*>(f.ahb));
+#endif
+    f.ahb = nullptr;
+}
+
+#ifdef __ANDROID__
+using SetBufferWithRelease = void (*)(ASurfaceTransaction*, ASurfaceControl*, AHardwareBuffer*, int, void*,
+                                      void (*)(void*, int));
+SetBufferWithRelease g_set_buffer_with_release = nullptr;  // API 36, looked up at start
+
+void wait_fence(int fd) {
+    if (fd < 0) return;
+    pollfd p{fd, POLLIN, 0};
+    poll(&p, 1, 100);
+    close(fd);
+}
+
+void apply_locked(Frame f);
+
+// A vsync frame was latched: the next may go.
+void on_commit(void*, ASurfaceTransactionStats*) {
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    g_scan.committing = false;
+    if (!g_scan.paced.empty() && g_scan.layer) {
+        Frame f = g_scan.paced.front();
+        g_scan.paced.pop_front();
+        apply_locked(f);
+    }
+}
+
+void on_buffer_release(void* context, int fence) {
+    auto* f = static_cast<Frame*>(context);
+    wait_fence(fence);
+    release_frame(*f);
+    delete f;
+}
+
+struct Applied {
+    ASurfaceControl* layer;  // acquired for the callback
+    bool has_prev;
+    Frame prev;
+};
+
+void apply_locked(Frame f);
+
+void on_complete(void* context, ASurfaceTransactionStats* stats) {
+    auto* a = static_cast<Applied*>(context);
+    if (a->has_prev) {
+        wait_fence(ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats, a->layer));
+        release_frame(a->prev);
+    }
+    ASurfaceControl_release(a->layer);
+    delete a;
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    g_scan.inflight = false;
+    if (g_scan.has_queued && g_scan.layer) {
+        g_scan.has_queued = false;
+        apply_locked(g_scan.queued);
+    }
+}
+
+void apply_locked(Frame f) {
+    ASurfaceTransaction* t = ASurfaceTransaction_create();
+    if (g_set_buffer_with_release) {
+        g_set_buffer_with_release(t, g_scan.layer, static_cast<AHardwareBuffer*>(f.ahb), -1, new Frame(f),
+                                  on_buffer_release);
+        if (f.vsync) {
+            ASurfaceTransaction_setOnCommit(t, nullptr, on_commit);
+            g_scan.committing = true;
+        }
+    } else {
+        ASurfaceTransaction_setBuffer(t, g_scan.layer, static_cast<AHardwareBuffer*>(f.ahb), -1);
+        auto* a = new Applied{g_scan.layer, g_scan.has_shown && g_scan.shown.ahb, g_scan.shown};
+        ASurfaceControl_acquire(g_scan.layer);
+        ASurfaceTransaction_setOnComplete(t, a, on_complete);
+        g_scan.inflight = true;
+    }
+    ASurfaceTransaction_setBufferTransparency(t, g_scan.layer, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+    ASurfaceTransaction_setPosition(t, g_scan.layer, 0, 0);
+    if (g_scan.view_w > 0 && g_scan.view_h > 0 && f.width && f.height)
+        ASurfaceTransaction_setScale(t, g_scan.layer, float(g_scan.view_w) / float(f.width),
+                                     float(g_scan.view_h) / float(f.height));
+    if (!g_scan.visible) ASurfaceTransaction_setVisibility(t, g_scan.layer, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+    ASurfaceTransaction_apply(t);
+    ASurfaceTransaction_delete(t);
+    g_scan.shown = f;
+    if (g_set_buffer_with_release) g_scan.shown.ahb = nullptr;  // the release callback owns it
+    g_scan.has_shown = true;
+    g_scan.visible = true;
+    g_scan.frames++;
+}
+#endif
+
+void scan_submit(const Frame& f) {
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    Frame frame = f;
+#ifdef __ANDROID__
+    if (g_scan.layer) {
+        if (g_set_buffer_with_release) {
+            if (frame.vsync && g_scan.committing) g_scan.paced.push_back(frame);
+            else apply_locked(frame);
+        } else if (!g_scan.inflight) {
+            apply_locked(frame);
+        } else {
+            if (g_scan.has_queued) release_frame(g_scan.queued);
+            g_scan.queued = frame;
+            g_scan.has_queued = true;
+        }
+        return;
+    }
+#endif
+    release_frame(frame);  // nowhere to show it (the app has no layer up): done with it at once
+}
+
+// What the layer holds stops being seen (hidden, or the layer replaced): the guest may draw into
+// it again, though the compositor keeps it until something replaces it.
+void forget_shown_locked() {
+    for (auto& f : g_scan.paced) release_frame(f);
+    g_scan.paced.clear();
+    g_scan.committing = false;
+    if (g_scan.has_queued) {
+        release_frame(g_scan.queued);
+        g_scan.has_queued = false;
+    }
+    if (g_scan.has_shown) {
+        publish_free(g_scan.shown);
+        if (g_scan.shown.ahb) {
+            Frame copy = g_scan.shown;
+            g_scan.shown.ahb = nullptr;  // the next completion's "previous" has nothing left to free
+            release_frame(copy);
+        }
+    }
+}
+
+// Hides the layer. With a channel, only when that channel's frames are the ones up.
+void scan_hide(int slot) {
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    if (slot >= 0 && !(g_scan.has_shown && int(g_scan.shown.slot) == slot) &&
+        !(g_scan.has_queued && int(g_scan.queued.slot) == slot))
+        return;
+#ifdef __ANDROID__
+    if (g_scan.layer && g_scan.visible) {
+        ASurfaceTransaction* t = ASurfaceTransaction_create();
+        ASurfaceTransaction_setVisibility(t, g_scan.layer, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        ASurfaceTransaction_apply(t);
+        ASurfaceTransaction_delete(t);
+    }
+#endif
+    g_scan.visible = false;
+    forget_shown_locked();
+}
+
+void drop_ahb(uint32_t res) {
+    auto it = g_ahb.find(res);
+    if (it == g_ahb.end()) return;
+#ifdef __ANDROID__
+    AHardwareBuffer_release(static_cast<AHardwareBuffer*>(it->second));
+#endif
+    g_ahb.erase(it);
+}
+
 uint8_t* blob_span(uint32_t res, uint64_t off, uint32_t len) {
     auto m = g_maps.find(res);
     if (m != g_maps.end()) return off + len <= m->second.size ? m->second.hva + off : nullptr;
@@ -220,6 +444,7 @@ void drop_resource(Slot& s, uint32_t res) {
         g_maps.erase(m);
         stream_renderer_resource_unmap(res);
     }
+    drop_ahb(res);
     stream_renderer_resource_unref(res);
     g_backing.erase(res);
     s.resources.erase(res);
@@ -227,6 +452,7 @@ void drop_resource(Slot& s, uint32_t res) {
 
 // Frees everything one Windows process made.
 void drop_slot(Slot& s) {
+    scan_hide(int(&s - g_slots));
     for (auto res : std::set<uint32_t>(s.resources)) drop_resource(s, res);
     for (auto c : s.contexts) stream_renderer_context_destroy(c);
     s.contexts.clear();
@@ -271,7 +497,8 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
                         : sizeof(vgpu_hdr);
         if (m.size() < at + 4) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
         memcpy(&res, m.data() + at, 4);
-        if (!own_res(l, res)) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_RESOURCE_ID);
+        if (!own_res(l, res) && !(hdr->type == SGPU_CMD_SCANOUT && res == 0))  // 0: hide
+            return reply(l, *hdr, VGPU_RESP_ERR_INVALID_RESOURCE_ID);
     }
 
     if (g_trace) LOG("channel %u: request 0x%x ctx %u, %zu bytes", l.slot, hdr->type, hdr->ctx_id, m.size());
@@ -279,6 +506,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
     case SGPU_CMD_HELLO: {
         sgpu_hello_resp r{};
         r.hdr.type = SGPU_RESP_OK_HELLO;
+        r.hdr.flags = g_scanout_ok ? SGPU_HELLO_SCANOUT : 0;
         r.version = SGPU_VERSION;
         r.num_capsets = static_cast<uint32_t>(g_capsets.size());
         return send_msg(l, &r, sizeof(r));
@@ -578,6 +806,30 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         __atomic_add_fetch(&wh->seq, 1, __ATOMIC_RELEASE);
         break;
     }
+    case SGPU_CMD_SCANOUT: {
+        const auto* p = as<sgpu_scanout>(m);
+        if (!p || p->index >= HWGPU_SCANOUT_BUFFERS) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
+        if (!g_scanout_ok) return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
+        if (!p->resource_id) {
+            scan_hide(int(l.slot));
+            break;
+        }
+#ifdef __ANDROID__
+        auto it = g_ahb.find(p->resource_id);
+        if (it == g_ahb.end()) {
+            void* ahb = stream_renderer_resource_get_ahb(p->resource_id);
+            if (!ahb) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_RESOURCE_ID);  // not an exportable ColorBuffer
+            it = g_ahb.emplace(p->resource_id, ahb).first;
+        }
+        auto* ahb = static_cast<AHardwareBuffer*>(it->second);
+        AHardwareBuffer_Desc d{};
+        AHardwareBuffer_describe(ahb, &d);
+        AHardwareBuffer_acquire(ahb);
+        scan_submit(Frame{ahb, l.slot, l.generation, p->index, p->seq, d.width, d.height,
+                          (p->flags & SGPU_SCANOUT_VSYNC) != 0});
+#endif
+        break;
+    }
     default:
         LOG("unknown command 0x%x", hdr->type);
         return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
@@ -618,6 +870,9 @@ bool serve_one(uint32_t i) {
     if (s.generation != gen) {
         drop_slot(s);  // a connection this side never saw close
         memset(c->fence, 0, sizeof(c->fence));
+        // A new process counts its scanouts from 1: counts the last one left would read as released.
+        memset(c->scanout_free, 0, sizeof(c->scanout_free));
+        __atomic_store_n(&c->scanout_flags, g_scanout_flags.load(), __ATOMIC_RELEASE);
         s.generation = gen;
         __atomic_store_n(&c->host_state, HWGPU_HOST_READY, __ATOMIC_RELEASE);
         LOG("channel %u open, generation %u", i, gen);
@@ -731,6 +986,28 @@ int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_
             g_capsets.push_back(i);
             LOG("capset %u version %u size %u", id, ver, size);
         }
+        // Scanout needs ColorBuffers the compositor can take: try one. Without the driver's
+        // VK_ANDROID_external_memory_android_hardware_buffer, gfxstream gives them memory that
+        // cannot be exported, and Windows keeps drawing frames itself.
+        {
+            constexpr uint32_t kProbe = 0x7f000001u;  // outside every channel's resource range
+            stream_renderer_resource_create_args a{kProbe, 2 /* PIPE_TEXTURE_2D */, 67 /* VIRGL R8G8B8A8 */,
+                                                   1u << 1 /* render target */, 64, 64, 1, 1, 0, 0, 0};
+            if (!stream_renderer_resource_create(&a, nullptr, 0)) {
+                void* ahb = stream_renderer_resource_get_ahb(kProbe);
+                g_scanout_ok = ahb != nullptr;
+#ifdef __ANDROID__
+                if (ahb) AHardwareBuffer_release(static_cast<AHardwareBuffer*>(ahb));
+#endif
+                stream_renderer_resource_unref(kProbe);
+            }
+            LOG("scanout %s", g_scanout_ok ? "available" : "unavailable: the driver cannot export ColorBuffers");
+        }
+#ifdef __ANDROID__
+        g_set_buffer_with_release = reinterpret_cast<SetBufferWithRelease>(
+            dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBufferWithRelease"));
+        LOG("scanout buffers released %s", g_set_buffer_with_release ? "one by one" : "per transaction");
+#endif
         g_inited = true;
     }
 
@@ -772,6 +1049,44 @@ int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_
     g_run = true;
     g_thread = std::thread(serve_loop);
     return 0;
+}
+
+int hwgpu_host_set_layer(void* layer, int view_width, int view_height) {
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    g_scan.view_w = view_width;
+    g_scan.view_h = view_height;
+#ifdef __ANDROID__
+    auto* sc = static_cast<ASurfaceControl*>(layer);
+    if (sc == g_scan.layer) return 0;  // only a new size
+    // A new layer (or none): what the old one showed is gone from the screen with it.
+    forget_shown_locked();
+    g_scan.has_shown = false;
+    g_scan.inflight = false;
+    g_scan.visible = false;
+    if (g_scan.layer) ASurfaceControl_release(g_scan.layer);
+    g_scan.layer = sc;  // the caller's reference passes to us
+#else
+    (void)layer;
+#endif
+    return 0;
+}
+
+void hwgpu_host_set_vsync(int on) {
+    g_scanout_flags = on ? HWGPU_SCANOUT_VSYNC : 0;
+    if (!g_window) return;
+    for (uint32_t i = 0; i < HWGPU_CHANNELS; i++)
+        __atomic_store_n(&hwgpu_chan_ctl(chan_base(i))->scanout_flags, g_scanout_flags.load(), __ATOMIC_RELEASE);
+}
+
+void hwgpu_host_set_layer_size(int view_width, int view_height) {
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    g_scan.view_w = view_width;
+    g_scan.view_h = view_height;
+}
+
+uint64_t hwgpu_host_scanout_frames(void) {
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    return g_scan.frames;
 }
 
 void hwgpu_host_stop(void) {

@@ -9,12 +9,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 GFX=${1:-$HERE/../work/gfx-out}
 [ -f "$GFX/lib/arm64-v8a/libgfxstream_backend.so" ] || "$HERE/build-gfxstream.sh"
 NDK=${ANDROID_HOME:-$HOME/Library/Android/sdk}/ndk/27.2.12479018
-CXX=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android31-clang++
+CXX=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang++
 OUT=$HERE/../work/android/arm64-v8a
 mkdir -p "$OUT"
 "$CXX" -std=c++17 -O2 -fPIC -shared -Wall -Wextra -Wno-missing-field-initializers \
   -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/hwgpu_host.cpp" "$HERE/hwgpu_jni.cpp" \
-  -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
+  -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
   -o "$OUT/libhwgpu.so"
 cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"
@@ -22,7 +22,7 @@ ls -la "$OUT"
 # LD_LIBRARY_PATH=/data/local/tmp/hwgpu /data/local/tmp/hwgpu/ring_test
 "$CXX" -std=c++17 -O1 -g -fPIE -pie -Wall -Wextra -Wno-missing-field-initializers \
   -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/ring_test.cpp" \
-  -L"$OUT" -lhwgpu -lgfxstream_backend -llog -nostdlib++ -lc++_shared -o "$OUT/ring_test"
+  -L"$OUT" -lhwgpu -lgfxstream_backend -llog -landroid -nostdlib++ -lc++_shared -o "$OUT/ring_test"
 # The wrapper driver core with no fixes (icd/passthrough.cpp), for checking the core on the phone:
 #   ANDROID_EMU_VK_LOADER_PATH=/data/local/tmp/hwgpu/libvulkan_passthrough.so ./ring_test
 # Real wrappers add a fix module in place of passthrough.cpp. HWGPU_VK_DRIVER picks the driver underneath.

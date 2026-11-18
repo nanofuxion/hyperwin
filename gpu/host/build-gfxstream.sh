@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds libgfxstream_backend.so for the phone from gfxstream with host/gfxstream.patch: SweetCider's
 # Android changes (non-blocking pipe reads, a pipe per guest thread) and HyperWin's allocator hook,
-# which puts host-visible Vulkan memory in the heap shared with Windows.
+# which puts host-visible Vulkan memory in the heap shared with Windows, and the export of a
+# ColorBuffer's AHardwareBuffer (stream_renderer_resource_get_ahb) for scanout.
 #   gpu/host/build-gfxstream.sh     -> gpu/work/gfx-out/{include,lib/arm64-v8a}
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)

@@ -36,6 +36,12 @@ $SIGN -in "$WIN/scream/Install/driver/arm64/scream.cat" -out "$OUT/guest/audio/s
 mkdir -p "$OUT/guest/gpu"
 cp "$ROOT/gpu/work/direct/hwgpu.sys" "$ROOT/gpu/work/out/vulkan_hwgpu.dll" "$ROOT/gpu/work/out/vulkan_hwgpu.json" \
    "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vktest-x64.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$OUT/guest/gpu/"
+# The input driver too, so machines made before a change get it (gpu-install.cmd swaps it in;
+# it loads at the next start). New machines already have it from drivers.json.
+cp "$ROOT/build/hwvsinput/hwvsinput.sys" "$OUT/guest/gpu/"
+# Phone storage as drives: the service and the WinFsp installer it needs.
+[ -f "$ROOT/build/files/hwfiles.exe" ] || sh "$ROOT/guest/files/build.sh"
+cp "$ROOT/build/files/hwfiles.exe" "$ROOT/build/files/winfsp.msi" "$OUT/guest/gpu/"
 # DXVK, vkd3d-proton and Zink, which use.cmd puts beside a program (Send To in Explorer).
 cp -R "$ROOT/gpu/work/out/dx" "$OUT/guest/gpu/"
 perl -pe 's/\r?\n/\r\n/' "$ROOT/gpu/guest/dx/use.cmd" > "$OUT/guest/gpu/dx/use.cmd"

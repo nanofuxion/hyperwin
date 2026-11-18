@@ -33,6 +33,7 @@ MmUnmapIoSpace
 MmUnmapLockedPages
 IoGetCurrentProcess
 RtlInitUnicodeString
+SeSinglePrivilegeCheck
 memcpy
 memset
 DEF

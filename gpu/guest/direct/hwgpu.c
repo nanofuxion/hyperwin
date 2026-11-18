@@ -4,6 +4,8 @@
  * encoder) opens \\.\HwGpu, asks for a channel, and from then on writes gfxstream straight into
  * shared RAM that the phone reads. No system call per command, nothing in between.
  *
+ * It also maps the phone storage slots (include/hw_files.h) into hwfiles.exe.
+ *
  * The kernel part only claims, maps and frees. A legacy (non-PnP) driver: one control device,
  * demand or auto start, ntoskrnl imports only.
  */
@@ -12,6 +14,7 @@
 #define HWGPU_KERNEL
 #include "hwgpu_ring.h"
 #include "hwgpu_ioctl.h"
+#include "hw_files.h"
 
 #define TAG 'upGH'
 #ifndef MdlMappingNoExecute
@@ -33,10 +36,12 @@ struct open_ctx {
     PVOID user;         /* mapping in the process that asked */
     PEPROCESS process;
     struct view views[MAX_VIEWS];
+    struct view files;  /* the storage slots, IOCTL_HWGPU_FILES */
 };
 
 static PVOID g_ring;    /* kernel mapping of the ring area, offset HWGPU_RING_OFF in the window */
 static PVOID g_heap;    /* kernel mapping of the shared heap, HW_HEAP_PA, or NULL */
+static PVOID g_files;   /* kernel mapping of the storage slots, HWF_OFF in the window */
 static FAST_MUTEX g_lock;
 
 /* The window base the ring helpers expect, so offsets inside hwgpu_ring.h line up. */
@@ -140,6 +145,7 @@ static NTSTATUS on_cleanup(PDEVICE_OBJECT dev, PIRP irp)
     (void)dev;
     struct open_ctx *c = IoGetCurrentIrpStackLocation(irp)->FileObject->FsContext;
     ExAcquireFastMutex(&g_lock);
+    if (c && c->files.user) unmap_view(c, &c->files);
     if (c && c->slot >= 0) {
         /* Heap views first: the phone may hand their memory to someone else once the channel is free. */
         for (uint32_t i = 0; i < MAX_VIEWS; i++)
@@ -223,6 +229,23 @@ static NTSTATUS on_ioctl(PDEVICE_OBJECT dev, PIRP irp)
         RtlCopyMemory(buf, &out, sizeof(out));
         return done(irp, STATUS_SUCCESS, sizeof(out));
     }
+    if (code == IOCTL_HWGPU_FILES) {
+        if (out_len < sizeof(struct hwgpu_map_out)) return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        LUID tcb = {7, 0};  /* SE_TCB_PRIVILEGE: only SYSTEM holds it */
+        if (!SeSinglePrivilegeCheck(tcb, UserMode)) return done(irp, STATUS_PRIVILEGE_NOT_HELD, 0);
+        struct hwgpu_map_out out;
+        NTSTATUS st = STATUS_SUCCESS;
+        ExAcquireFastMutex(&g_lock);
+        if (!g_files) st = STATUS_DEVICE_NOT_READY;
+        else if (c->files.user) st = STATUS_DEVICE_BUSY;
+        else if (!(c->files.user = map_user(g_files, HWF_BYTES, &c->files.mdl))) st = STATUS_INSUFFICIENT_RESOURCES;
+        else c->process = PsGetCurrentProcess();
+        out.user = (uint64_t)(ULONG_PTR)c->files.user;
+        ExReleaseFastMutex(&g_lock);
+        if (!NT_SUCCESS(st)) return done(irp, st, 0);
+        RtlCopyMemory(buf, &out, sizeof(out));
+        return done(irp, STATUS_SUCCESS, sizeof(out));
+    }
     if (code == IOCTL_HWGPU_MAP) {
         if (in_len < sizeof(struct hwgpu_map_in) || out_len < sizeof(struct hwgpu_map_out))
             return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
@@ -257,6 +280,7 @@ static void unload(PDRIVER_OBJECT driver)
     if (driver->DeviceObject) IoDeleteDevice(driver->DeviceObject);
     if (g_ring) MmUnmapIoSpace(g_ring, HWGPU_RING_BYTES);
     if (g_heap) MmUnmapIoSpace(g_heap, (SIZE_T)HW_HEAP_SIZE);
+    if (g_files) MmUnmapIoSpace(g_files, HWF_BYTES);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
@@ -270,6 +294,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
      * mapped GPU memory is then copied as before. */
     pa.QuadPart = (LONGLONG)HW_HEAP_PA;
     g_heap = MmMapIoSpace(pa, (SIZE_T)HW_HEAP_SIZE, MmCached);
+    pa.QuadPart = (LONGLONG)(HW_WINDOW_PA + HWF_OFF);
+    g_files = MmMapIoSpace(pa, HWF_BYTES, MmCached);
     ExInitializeFastMutex(&g_lock);
 
     UNICODE_STRING name, link;

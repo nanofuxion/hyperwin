@@ -2,6 +2,7 @@ package dev.hyperwin.app
 
 import android.view.Display
 import android.view.Surface
+import android.view.SurfaceControl
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -31,10 +32,14 @@ class GuestDisplay(
                     runCatching { holder.surface.setFrameRate(it.refreshRate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
                 }
                 WindowBridge.nativeSetSurface(holder.surface)
+                makeLayer()
                 startIfReady()
             }
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                layer?.let { HwGpu.setLayer(it, width, height) }
+            }
             override fun surfaceDestroyed(holder: SurfaceHolder) {
+                dropLayer()
                 WindowBridge.nativeSetSurface(null)   // returns once no draw is in flight
                 stop()
             }
@@ -45,6 +50,36 @@ class GuestDisplay(
             }
             override fun onViewDetachedFromWindow(v: View) = Unit
         })
+    }
+
+    /** GPU frames from Windows go here, a layer just above this view's own CPU-drawn picture. */
+    private var layer: SurfaceControl? = null
+
+    private fun makeLayer() {
+        if (layer != null) return
+        val sc = SurfaceControl.Builder()
+            .setName("hyperwin-scanout")
+            .setParent(view.surfaceControl)
+            .setOpaque(true)
+            .setHidden(true)   // the renderer shows it with its first frame
+            .build()
+        SurfaceControl.Transaction().setLayer(sc, 1).apply {
+            // Only a layer that gets frames counts toward the screen's rate, and during a game
+            // that is this one: ask for the panel's fastest.
+            bestMode(view.display)?.let {
+                setFrameRate(sc, it.refreshRate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT, Surface.CHANGE_FRAME_RATE_ALWAYS)
+            }
+        }.apply()
+        layer = sc
+        HwGpu.setLayer(sc, view.width, view.height)
+    }
+
+    private fun dropLayer() {
+        val sc = layer ?: return
+        layer = null
+        HwGpu.setLayer(null, 0, 0)
+        SurfaceControl.Transaction().reparent(sc, null).apply()
+        sc.release()
     }
 
     fun vmStarted(sharedWindow: AvfPlan.SharedWindow?) {
@@ -58,6 +93,7 @@ class GuestDisplay(
     }
 
     fun vmStopped() {
+        HwGpu.hideLayer()
         val thread: Thread?
         synchronized(lock) {
             running = false

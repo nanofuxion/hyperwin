@@ -18,6 +18,16 @@ int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_
                      uint32_t width, uint32_t height);
 // Stops the thread and frees what every guest process made. The renderer stays up.
 void hwgpu_host_stop(void);
+// The compositor layer SGPU_CMD_SCANOUT frames go on (an ASurfaceControl*, whose reference passes
+// to the host; null for none), and the size in pixels it covers. Frames are scaled to that size.
+int hwgpu_host_set_layer(void* layer, int view_width, int view_height);
+// Whether every scanout frame waits for the phone's screen, as if each program asked for FIFO.
+// On by default. Programs that ask for FIFO themselves always wait.
+void hwgpu_host_set_vsync(int on);
+// The same layer now covers another size.
+void hwgpu_host_set_layer_size(int view_width, int view_height);
+// How many scanout frames went to the layer so far.
+uint64_t hwgpu_host_scanout_frames(void);
 
 #ifdef __cplusplus
 }

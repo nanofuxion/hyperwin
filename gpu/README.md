@@ -121,6 +121,31 @@ round trip per request, so it is slower than direct. Needed pieces:
 3. The adapter's registry values naming `vulkan_hwgpu.dll` as its Vulkan driver.
 4. D3D later: a D3D UMD, or DXVK and vkd3d-proton in each game on top of the Vulkan driver.
 
+## Frames to the screen
+
+A fullscreen Vulkan program's frames never come back to the CPU (`SGPU_CMD_SCANOUT`). In that mode
+the guest WSI copies each finished swapchain image on the GPU into one of its own scanout images,
+whose memory is a gfxstream ColorBuffer. On the phone that memory is an `AHardwareBuffer`.
+`hwgpu_host` takes the buffer (`stream_renderer_resource_get_ahb`, in `host/gfxstream.patch`) and
+gives it to SurfaceFlinger with `ASurfaceTransaction_setBuffer`, on a layer just above the
+SurfaceView that shows the CPU-drawn desktop. Frames go to the layer one at a time. A frame that
+arrives while the last is still on its way replaces any frame already waiting, like mailbox. When
+the screen lets go of a buffer, the host writes its count into `hwgpu_ctl.scanout_free`. The guest
+draws into that buffer only after that.
+
+- The app process owns the layer (`GuestDisplay`) and lends it to each renderer process in the
+  start message. When a renderer dies the app hides the layer. The next renderer shows it again
+  with its first frame, and the desktop underneath stays on screen throughout.
+- ColorBuffers must be RGBA. The phone's driver cannot make BGRA `AHardwareBuffer` images. The
+  guest's copy swaps the channels of BGRA swapchains.
+- Scanout needs the driver stack to export ColorBuffers
+  (`VK_ANDROID_external_memory_android_hardware_buffer`). The renderer tries one at start. The
+  hello reply carries `SGPU_HELLO_SCANOUT` only when that worked. Otherwise the guest uses the GDI
+  path.
+- Windowed programs, and everything DWM draws, still reach the screen through the CPU. Basic
+  Display writes the framebuffer, and `nativePresent` copies only the rows that changed into the
+  SurfaceView in one NEON pass. `SGPU_CMD_PRESENT` stays for software-drawn frames only.
+
 ## Build
 
 ```

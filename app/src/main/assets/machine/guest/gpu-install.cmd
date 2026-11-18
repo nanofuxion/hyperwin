@@ -1,8 +1,11 @@
 @echo off
 rem Installs or updates the HyperWin GPU in Windows (gpu/README.md): the ring driver hwgpu.sys and
-rem the Vulkan driver vulkan_hwgpu.dll. Run as administrator or SYSTEM, by firstboot.cmd on new
-rem machines and by the app on older ones. Safe to run again.
+rem the Vulkan driver vulkan_hwgpu.dll; also the input driver hwvsinput.sys and the phone storage
+rem service hwfiles.exe. Run as administrator or SYSTEM, by firstboot.cmd on new machines and by
+rem the app on older ones. Safe to run again.
 set G=C:\HyperWin\gpu
+rem The storage service keeps the ring driver open, so it stops first.
+sc stop HyperWinFiles >nul 2>&1 && ping -n 3 127.0.0.1 >nul
 sc stop hwgpu >nul 2>&1
 copy /y %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys
 sc query hwgpu >nul 2>&1 || sc create hwgpu type= kernel start= auto binPath= System32\drivers\hwgpu.sys DisplayName= "HyperWin GPU ring"
@@ -12,6 +15,22 @@ rem Apps link to the Vulkan loader, which Windows does not ship. Keep one someth
 rem and update ours (the marker says System32's copy came from here).
 if not exist %SystemRoot%\System32\vulkan-1.dll echo.> %G%\vulkan-1.ours
 if exist %G%\vulkan-1.ours copy /y %G%\vulkan-1.dll %SystemRoot%\System32\vulkan-1.dll
+rem The keyboard, mouse and gamepad driver: Windows keeps a loaded driver's file open, so the old
+rem one is moved aside, and the new one loads at the next start.
+set D=%SystemRoot%\System32\drivers
+fc /b %G%\hwvsinput.sys %D%\hwvsinput.sys >nul 2>&1 || (
+  del %D%\hwvsinput.old >nul 2>&1
+  move /y %D%\hwvsinput.sys %D%\hwvsinput.old >nul
+  copy /y %G%\hwvsinput.sys %D%\hwvsinput.sys
+)
+rem Phone storage as drives: WinFsp, then the HyperWinFiles service on it (guest/files/hwfiles.c).
+rem It runs from its own folder, so the app can send a new one while it runs.
+reg query HKLM\SOFTWARE\WOW6432Node\WinFsp /v InstallDir >nul 2>&1 || msiexec /i %G%\winfsp.msi /qn /norestart
+if not exist C:\HyperWin\files mkdir C:\HyperWin\files
+copy /y %G%\hwfiles.exe C:\HyperWin\files\hwfiles.exe
+sc query HyperWinFiles >nul 2>&1 || sc create HyperWinFiles type= own start= auto binPath= C:\HyperWin\files\hwfiles.exe DisplayName= "HyperWin phone storage"
+sc failure HyperWinFiles reset= 60 actions= restart/2000 >nul
+sc start HyperWinFiles
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
 rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).

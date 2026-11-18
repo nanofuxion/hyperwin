@@ -18,6 +18,10 @@
 #define IOCTL_HWGPU_MAP   0x00222404u
 #define IOCTL_HWGPU_UNMAP 0x00222408u
 
+/* Map the phone storage slots (include/hw_files.h) into the caller (out: hwgpu_map_out). Only for
+ * SYSTEM, which is what hwfiles.exe runs as: they reach every file the phone shares. */
+#define IOCTL_HWGPU_FILES 0x0022240Cu
+
 struct hwgpu_map_in {
     uint64_t offset;      /* from the start of the heap */
     uint64_t size;

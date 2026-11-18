@@ -99,17 +99,26 @@ Java_dev_hyperwin_app_WindowBridge_nativeCopyFrame(JNIEnv *env, jclass cls,
 }
 
 /* ---- presenting the guest frame ----
- * The guest's pixels go straight into the SurfaceView's buffer, which has the guest's size; the
- * phone's compositor scales it to the view. An unchanged frame costs one compare and no drawing. */
+ * The guest's pixels go into the SurfaceView's buffer, which has the guest's size; the phone's
+ * compositor scales it to the view. One pass finds the rows that changed and keeps a copy of
+ * them; only those rows are locked and written, converting while they are copied. An unchanged
+ * frame costs one compare and no drawing. GPU frames of fullscreen games skip all of this: they go
+ * to a layer above this one (SGPU_CMD_SCANOUT, gpu/host/hwgpu_host.cpp). */
 
 #include <pthread.h>
 #include <stdlib.h>
 #include <android/native_window_jni.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#define FORMAT_BGRA 5   /* AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM: the guest's own byte order */
 
 static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *present_window;
 static uint8_t *present_last;        /* the frame on screen, as the guest wrote it */
 static uint32_t present_bytes;
+static int present_bgra;             /* the surface takes BGRA, so rows need no swap */
 
 /* surface null: stop drawing. Returns only when no draw is in flight, as surfaceDestroyed needs. */
 JNIEXPORT void JNICALL
@@ -123,6 +132,29 @@ Java_dev_hyperwin_app_WindowBridge_nativeSetSurface(JNIEnv *env, jclass cls, job
     pthread_mutex_unlock(&present_lock);
 }
 
+/* One row of guest BGRX into the surface: alpha forced opaque, red and blue swapped unless the
+ * surface is BGRA itself. */
+static void put_row(uint32_t *to, const uint32_t *in, uint32_t n, int bgra)
+{
+    uint32_t x = 0;
+#if defined(__aarch64__)
+    const uint8x16_t opaque = vdupq_n_u8(0xff);
+    for (; x + 16 <= n; x += 16) {
+        uint8x16x4_t p = vld4q_u8((const uint8_t *)(in + x));
+        if (!bgra) {
+            uint8x16_t b = p.val[0];
+            p.val[0] = p.val[2];
+            p.val[2] = b;
+        }
+        p.val[3] = opaque;
+        vst4q_u8((uint8_t *)(to + x), p);
+    }
+#endif
+    for (; x < n; x++)
+        to[x] = bgra ? (in[x] | 0xff000000u)
+                     : (in[x] & 0x0000ff00u) | ((in[x] >> 16) & 0xffu) | ((in[x] & 0xffu) << 16) | 0xff000000u;
+}
+
 /* 1 drew a frame, 0 nothing new, -1 no guest frame or no surface. */
 JNIEXPORT jint JNICALL
 Java_dev_hyperwin_app_WindowBridge_nativePresent(JNIEnv *env, jclass cls, jobject windowBuffer)
@@ -130,7 +162,7 @@ Java_dev_hyperwin_app_WindowBridge_nativePresent(JNIEnv *env, jclass cls, jobjec
     struct hw_header *h = (*env)->GetDirectBufferAddress(env, windowBuffer);
     ANativeWindow_Buffer out;
     const uint8_t *src;
-    uint32_t bytes, front, x, y;
+    uint32_t bytes, front, y, row, first, last;
     int rc = -1;
     (void)cls;
     if (!ready || !h || !hw_mode_ok(h)) return -1;
@@ -138,27 +170,47 @@ Java_dev_hyperwin_app_WindowBridge_nativePresent(JNIEnv *env, jclass cls, jobjec
     if (front > 1 || (!(__atomic_load_n(&h->guest_flags, __ATOMIC_ACQUIRE) & HW_GUEST_GOP) &&
                       !__atomic_load_n(&h->seq, __ATOMIC_ACQUIRE))) return -1;
     bytes = hw_frame_bytes(h);
+    row = h->width * 4;
     src = (const uint8_t *)h + hw_frame_off(h, front);
     pthread_mutex_lock(&present_lock);
     if (!present_window) goto out;
-    if (bytes == present_bytes && !memcmp(present_last, src, bytes)) { rc = 0; goto out; }
     if (bytes != present_bytes) {
         uint8_t *grown = realloc(present_last, bytes);
         if (!grown) goto out;
         present_last = grown;
-        present_bytes = 0;
-        ANativeWindow_setBuffersGeometry(present_window, (int32_t)h->width, (int32_t)h->height, WINDOW_FORMAT_RGBX_8888);
-    }
-    memcpy(present_last, src, bytes);            /* one steady copy; the guest keeps drawing */
-    if (ANativeWindow_lock(present_window, &out, NULL) != 0) goto out;
-    if ((uint32_t)out.width >= h->width && (uint32_t)out.height >= h->height) {
+        /* BGRA saves the swap. A surface that will not take it stays RGBX. */
+        present_bgra = ANativeWindow_setBuffersGeometry(present_window, (int32_t)h->width, (int32_t)h->height,
+                                                        FORMAT_BGRA) == 0;
+        if (!present_bgra)
+            ANativeWindow_setBuffersGeometry(present_window, (int32_t)h->width, (int32_t)h->height,
+                                             WINDOW_FORMAT_RGBX_8888);
+        memcpy(present_last, src, bytes);
+        first = 0;
+        last = h->height - 1;
+    } else {
+        /* The rows that changed, kept as they are now: the guest keeps drawing meanwhile. */
+        first = UINT32_MAX;
+        last = 0;
         for (y = 0; y < h->height; y++) {
-            const uint32_t *in = (const uint32_t *)(present_last + (size_t)y * h->stride);
-            uint32_t *to = (uint32_t *)((uint8_t *)out.bits + (size_t)y * (size_t)out.stride * 4);
-            /* Guest BGRX to the surface's RGBX: swap red and blue. */
-            for (x = 0; x < h->width; x++)
-                to[x] = (in[x] & 0x0000ff00u) | ((in[x] >> 16) & 0xffu) | ((in[x] & 0xffu) << 16) | 0xff000000u;
+            const uint8_t *a = src + (size_t)y * h->stride;
+            uint8_t *b = present_last + (size_t)y * h->stride;
+            if (!memcmp(a, b, row)) continue;
+            memcpy(b, a, row);
+            if (first == UINT32_MAX) first = y;
+            last = y;
         }
+        if (first == UINT32_MAX) { rc = 0; goto out; }
+    }
+    ARect dirty = {0, (int32_t)first, (int32_t)h->width, (int32_t)last + 1};
+    if (ANativeWindow_lock(present_window, &out, &dirty) != 0) goto out;
+    if ((uint32_t)out.width >= h->width && (uint32_t)out.height >= h->height) {
+        /* The surface may hand back a bigger region than asked: fill all of it. */
+        uint32_t top = dirty.top < 0 ? 0 : (uint32_t)dirty.top;
+        uint32_t bottom = dirty.bottom > (int32_t)h->height ? h->height : (uint32_t)dirty.bottom;
+        int bgra = out.format == FORMAT_BGRA;
+        for (y = top; y < bottom; y++)
+            put_row((uint32_t *)((uint8_t *)out.bits + (size_t)y * (size_t)out.stride * 4),
+                    (const uint32_t *)(present_last + (size_t)y * h->stride), h->width, bgra);
         present_bytes = bytes;
         rc = 1;
     }

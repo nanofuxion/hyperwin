@@ -34,6 +34,7 @@
 #define HWGPU_RING_BYTES    (0x1000u + HWGPU_CHANNELS * HWGPU_CHAN_STRIDE)
 #define HWGPU_FENCE_RINGS   64u
 #define HWGPU_GRANTS        128u  /* heap ranges one channel may map at once */
+#define HWGPU_SCANOUT_BUFFERS 16u /* buffers one channel may show with SGPU_CMD_SCANOUT */
 
 _Static_assert(HWGPU_RING_OFF + HWGPU_RING_BYTES <= 0x7f00000u, "GPU rings end below the debug marks");
 
@@ -73,7 +74,14 @@ struct hwgpu_ctl {
     /* phone: parts of the heap (HW_HEAP_PA) this channel's process may map, size 0 for unused.
      * hwgpu.sys maps only a range that matches one exactly. */
     struct { uint64_t offset, size; } grant[HWGPU_GRANTS];
+    /* phone: per scanout buffer, the seq of its last SGPU_CMD_SCANOUT that the screen has let go
+     * of. The guest draws into a buffer again only once this has reached what it last sent. */
+    uint32_t scanout_free[HWGPU_SCANOUT_BUFFERS];
+    /* phone: HWGPU_SCANOUT_VSYNC when every scanout frame should wait for the phone's screen, as
+     * if the program had asked for FIFO (the app's "Limit to screen refresh" setting). */
+    uint32_t scanout_flags;
 };
+#define HWGPU_SCANOUT_VSYNC 1u
 
 _Static_assert(sizeof(struct hwgpu_ctl) <= HWGPU_CTL_BYTES, "control fits its page");
 

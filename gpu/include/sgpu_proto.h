@@ -32,6 +32,16 @@
  * drawable that the guest copied there on the GPU). The pixels stay on the host: neither side
  * syncs the whole pages of that range any more, and the host's GL compositor reads them when the
  * guest's window server draws that surface (GuestGL.kt, op HOST_SURFACE). width 0 ends it.
+ *
+ * SGPU_CMD_SCANOUT shows a frame without it ever leaving the phone's GPU. The guest renders into
+ * a RESOURCE_CREATE_3D resource (a gfxstream ColorBuffer, which on the phone is an
+ * AHardwareBuffer), waits until that rendering has finished, and names the resource. The phone
+ * hands the buffer to its compositor on a layer above the CPU-drawn desktop. Each scanout buffer
+ * has an index and a count of how often it was shown; the phone writes that count into
+ * hwgpu_ctl.scanout_free[index] once the screen lets go of the buffer, and only then may the
+ * guest draw into it again. Resource 0 hides the layer. A phone that cannot do this (its Vulkan
+ * driver has no AHardwareBuffer export) leaves SGPU_HELLO_SCANOUT out of the hello reply and
+ * refuses the command; software-drawn frames use SGPU_CMD_PRESENT instead.
  */
 #ifndef SGPU_PROTO_H
 #define SGPU_PROTO_H
@@ -84,7 +94,9 @@
 #define SGPU_CMD_SYNC        0x1003u  /* sgpu_sync_entry list -> SGPU_RESP_SYNC */
 #define SGPU_CMD_SURFACE     0x1004u  /* sgpu_surface -> OK_NODATA */
 #define SGPU_CMD_PRESENT     0x1005u  /* sgpu_present -> OK_NODATA (frame to shared window) */
+#define SGPU_CMD_SCANOUT     0x1006u  /* sgpu_scanout -> OK_NODATA (GPU frame straight to the screen) */
 #define SGPU_RESP_OK_HELLO   0x1180u
+#define SGPU_HELLO_SCANOUT   (1u << 0) /* sgpu_hello_resp.hdr.flags: SGPU_CMD_SCANOUT works */
 #define SGPU_RESP_OK_DATA    0x1181u  /* vgpu_hdr, u32 len, len bytes */
 #define SGPU_RESP_SYNC       0x1182u  /* vgpu_hdr, sgpu_sync_entry list */
 #define SGPU_RESP_AGAIN      0x1183u  /* TRANSFER_FROM_HOST on a pipe: nothing to read yet */
@@ -271,6 +283,17 @@ struct sgpu_present {                  /* the host copies the resource into the 
 	uint32_t format;                   /* SGPU_PRESENT_BGRA8 */
 };
 #define SGPU_PRESENT_BGRA8 1u
+
+struct sgpu_scanout {                  /* the phone's compositor shows the resource as it is */
+	struct vgpu_hdr hdr;
+	uint32_t resource_id;              /* a finished ColorBuffer resource, 0 to hide the layer */
+	uint32_t index;                    /* the guest's buffer number, < HWGPU_SCANOUT_BUFFERS */
+	uint32_t seq;                      /* how often this buffer has been shown, counting this time */
+	uint32_t flags;                    /* SGPU_SCANOUT_VSYNC */
+};
+/* Show every frame, each for at least one refresh, in order (FIFO). Without it a newer frame
+ * replaces one not yet on screen. */
+#define SGPU_SCANOUT_VSYNC 1u
 /* What a guest driver leaves in the first bytes of such an IOSurface for its window server. */
 #define SGPU_SURFACE_MAGIC "SWEETMTL"
 #pragma pack(pop)

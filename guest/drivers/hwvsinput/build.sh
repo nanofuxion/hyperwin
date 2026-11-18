@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds and test-signs build/hwvsinput/hwvsinput.sys (ARM64 keyboard/mouse port driver over viosock).
+# Builds and test-signs build/hwvsinput/hwvsinput.sys (ARM64 keyboard, mouse and gamepad over viosock).
 set -eu
 cd "$(dirname "$0")/../../.."
 OUT=build/hwvsinput
@@ -18,6 +18,9 @@ IoCreateDevice
 IoDeleteDevice
 IoDetachDevice
 IoGetDeviceProperty
+IoRegisterDeviceInterface
+IoReportDetectedDevice
+IoSetDeviceInterfaceState
 IofCallDriver
 IofCompleteRequest
 KeAcquireSpinLockRaiseToDpc
@@ -30,10 +33,15 @@ MmMapIoSpace
 MmUnmapIoSpace
 PoCallDriver
 PsCreateSystemThread
+RtlFreeUnicodeString
+RtlInitUnicodeString
 ZwClose
 ZwCreateFile
 ZwDeviceIoControlFile
+ZwOpenKey
+ZwQueryValueKey
 ZwReadFile
+ZwSetValueKey
 memcpy
 memmove
 memset
