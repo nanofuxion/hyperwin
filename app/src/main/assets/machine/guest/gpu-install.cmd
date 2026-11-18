@@ -46,7 +46,10 @@ if defined NEWH if not "%NEWH%"=="%OLDH%" powershell -NoProfile -ExecutionPolicy
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 rem Vulkan finds the driver through the adapter's VulkanDriverName. The global key is only for a
 rem machine that has no adapter (wddm/README.md).
-powershell -NoProfile -Command "if (Get-PnpDevice | ? HardwareID -contains 'Root\HwGpuAdapter') { exit 0 } else { exit 1 }" && (reg delete HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /f >nul 2>&1) || reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
+set HWAD=0
+powershell -NoProfile -Command "if (Get-PnpDevice | ? HardwareID -contains 'Root\HwGpuAdapter') { exit 0 } else { exit 1 }" && set HWAD=1
+rem With the adapter, Vulkan is found through its own VulkanDriverName: the global key goes. Without it the key is added.
+if "%HWAD%"=="1" (reg delete HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /f >nul 2>&1) else (reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f)
 rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).
 for /d %%u in (C:\Users\*) do if exist "%%u\AppData\Roaming\Microsoft\Windows\SendTo" call :sendto "%%u\AppData\Roaming\Microsoft\Windows\SendTo"
 call :sendto "C:\Users\Default\AppData\Roaming\Microsoft\Windows\SendTo"
