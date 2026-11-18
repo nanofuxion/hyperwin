@@ -532,7 +532,13 @@ and the driver's own line in `HWD3D_UMDLOG` at exit.
 | `dxtest 11` (device, clear, copy, read back) | 1935 | 3849 |
 | `d3dfeat` (deferred context, MSAA, query; compute fails at level 10.1) | 1974 | 3885 |
 
-Almost all of both is device creation: the runtime asks for the support of every
+| `d3dcube` 1280x720, windowed, 10 s (735 frames) | about 11 per frame | about 2 per frame |
+
+The cube row is the first with draws and a present. 73 FPS includes the windowed read-back
+described under "Present" below. The submits per frame are the driver's state calls, one draw,
+the copy and the map.
+
+Almost all of the first two rows is device creation: the runtime asks for the support of every
 format and multisample count (about 1900 calls), which the driver answers from
 the phone once per format. Caching those on the guest side would remove most of
 them and is not batching. The numbers for the cube and the AIO scenes go here
@@ -548,6 +554,24 @@ Batching before display (phase 6). The decision from phase 4 is settled before
 this phase starts. If batching stays, flips use the batched submit path: a flip is
 a present, so it flushes the batch, and the flip rides the same path as the rest
 of the frame. Vsync and the cursor layer add no submits of their own beyond it.
+
+### Present, until the display phase (2026-11-18)
+
+DXGI's `pfnPresent`, `pfnPresent1` and `pfnRotateResourceIdentities` are in the driver. With no
+kernel allocation to give the runtime, a windowed present reads the frame back from the phone
+(a staging copy, mapped) and draws it into the program's own window with GDI (`SetDIBitsToDevice`).
+The window is found as the program's visible top-level window whose client area is the frame's
+size. This is the one copy back to Windows the plan lists, and it goes when phase 6 gives the
+runtime a real flip. `d3dcube` runs through Windows' own `d3d11.dll` with nothing beside it and
+shows the cube on the phone's screen. A program in a user's session meets this adapter only when
+it picks it by name: Windows' default adapter there is the one with the screen. `HWD3D_ADAPTER` in
+`d3dcube` picks by name, as a program that lists adapters would.
+
+What it took, for the next driver: the DXGI base table has 18 entries in its 1.3 form and the
+runtime calls every one it needs, so each gets a function; `ppfnRetrieveSubObject` must be set; a
+shader's signatures must carry a component type (0 makes DXVK's converter assert and the phone's
+renderer aborts); `CreateTexture2D`'s wire is the description, a count of first data, then the
+object wanted.
 
 ## Things to check early
 

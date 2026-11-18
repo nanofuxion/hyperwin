@@ -143,7 +143,27 @@ int main(int argc, char** argv) {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     IDXGISwapChain* swap = nullptr;
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 3,
+    IDXGIAdapter* pick = nullptr;
+#ifdef _WIN32
+    // HWD3D_ADAPTER=<part of a name> picks an adapter by name, as a program that lists adapters would. In
+    // a user's session Windows' default adapter is the one with the screen, not the HyperWin GPU.
+    char want_name[64];
+    if (GetEnvironmentVariableA("HWD3D_ADAPTER", want_name, sizeof want_name)) {
+        IDXGIFactory1* fac = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&fac)))) {
+            IDXGIAdapter* ad = nullptr;
+            for (UINT i = 0; fac->EnumAdapters(i, &ad) == S_OK && !pick; i++) {
+                DXGI_ADAPTER_DESC ad_desc;
+                ad->GetDesc(&ad_desc);
+                char name[128];
+                WideCharToMultiByte(CP_ACP, 0, ad_desc.Description, -1, name, sizeof name, nullptr, nullptr);
+                if (strstr(name, want_name)) pick = ad; else ad->Release();
+            }
+            fac->Release();
+        }
+    }
+#endif
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(pick, pick ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 3,
                                                D3D11_SDK_VERSION, &scd, &swap, &dev, nullptr, &ctx);
     if (FAILED(hr)) {
         printf("FAIL D3D11CreateDeviceAndSwapChain 0x%08x\n", unsigned(hr));

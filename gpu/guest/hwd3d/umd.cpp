@@ -80,6 +80,7 @@ struct Dev {
     uint32_t hdev, hctx;  /* the phone's device and immediate context */
     HANDLE kctx;          /* the kernel context the runtime wants a driver to have */
     UINT flags;
+    struct Obj *pstage;   /* the staging copy a windowed present reads back, kept at the last size */
 };
 
 struct Shadow {
@@ -106,6 +107,7 @@ static Obj *OB(D3D10DDI_HRENDERTARGETVIEW h) { return static_cast<Obj *>(h.pDrvP
 
 static void fail(Dev *d, HRESULT hr)
 {
+    ulog("hwd3d_umd: error 0x%08lx reported to the runtime\n", (unsigned long)hr);
     if (d && d->ucb && d->ucb->pfnSetErrorCb) d->ucb->pfnSetErrorCb(d->core, hr);
 }
 
@@ -220,6 +222,8 @@ static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CRE
     for (uint32_t i = 0; init && i < o->subs; i++) {
         uint32_t row, rows, slices;
         if (!init[i].pSysMem || !hwd3d_region(&o->r, i, NULL, &row, &rows, &slices)) {
+            ulog("hwd3d_umd: initial data of subresource %u cannot be sent: dimension %u, format %u, %ux%ux%u, %u mips, %u layers%s\n", i, o->dim,
+                 (unsigned)o->r.format, o->r.width, o->r.height, o->r.depth, o->r.mips, layers, init[i].pSysMem ? "" : ", no memory");
             call_abort(b);
             fail(d, E_INVALIDARG);
             return;
@@ -231,7 +235,11 @@ static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CRE
     HRESULT res = (HRESULT)call_wait(b, &r);
     o->h = take32(&r);
     call_end(&r);
-    if (FAILED(res) || !o->h) fail(d, FAILED(res) ? res : E_FAIL);
+    if (FAILED(res) || !o->h) {
+        ulog("hwd3d_umd: the phone refused a resource, dimension %u, format %u, %ux%u, bind 0x%x, usage %u (0x%08lx)\n", o->dim, (unsigned)a->Format,
+             o->r.width, o->r.height, a->BindFlags, a->Usage, (unsigned long)res);
+        fail(d, FAILED(res) ? res : E_FAIL);
+    }
 }
 
 static void APIENTRY u_DestroyResource(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE h) { release_obj(OB(h)); }
@@ -243,6 +251,9 @@ static SIZE_T APIENTRY u_CalcPrivateRenderTargetViewSize(D3D10DDI_HDEVICE, const
 static void APIENTRY u_CreateRenderTargetView(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATERENDERTARGETVIEW *a,
                                               D3D10DDI_HRENDERTARGETVIEW hv, D3D10DDI_HRTRENDERTARGETVIEW)
 {
+    ulog_call("DestroyResource");
+    ulog_call("CalcPrivateRenderTargetViewSize");
+    ulog_call("CreateRenderTargetView");
     Dev *d = DV(hd);
     Obj *v = new (hv.pDrvPrivate) Obj();
     Obj *res = OB(a->hDrvResource);
@@ -320,6 +331,7 @@ static void APIENTRY u_ResourceCopy(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst,
 
 static BOOL APIENTRY u_Flush(D3D10DDI_HDEVICE hd, UINT)
 {
+    ulog_call("Flush");
     call_async(cx(DV(hd), HMX_ID3D11DeviceContext_Flush));
     return TRUE;
 }
@@ -397,6 +409,7 @@ static void map_phone(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, UINT
 static void APIENTRY u_StagingResourceMap(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, D3D10_DDI_MAP type, UINT flags,
                                           D3D10DDI_MAPPED_SUBRESOURCE *out)
 {
+    ulog_call("StagingResourceMap");
     memset(out, 0, sizeof *out);
     map_phone(hd, hr, sub, type, flags, out);
 }
@@ -404,6 +417,7 @@ static void APIENTRY u_StagingResourceMap(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURC
 static void APIENTRY u_ResourceMap(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, D3D10_DDI_MAP type, UINT flags,
                                    D3D10DDI_MAPPED_SUBRESOURCE *out)
 {
+    ulog_call("ResourceMap");
     memset(out, 0, sizeof *out);
     if (type == D3D10_DDI_MAP_WRITE_DISCARD || type == D3D10_DDI_MAP_WRITE_NOOVERWRITE) map_local(hd, hr, sub, type, out);
     else map_phone(hd, hr, sub, type, flags, out);
@@ -577,6 +591,8 @@ template <class T> static void APIENTRY u_destroy(D3D10DDI_HDEVICE, T h) { relea
 
 static void APIENTRY u_CreateBlendState(D3D10DDI_HDEVICE hd, const D3D11_1_DDI_BLEND_DESC *a, D3D10DDI_HBLENDSTATE hs, D3D10DDI_HRTBLENDSTATE)
 {
+    ulog_call("destroy");
+    ulog_call("CreateBlendState");
     Obj *o = new (hs.pDrvPrivate) Obj();
     D3D11_BLEND_DESC d;
     memset(&d, 0, sizeof d);
@@ -599,6 +615,7 @@ static void APIENTRY u_CreateBlendState(D3D10DDI_HDEVICE hd, const D3D11_1_DDI_B
 
 static void APIENTRY u_CreateDepthStencilState(D3D10DDI_HDEVICE hd, const D3D10_DDI_DEPTH_STENCIL_DESC *a, D3D10DDI_HDEPTHSTENCILSTATE hs, D3D10DDI_HRTDEPTHSTENCILSTATE)
 {
+    ulog_call("CreateDepthStencilState");
     Obj *o = new (hs.pDrvPrivate) Obj();
     D3D11_DEPTH_STENCIL_DESC d;
     memset(&d, 0, sizeof d);
@@ -622,6 +639,7 @@ static void APIENTRY u_CreateDepthStencilState(D3D10DDI_HDEVICE hd, const D3D10_
 
 static void APIENTRY u_CreateRasterizerState(D3D10DDI_HDEVICE hd, const D3D11_1_DDI_RASTERIZER_DESC *a, D3D10DDI_HRASTERIZERSTATE hs, D3D10DDI_HRTRASTERIZERSTATE)
 {
+    ulog_call("CreateRasterizerState");
     Obj *o = new (hs.pDrvPrivate) Obj();
     D3D11_RASTERIZER_DESC d;
     d.FillMode = (D3D11_FILL_MODE)a->FillMode;
@@ -639,6 +657,7 @@ static void APIENTRY u_CreateRasterizerState(D3D10DDI_HDEVICE hd, const D3D11_1_
 
 static void APIENTRY u_CreateSampler(D3D10DDI_HDEVICE hd, const D3D10_DDI_SAMPLER_DESC *a, D3D10DDI_HSAMPLER hs, D3D10DDI_HRTSAMPLER)
 {
+    ulog_call("CreateSampler");
     Obj *o = new (hs.pDrvPrivate) Obj();
     D3D11_SAMPLER_DESC d;
     d.Filter = (D3D11_FILTER)a->Filter;
@@ -656,6 +675,7 @@ static void APIENTRY u_CreateSampler(D3D10DDI_HDEVICE hd, const D3D10_DDI_SAMPLE
 
 static void APIENTRY u_SetBlendState(D3D10DDI_HDEVICE hd, D3D10DDI_HBLENDSTATE s, const FLOAT factor[4], UINT mask)
 {
+    ulog_call("SetBlendState");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_OMSetBlendState);
     put32(b, H(s));
     put_arr(b, factor, 4, sizeof(FLOAT));
@@ -665,6 +685,7 @@ static void APIENTRY u_SetBlendState(D3D10DDI_HDEVICE hd, D3D10DDI_HBLENDSTATE s
 
 static void APIENTRY u_SetDepthStencilState(D3D10DDI_HDEVICE hd, D3D10DDI_HDEPTHSTENCILSTATE s, UINT ref)
 {
+    ulog_call("SetDepthStencilState");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_OMSetDepthStencilState);
     put32(b, H(s));
     put32(b, ref);
@@ -673,6 +694,7 @@ static void APIENTRY u_SetDepthStencilState(D3D10DDI_HDEVICE hd, D3D10DDI_HDEPTH
 
 static void APIENTRY u_SetRasterizerState(D3D10DDI_HDEVICE hd, D3D10DDI_HRASTERIZERSTATE s)
 {
+    ulog_call("SetRasterizerState");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetState);
     put32(b, H(s));
     call_async(b);
@@ -680,6 +702,7 @@ static void APIENTRY u_SetRasterizerState(D3D10DDI_HDEVICE hd, D3D10DDI_HRASTERI
 
 static void APIENTRY u_SetViewports(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D10_DDI_VIEWPORT *v)
 {
+    ulog_call("SetViewports");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetViewports);
     put32(b, n);
     put_arr(b, v, n, sizeof *v);
@@ -688,6 +711,7 @@ static void APIENTRY u_SetViewports(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D
 
 static void APIENTRY u_SetScissorRects(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D10_DDI_RECT *r)
 {
+    ulog_call("SetScissorRects");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetScissorRects);
     put32(b, n);
     put_arr(b, r, n, sizeof *r);
@@ -854,7 +878,7 @@ static std::vector<uint8_t> dxbc(const UINT *code, const std::vector<Sig> *in, c
 static std::vector<Sig> sigs_of(const D3D11_1DDIARG_SIGNATURE_ENTRY2 *e, UINT n)
 {
     std::vector<Sig> v;
-    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, (uint32_t)e[i].RegisterComponentType});
+    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, e[i].RegisterComponentType ? (uint32_t)e[i].RegisterComponentType : 3u});
     return v;
 }
 
@@ -905,6 +929,7 @@ SHADER_CREATE(Pixel, PixelShader, 0)
 
 static void APIENTRY u_CreateComputeShader(D3D10DDI_HDEVICE hd, const UINT *code, D3D10DDI_HSHADER hs, D3D10DDI_HRTSHADER)
 {
+    ulog_call("CreateComputeShader");
     make_shader(hd, HMX_ID3D11Device_CreateComputeShader, code, hs, nullptr);
 }
 
@@ -912,6 +937,7 @@ static void APIENTRY u_CreateComputeShader(D3D10DDI_HDEVICE hd, const UINT *code
  * whose input signature names the registers, and the elements named alike. */
 static void APIENTRY u_CreateElementLayout(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATEELEMENTLAYOUT *a, D3D10DDI_HELEMENTLAYOUT hl, D3D10DDI_HRTELEMENTLAYOUT)
 {
+    ulog_call("CreateElementLayout");
     Dev *d = DV(hd);
     Obj *o = new (hl.pDrvPrivate) Obj();
     std::vector<Sig> in;
@@ -939,6 +965,7 @@ static void APIENTRY u_CreateElementLayout(D3D10DDI_HDEVICE hd, const D3D10DDIAR
 
 static void APIENTRY u_SetInputLayout(D3D10DDI_HDEVICE hd, D3D10DDI_HELEMENTLAYOUT l)
 {
+    ulog_call("SetInputLayout");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetInputLayout);
     put32(b, H(l));
     call_async(b);
@@ -1009,6 +1036,7 @@ STAGE(Cs, CS)
 
 static void APIENTRY u_SetTopology(D3D10DDI_HDEVICE hd, D3D10_DDI_PRIMITIVE_TOPOLOGY t)
 {
+    ulog_call("SetTopology");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetPrimitiveTopology);
     put32(b, (uint32_t)t);
     call_async(b);
@@ -1016,6 +1044,7 @@ static void APIENTRY u_SetTopology(D3D10DDI_HDEVICE hd, D3D10_DDI_PRIMITIVE_TOPO
 
 static void APIENTRY u_SetVertexBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HRESOURCE *v, const UINT *strides, const UINT *offsets)
 {
+    ulog_call("SetVertexBuffers");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetVertexBuffers);
     put32(b, start);
     put32(b, n);
@@ -1027,6 +1056,7 @@ static void APIENTRY u_SetVertexBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n,
 
 static void APIENTRY u_SetIndexBuffer(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, DXGI_FORMAT f, UINT offset)
 {
+    ulog_call("SetIndexBuffer");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetIndexBuffer);
     put32(b, H(r));
     put32(b, (uint32_t)f);
@@ -1038,6 +1068,7 @@ static void APIENTRY u_SetIndexBuffer(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r,
 
 static void APIENTRY u_CreateShaderResourceView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *a, D3D10DDI_HSHADERRESOURCEVIEW hv, D3D10DDI_HRTSHADERRESOURCEVIEW)
 {
+    ulog_call("CreateShaderResourceView");
     Dev *d = DV(hd);
     Obj *v = new (hv.pDrvPrivate) Obj();
     Obj *res = O(a->hDrvResource);
@@ -1099,6 +1130,7 @@ static void APIENTRY u_CreateShaderResourceView(D3D10DDI_HDEVICE hd, const D3D11
 
 static void APIENTRY u_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *a, D3D10DDI_HDEPTHSTENCILVIEW hv, D3D10DDI_HRTDEPTHSTENCILVIEW)
 {
+    ulog_call("CreateDepthStencilView");
     Dev *d = DV(hd);
     Obj *v = new (hv.pDrvPrivate) Obj();
     Obj *res = O(a->hDrvResource);
@@ -1133,6 +1165,7 @@ static void APIENTRY u_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D11DD
 
 static void APIENTRY u_CreateUnorderedAccessView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *a, D3D11DDI_HUNORDEREDACCESSVIEW hv, D3D11DDI_HRTUNORDEREDACCESSVIEW)
 {
+    ulog_call("CreateUnorderedAccessView");
     Dev *d = DV(hd);
     Obj *v = new (hv.pDrvPrivate) Obj();
     Obj *res = O(a->hDrvResource);
@@ -1173,6 +1206,7 @@ static void APIENTRY u_CreateUnorderedAccessView(D3D10DDI_HDEVICE hd, const D3D1
 static void APIENTRY u_SetRenderTargets(D3D10DDI_HDEVICE hd, const D3D10DDI_HRENDERTARGETVIEW *rtv, UINT n, UINT, D3D10DDI_HDEPTHSTENCILVIEW dsv,
                                         const D3D11DDI_HUNORDEREDACCESSVIEW *uav, const UINT *counts, UINT uavStart, UINT nUav, UINT, UINT)
 {
+    ulog_call("SetRenderTargets");
     Dev *d = DV(hd);
     struct wbuf *b;
     if (!nUav) {
@@ -1195,6 +1229,7 @@ static void APIENTRY u_SetRenderTargets(D3D10DDI_HDEVICE hd, const D3D10DDI_HREN
 
 static void APIENTRY u_ClearDepthStencilView(D3D10DDI_HDEVICE hd, D3D10DDI_HDEPTHSTENCILVIEW v, UINT flags, FLOAT depth, UINT8 stencil)
 {
+    ulog_call("ClearDepthStencilView");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ClearDepthStencilView);
     put32(b, H(v));
     put32(b, flags);
@@ -1205,6 +1240,7 @@ static void APIENTRY u_ClearDepthStencilView(D3D10DDI_HDEVICE hd, D3D10DDI_HDEPT
 
 static void APIENTRY u_ClearUnorderedAccessViewUint(D3D10DDI_HDEVICE hd, D3D11DDI_HUNORDEREDACCESSVIEW v, const UINT c[4])
 {
+    ulog_call("ClearUnorderedAccessViewUint");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ClearUnorderedAccessViewUint);
     put32(b, H(v));
     put_arr(b, c, 4, 4);
@@ -1213,6 +1249,7 @@ static void APIENTRY u_ClearUnorderedAccessViewUint(D3D10DDI_HDEVICE hd, D3D11DD
 
 static void APIENTRY u_ClearUnorderedAccessViewFloat(D3D10DDI_HDEVICE hd, D3D11DDI_HUNORDEREDACCESSVIEW v, const FLOAT c[4])
 {
+    ulog_call("ClearUnorderedAccessViewFloat");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ClearUnorderedAccessViewFloat);
     put32(b, H(v));
     put_arr(b, c, 4, 4);
@@ -1221,6 +1258,7 @@ static void APIENTRY u_ClearUnorderedAccessViewFloat(D3D10DDI_HDEVICE hd, D3D11D
 
 static void APIENTRY u_CsSetUnorderedAccessViews(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D11DDI_HUNORDEREDACCESSVIEW *v, const UINT *counts)
 {
+    ulog_call("CsSetUnorderedAccessViews");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_CSSetUnorderedAccessViews);
     put32(b, start);
     put32(b, n);
@@ -1233,6 +1271,7 @@ static void APIENTRY u_CsSetUnorderedAccessViews(D3D10DDI_HDEVICE hd, UINT start
 
 static void APIENTRY u_Draw(D3D10DDI_HDEVICE hd, UINT count, UINT start)
 {
+    ulog_call("Draw");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Draw);
     put32(b, count);
     put32(b, start);
@@ -1241,6 +1280,7 @@ static void APIENTRY u_Draw(D3D10DDI_HDEVICE hd, UINT count, UINT start)
 
 static void APIENTRY u_DrawIndexed(D3D10DDI_HDEVICE hd, UINT count, UINT start, INT base)
 {
+    ulog_call("DrawIndexed");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawIndexed);
     put32(b, count);
     put32(b, start);
@@ -1250,6 +1290,7 @@ static void APIENTRY u_DrawIndexed(D3D10DDI_HDEVICE hd, UINT count, UINT start, 
 
 static void APIENTRY u_DrawInstanced(D3D10DDI_HDEVICE hd, UINT count, UINT inst, UINT start, UINT start_inst)
 {
+    ulog_call("DrawInstanced");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawInstanced);
     put32(b, count);
     put32(b, inst);
@@ -1260,6 +1301,7 @@ static void APIENTRY u_DrawInstanced(D3D10DDI_HDEVICE hd, UINT count, UINT inst,
 
 static void APIENTRY u_DrawIndexedInstanced(D3D10DDI_HDEVICE hd, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
+    ulog_call("DrawIndexedInstanced");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawIndexedInstanced);
     put32(b, count);
     put32(b, inst);
@@ -1271,6 +1313,7 @@ static void APIENTRY u_DrawIndexedInstanced(D3D10DDI_HDEVICE hd, UINT count, UIN
 
 static void APIENTRY u_DrawInstancedIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT off)
 {
+    ulog_call("DrawInstancedIndirect");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawInstancedIndirect);
     put32(b, H(r));
     put32(b, off);
@@ -1279,6 +1322,7 @@ static void APIENTRY u_DrawInstancedIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESO
 
 static void APIENTRY u_DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT off)
 {
+    ulog_call("DrawIndexedInstancedIndirect");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawIndexedInstancedIndirect);
     put32(b, H(r));
     put32(b, off);
@@ -1287,6 +1331,7 @@ static void APIENTRY u_DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hd, D3D10DD
 
 static void APIENTRY u_Dispatch(D3D10DDI_HDEVICE hd, UINT x, UINT y, UINT z)
 {
+    ulog_call("Dispatch");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Dispatch);
     put32(b, x);
     put32(b, y);
@@ -1296,6 +1341,7 @@ static void APIENTRY u_Dispatch(D3D10DDI_HDEVICE hd, UINT x, UINT y, UINT z)
 
 static void APIENTRY u_DispatchIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT off)
 {
+    ulog_call("DispatchIndirect");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DispatchIndirect);
     put32(b, H(r));
     put32(b, off);
@@ -1307,6 +1353,7 @@ static void APIENTRY u_DispatchIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE 
 static void APIENTRY u_ResourceCopyRegion(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT dsub, UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT ssub,
                                           const D3D10_DDI_BOX *box, UINT)
 {
+    ulog_call("ResourceCopyRegion");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_CopySubresourceRegion);
     put32(b, H(dst));
     put32(b, dsub);
@@ -1337,11 +1384,13 @@ static void update_subresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT 
 
 static void APIENTRY u_ResourceUpdateSubresourceUP(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT p, UINT sp, UINT)
 {
+    ulog_call("ResourceUpdateSubresourceUP");
     update_subresource(hd, r, sub, box, src, p, sp);
 }
 
 static void APIENTRY u_ResourceResolveSubresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT dsub, D3D10DDI_HRESOURCE src, UINT ssub, DXGI_FORMAT f)
 {
+    ulog_call("ResourceResolveSubresource");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ResolveSubresource);
     put32(b, H(dst));
     put32(b, dsub);
@@ -1353,6 +1402,7 @@ static void APIENTRY u_ResourceResolveSubresource(D3D10DDI_HDEVICE hd, D3D10DDI_
 
 static void APIENTRY u_GenMips(D3D10DDI_HDEVICE hd, D3D10DDI_HSHADERRESOURCEVIEW v)
 {
+    ulog_call("GenMips");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_GenerateMips);
     put32(b, H(v));
     call_async(b);
@@ -1360,6 +1410,7 @@ static void APIENTRY u_GenMips(D3D10DDI_HDEVICE hd, D3D10DDI_HSHADERRESOURCEVIEW
 
 static void APIENTRY u_SetResourceMinLOD(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, FLOAT lod)
 {
+    ulog_call("SetResourceMinLOD");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_SetResourceMinLOD);
     put32(b, H(r));
     put(b, &lod, 4);
@@ -1368,6 +1419,7 @@ static void APIENTRY u_SetResourceMinLOD(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE
 
 static void APIENTRY u_CopyStructureCount(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT off, D3D11DDI_HUNORDEREDACCESSVIEW v)
 {
+    ulog_call("CopyStructureCount");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_CopyStructureCount);
     put32(b, H(dst));
     put32(b, off);
@@ -1381,6 +1433,7 @@ static BOOL APIENTRY u_ResourceIsStagingBusy(D3D10DDI_HDEVICE, D3D10DDI_HRESOURC
 
 static uint32_t query_type(uint32_t q)
 {
+    ulog_call("ResourceIsStagingBusy");
     if (q <= 7) return q;            /* the ten's numbers are the eleven's */
     if (q == 8) return 4;            /* the pipeline statistics of eleven */
     if (q >= 9 && q <= 12) return q - 1;
@@ -1392,6 +1445,8 @@ static SIZE_T APIENTRY u_CalcPrivateQuerySize(D3D10DDI_HDEVICE, const D3D10DDIAR
 
 static void APIENTRY u_CreateQuery(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATEQUERY *a, D3D10DDI_HQUERY hq, D3D10DDI_HRTQUERY)
 {
+    ulog_call("CalcPrivateQuerySize");
+    ulog_call("CreateQuery");
     Obj *o = new (hq.pDrvPrivate) Obj();
     uint32_t t = query_type((uint32_t)a->Query);
     if (t == 0xFFFFFFFFu) {
@@ -1404,6 +1459,7 @@ static void APIENTRY u_CreateQuery(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATE
 
 static void APIENTRY u_QueryBegin(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
 {
+    ulog_call("QueryBegin");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Begin);
     put32(b, H(q));
     call_async(b);
@@ -1411,6 +1467,7 @@ static void APIENTRY u_QueryBegin(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
 
 static void APIENTRY u_QueryEnd(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
 {
+    ulog_call("QueryEnd");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_End);
     put32(b, H(q));
     put32(b, 0);  /* no result slot: GetData asks the phone */
@@ -1420,6 +1477,7 @@ static void APIENTRY u_QueryEnd(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
 
 static void APIENTRY u_QueryGetData(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, void *data, UINT size, UINT flags)
 {
+    ulog_call("QueryGetData");
     Dev *d = DV(hd);
     struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_GetData);
     put32(b, H(q));
@@ -1435,6 +1493,7 @@ static void APIENTRY u_QueryGetData(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, void
 
 static void APIENTRY u_SetPredication(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, BOOL v)
 {
+    ulog_call("SetPredication");
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_SetPredication);
     put32(b, H(q));
     put32(b, (uint32_t)v);
@@ -1566,20 +1625,174 @@ template <class Tbl> static void fill_device_funcs(Tbl *t)
 
 /* ---- the DXGI entries the runtime asks of the driver ---- */
 
+/* ---- DXGI: present and the rest ---- */
+
+/* The window a program presents to is not told to the driver: DXGI has it, and shows it only to the kernel.
+ * Until the display driver (wddm/README.md, phase 6) there is no kernel allocation to hand over, so a frame is
+ * read back from the phone and drawn into the program's window with GDI. This is the one copy back to Windows
+ * the plan lists, for windowed programs only. The window is the program's visible top-level window whose
+ * client area is the size of the frame, the foreground one when there are several. */
+struct FindWin {
+    DWORD pid;
+    UINT w, h;
+    HWND best;
+};
+
+static BOOL CALLBACK find_win(HWND w, LPARAM lp)
+{
+    FindWin *f = reinterpret_cast<FindWin *>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    RECT rc;
+    if (pid != f->pid || !IsWindowVisible(w) || !GetClientRect(w, &rc)) return TRUE;
+    if ((UINT)rc.right != f->w || (UINT)rc.bottom != f->h) return TRUE;
+    if (!f->best || w == GetForegroundWindow()) f->best = w;
+    return TRUE;
+}
+
+static HRESULT present_surface(Dev *d, Obj *src);
+
+static HRESULT __stdcall u_dxgi_present(DXGI_DDI_ARG_PRESENT *a)
+{
+    ulog_call("dxgi Present");
+    return present_surface(reinterpret_cast<Dev *>(a->hDevice), reinterpret_cast<Obj *>(a->hSurfaceToPresent));
+}
+
+/* The same with a list of surfaces: the first one is the frame. */
+static HRESULT __stdcall u_dxgi_present1(DXGI_DDI_ARG_PRESENT1 *a)
+{
+    ulog_call("dxgi Present1");
+    if (!a->SurfacesToPresent) return S_OK;
+    return present_surface(reinterpret_cast<Dev *>(a->hDevice), reinterpret_cast<Obj *>(a->phSurfacesToPresent[0].hSurface));
+}
+
+static HRESULT present_surface(Dev *d, Obj *src)
+{
+    if (!d || !src || src->dim != 3) {
+        ulog("hwd3d_umd: present of something that is not a 2D resource\n");
+        return S_OK;
+    }
+    uint32_t w = src->r.width, h = src->r.height, fmt = src->r.format;
+    if (fmt != DXGI_FORMAT_R8G8B8A8_UNORM && fmt != DXGI_FORMAT_B8G8R8A8_UNORM && fmt != DXGI_FORMAT_B8G8R8X8_UNORM &&
+        fmt != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && fmt != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+        return S_OK;
+    FindWin f = {GetCurrentProcessId(), w, h, nullptr};
+    EnumWindows(find_win, reinterpret_cast<LPARAM>(&f));
+    if (!f.best) {
+        ulog("hwd3d_umd: present: no window of %ux%u\n", w, h);
+        return S_OK;
+    }
+    if (!d->pstage || d->pstage->r.width != w || d->pstage->r.height != h || d->pstage->r.format != fmt) {
+        if (d->pstage) {
+            release_obj(d->pstage);
+        } else {
+            d->pstage = new Obj();
+        }
+        *d->pstage = Obj();
+        D3D11_TEXTURE2D_DESC td = {w, h, 1, 1, (DXGI_FORMAT)fmt, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+        {   /* the description, no first data, and the object wanted */
+            struct wbuf *cb = dc(d, HMX_ID3D11Device_CreateTexture2D);
+            put_arr(cb, &td, 1, sizeof td);
+            put32(cb, 0);
+            put32(cb, 1);
+            struct rd cr;
+            HRESULT chr = (HRESULT)call_wait(cb, &cr);
+            d->pstage->h = take32(&cr);
+            call_end(&cr);
+            if (FAILED(chr)) d->pstage->h = 0;
+        }
+        d->pstage->dim = 3;
+        d->pstage->r = {3, fmt, w, h, 1, 1};
+        d->pstage->subs = 1;
+        d->pstage->array = 1;
+        d->pstage->samples = 1;
+        d->pstage->usage = 3;
+    }
+    if (!d->pstage->h) return S_OK;
+    struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_CopyResource);
+    put32(b, d->pstage->h);
+    put32(b, src->h);
+    call_async(b);
+    D3D10DDI_HDEVICE hd = {d};
+    D3D10DDI_HRESOURCE hr = {d->pstage};
+    D3D10DDI_MAPPED_SUBRESOURCE m = {};
+    map_phone(hd, hr, 0, D3D10_DDI_MAP_READ, 0, &m);
+    if (m.pData) {
+        HDC dc = GetDC(f.best);
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = (LONG)(m.RowPitch / 4);
+        bi.bmiHeader.biHeight = -(LONG)h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+            uint8_t *p = static_cast<uint8_t *>(m.pData);  /* the copy is ours: swap red and blue in place */
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++) {
+                    uint8_t *px = p + (size_t)y * m.RowPitch + x * 4;
+                    uint8_t t = px[0];
+                    px[0] = px[2];
+                    px[2] = t;
+                }
+        }
+        SetDIBitsToDevice(dc, 0, 0, w, h, 0, 0, 0, h, m.pData, &bi, DIB_RGB_COLORS);
+        ReleaseDC(f.best, dc);
+    }
+    u_Unmap(hd, hr, 0);
+    return S_OK;
+}
+
+/* A flip swaps what the back buffers are: the first takes the second's contents, and so on. */
+static HRESULT __stdcall u_dxgi_rotate(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *a)
+{
+    ulog_call("dxgi Rotate");
+    if (a->Resources < 2) return S_OK;
+    Obj *first = reinterpret_cast<Obj *>(a->pResources[0]);
+    Obj keep = *first;
+    for (UINT i = 0; i + 1 < a->Resources; i++)
+        *reinterpret_cast<Obj *>(a->pResources[i]) = *reinterpret_cast<Obj *>(a->pResources[i + 1]);
+    *reinterpret_cast<Obj *>(a->pResources[a->Resources - 1]) = keep;
+    return S_OK;
+}
+
+static HRESULT __stdcall u_dxgi_residency(DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *a)
+{
+    for (SIZE_T i = 0; i < a->Resources; i++) a->pStatus[i] = DXGI_DDI_RESIDENCY_FULLY_RESIDENT;
+    return S_OK;
+}
+
+static HRESULT __stdcall u_dxgi_priority(DXGI_DDI_ARG_SETRESOURCEPRIORITY *) { return S_OK; }
+
 /* The DXGI entries are all one shape, an answer and one pointer to arguments. Each table is the entries of
  * the one before it and more, so the table the runtime gave is filled to its size. */
-static HRESULT __stdcall dxgi_stub(void *)
+template <int N> static HRESULT __stdcall dxgi_stub(void *)
 {
-    ulog("hwd3d_umd: a DXGI entry is not done yet\n");
+    static const char *const names[] = {"Present", "GetGammaCaps", "SetDisplayMode", "SetResourcePriority", "QueryResourceResidency",
+                                        "RotateResourceIdentities", "Blt", "ResolveSharedResource", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31"};
+    ulog("hwd3d_umd: DXGI entry %s is not done yet\n", names[N]);
     return E_NOTIMPL;
 }
+#define DXGI_STUBS \
+    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)
 
 static void fill_dxgi(DXGI_DDI_BASE_ARGS *a, UINT interface_version)
 {
     size_t n = sizeof(DXGI1_1_DDI_BASE_FUNCTIONS);
     if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) n = sizeof(DXGI1_3_DDI_BASE_FUNCTIONS);
     void **f = reinterpret_cast<void **>(a->pDXGIDDIBaseFunctions2);
-    for (size_t i = 0; i < n / sizeof(void *); i++) f[i] = reinterpret_cast<void *>(dxgi_stub);
+    static void *const stubs[] = {
+#define X(i) reinterpret_cast<void *>(dxgi_stub<i>),
+        DXGI_STUBS
+#undef X
+    };
+    for (size_t i = 0; i < n / sizeof(void *) && i < sizeof stubs / sizeof *stubs; i++) f[i] = stubs[i];
+    DXGI1_3_DDI_BASE_FUNCTIONS *t = a->pDXGIDDIBaseFunctions4;
+    t->pfnPresent = u_dxgi_present;
+    t->pfnRotateResourceIdentities = u_dxgi_rotate;
+    t->pfnPresent1 = u_dxgi_present1;
+    t->pfnQueryResourceResidency = u_dxgi_residency;
+    t->pfnSetResourcePriority = u_dxgi_priority;
 }
 
 /* ---- the adapter ---- */
@@ -1604,8 +1817,12 @@ static bool windows_own_program()
     return n && m > n && !_wcsnicmp(exe, win, n);
 }
 
+/* Sub-objects are the video functions; the driver has none, and the runtime calls this to find out. */
+static HRESULT APIENTRY u_RetrieveSubObject(D3D10DDI_HDEVICE, UINT32, SIZE_T, void *, SIZE_T, void *) { return E_NOTIMPL; }
+
 static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVICE *a)
 {
+    ulog_call("RetrieveSubObject");
     ulog("hwd3d_umd: CreateDevice, interface 0x%x, version %u, flags 0x%x\n", a->Interface, a->Version, a->Flags);
     if (a->Interface != D3DWDDM1_3_DDI_INTERFACE_VERSION) {
         ulog("hwd3d_umd: no table for that interface\n");
@@ -1648,6 +1865,12 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
         if (SUCCEEDED(kh)) d->kctx = cc.hContext;
     }
     fill_device_funcs(a->pWDDM1_3DeviceFuncs);
+    if (a->ppfnRetrieveSubObject) *a->ppfnRetrieveSubObject = u_RetrieveSubObject;
+    {   /* a table entry left empty is a call to zero when the runtime uses it */
+        void **t = reinterpret_cast<void **>(a->pWDDM1_3DeviceFuncs);
+        for (size_t i = 0; i < sizeof(D3DWDDM1_3DDI_DEVICEFUNCS) / sizeof(void *); i++)
+            if (!t[i]) ulog("hwd3d_umd: device table entry %u is empty\n", (unsigned)i);
+    }
     fill_dxgi(&a->DXGIBaseDDI, a->Interface);
     ulog("hwd3d_umd: device %u, context %u\n", d->hdev, d->hctx);
     return S_OK;
@@ -1717,9 +1940,45 @@ extern "C" HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER *a)
     return S_OK;
 }
 
+/* With HWD3D_UMDLOG set, a crash of the program leaves where it was in the log: the module and offset. */
+static LONG WINAPI on_crash(EXCEPTION_POINTERS *p)
+{
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)p->ExceptionRecord->ExceptionAddress, &m))
+        GetModuleFileNameA(m, name, sizeof name);
+    ulog("hwd3d_umd: crash 0x%08lx at %p (%s +0x%llx)\n", (unsigned long)p->ExceptionRecord->ExceptionCode, p->ExceptionRecord->ExceptionAddress, name,
+         (unsigned long long)((uintptr_t)p->ExceptionRecord->ExceptionAddress - (uintptr_t)m));
+#ifdef _M_ARM64
+    {
+        HMODULE lm = NULL;
+        char lname[MAX_PATH] = "?";
+        void *lr = (void *)p->ContextRecord->Lr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)lr, &lm)) GetModuleFileNameA(lm, lname, sizeof lname);
+        ulog("hwd3d_umd:   called from %p (%s +0x%llx)\n", lr, lname, (unsigned long long)((uintptr_t)lr - (uintptr_t)lm));
+        uintptr_t *fp = (uintptr_t *)p->ContextRecord->Fp;
+        for (int i = 0; i < 8 && fp && !IsBadReadPtr(fp, 16); i++) {
+            void *ra = (void *)fp[1];
+            HMODULE rm = NULL;
+            char rn[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ra, &rm)) GetModuleFileNameA(rm, rn, sizeof rn);
+            ulog("hwd3d_umd:   frame %p (%s +0x%llx)\n", ra, rn, (unsigned long long)((uintptr_t)ra - (uintptr_t)rm));
+            uintptr_t *next = (uintptr_t *)fp[0];
+            if (next <= fp) break;
+            fp = next;
+        }
+        ulog("hwd3d_umd:   x0 %llx x1 %llx x2 %llx x16 %llx x17 %llx\n", (unsigned long long)p->ContextRecord->X0, (unsigned long long)p->ContextRecord->X1,
+             (unsigned long long)p->ContextRecord->X2, (unsigned long long)p->ContextRecord->X16, (unsigned long long)p->ContextRecord->X17);
+    }
+#endif
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 /* At exit the program's own submit counts go to the log (HWD3D_UMDLOG), for the baseline in wddm/README.md. */
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
 {
+    char v[8];
+    if (reason == DLL_PROCESS_ATTACH && GetEnvironmentVariableA("HWD3D_UMDLOG", v, sizeof v)) SetUnhandledExceptionFilter(on_crash);
     if (reason == DLL_PROCESS_DETACH && g_chan) {
         const struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
         ulog("hwd3d_umd: submits to the phone %llu, to Windows %llu\n", (unsigned long long)c->submits_to_phone,
