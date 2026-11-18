@@ -463,7 +463,13 @@ What the work found, for whoever picks it up:
   DXVK and applies those rules (`ddi_format_bits`).
 - **Pipeline levels.** Caps word 130 with the 11.0 bit set makes the runtime close
   the adapter right after the caps, before it asks for a device size. With 10.0 and
-  10.1 it goes on. Not solved: what 11.0 needs, so the adapter reports 10.1 for now.
+  10.1 it goes on. Not solved: what 11.0 needs, so the adapter reported 10.1 for a while.
+- **Level 11.0 (later the same day).** The runtime wants shader caps with
+  `COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X` before it takes an adapter
+  that claims 11.0. With that the adapter reports 11.0, and `d3dfeat` passes whole
+  (deferred context, MSAA resolve, compute with a UAV read-back, occlusion query).
+  DXVK checks the container checksum (the driver builds the container, MD5 with the
+  format's own padding), which was the compute shader's last blocker.
 - **Result.** `dxtest 11` passes with nothing beside it, through Windows' own
   `d3d11.dll`: the device is made on the HyperWin GPU (feature level 10.1), a
   target is cleared on the phone, copied to a staging resource and read back

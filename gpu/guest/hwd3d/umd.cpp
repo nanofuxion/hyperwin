@@ -750,6 +750,75 @@ static std::vector<uint8_t> sig_chunk(const Sig *e, uint32_t n, bool output)
     return body;
 }
 
+/* The container's checksum. DXVK checks it. It is MD5 over everything after the checksum, with the padding
+ * and the length written the way the format does (the length in bits first, then (size << 1) | 1 last). */
+static void md5_block(uint32_t st[4], const uint8_t *blk)
+{
+    static const uint8_t sh[64] = {7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+                                   4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+    static uint32_t K[64];
+    static bool init;
+    if (!init) {
+        /* floor(abs(sin(i + 1)) * 2^32), written out so there is no math library */
+        static const uint32_t k[64] = {
+            0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1,
+            0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453,
+            0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942,
+            0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+            0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d,
+            0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
+        memcpy(K, k, sizeof K);
+        init = true;
+    }
+    uint32_t m[16];
+    memcpy(m, blk, 64);
+    uint32_t a = st[0], b = st[1], c = st[2], d = st[3];
+    for (uint32_t i = 0; i < 64; i++) {
+        uint32_t f, g;
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+        else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+        f = f + a + K[i] + m[g];
+        a = d;
+        d = c;
+        c = b;
+        b = b + ((f << sh[i]) | (f >> (32 - sh[i])));
+    }
+    st[0] += a;
+    st[1] += b;
+    st[2] += c;
+    st[3] += d;
+}
+
+static void dxbc_checksum(std::vector<uint8_t> &v)
+{
+    const uint8_t *d = v.data() + 20;
+    uint32_t size = (uint32_t)v.size() - 20, st[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476}, i = 0;
+    for (; size - i >= 64; i += 64) md5_block(st, d + i);
+    uint32_t n = size - i;
+    uint8_t blk[64];
+    uint32_t bits = size * 8, tail = (size * 2) | 1;
+    if (n >= 56) {
+        memset(blk, 0, 64);
+        memcpy(blk, d + i, n);
+        blk[n] = 0x80;
+        md5_block(st, blk);
+        memset(blk, 0, 64);
+        memcpy(blk, &bits, 4);
+        memcpy(blk + 60, &tail, 4);
+        md5_block(st, blk);
+    } else {
+        memset(blk, 0, 64);
+        memcpy(blk, &bits, 4);
+        memcpy(blk + 4, d + i, n);
+        blk[4 + n] = 0x80;
+        memcpy(blk + 60, &tail, 4);
+        md5_block(st, blk);
+    }
+    memcpy(v.data() + 4, st, 16);
+}
+
 static std::vector<uint8_t> dxbc(const UINT *code, const std::vector<Sig> *in, const std::vector<Sig> *out)
 {
     uint32_t words = code[1], major = (code[0] >> 4) & 0xF;
@@ -764,7 +833,7 @@ static std::vector<uint8_t> dxbc(const UINT *code, const std::vector<Sig> *in, c
     for (auto &c : chunks) total += 8 + (uint32_t)c.body.size();
     std::vector<uint8_t> v;
     put_u32(v, 'CBXD');
-    for (int i = 0; i < 4; i++) put_u32(v, 0);  /* the checksum: DXVK does not look */
+    for (int i = 0; i < 4; i++) put_u32(v, 0);  /* the checksum, set at the end */
     put_u32(v, 1);
     put_u32(v, total);
     put_u32(v, (uint32_t)chunks.size());
@@ -778,6 +847,7 @@ static std::vector<uint8_t> dxbc(const UINT *code, const std::vector<Sig> *in, c
         put_u32(v, (uint32_t)c.body.size());
         v.insert(v.end(), c.body.begin(), c.body.end());
     }
+    dxbc_checksum(v);
     return v;
 }
 
@@ -798,6 +868,15 @@ static void make_shader(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, 
         out = sigs_of(sg->pOutputSignature, sg->NumOutputSignatureEntries);
     }
     std::vector<uint8_t> bc = dxbc(code, sg ? &in : nullptr, sg ? &out : nullptr);
+    char dump[MAX_PATH];
+    if (GetEnvironmentVariableA("HWD3D_DUMPSHADER", dump, sizeof dump)) {  /* the container built, for reading it */
+        HANDLE f = CreateFileA(dump, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD n;
+            WriteFile(f, bc.data(), (DWORD)bc.size(), &n, NULL);
+            CloseHandle(f);
+        }
+    }
     struct wbuf *b = dc(d, method);
     put_arr(b, bc.data(), bc.size(), 1);
     uint64_t len = bc.size();
@@ -1601,16 +1680,21 @@ static HRESULT APIENTRY a_GetCaps(D3D10DDI_HADAPTER, const D3D10_2DDIARG_GETCAPS
         *static_cast<UINT *>(c->pData) = (UINT)strtoul(e, NULL, 16);
         return S_OK;
     }
-    switch (c->Type) {    case D3D11DDICAPS_THREADING:
+    switch (c->Type) {    case D3D11DDICAPS_SHADER:
+        /* Compute and raw or structured buffers on every level: without this word the runtime turns the
+         * adapter away when it claims 11.0. */
+        if (c->DataSize >= 4) *static_cast<UINT *>(c->pData) = D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X;
+        break;
+    case D3D11DDICAPS_THREADING:
         /* Calls from several threads are safe: the channel takes one at a time. No command lists: the
          * runtime records deferred contexts itself and replays them on this one. */
         if (c->DataSize >= 4) *static_cast<UINT *>(c->pData) = D3D11DDICAPS_FREETHREADED;
         break;
     case D3D11DDICAPS_3DPIPELINESUPPORT:
-        /* Levels 10.0 and 10.1. Claiming 11.0 as well makes the runtime refuse the adapter before it asks for
-         * a device; what it wants for that is not found yet (wddm/README.md, phase 4). */
+        /* Levels 10.0, 10.1 and 11.0, which the phone's DXVK gives. 11.0 needs the shader caps below. */
         if (c->DataSize >= 4) *static_cast<UINT *>(c->pData) = D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0) |
-                                                                 D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1);
+                                                                 D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) |
+                                                                 D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0);
         break;
     default:
         break;  /* zeroes: no optional feature */
