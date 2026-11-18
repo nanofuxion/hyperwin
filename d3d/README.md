@@ -208,6 +208,33 @@ exit, as they would when a PC's driver updates.
    command lists and placed heaps fit remoting less well, so decide after
    phase 4's numbers.
 
+## Phase 0 result (2026-11-18): it is faster
+
+`gpu/host/hwd3d/build.sh` builds DXVK 3.1.1's native build for Android with
+`dxvk-android.patch`: an Android WSI (a window is an `ANativeWindow`) and
+Vulkan from the driver wrapper named by `HWGPU_VK_LOADER`. `hwd3d_cube`
+(`cube.cpp`) draws the AIO Graphics Test's D3D11 spin cube: the same geometry,
+the same shaders (`spin_dxbc.inc`, compiled once by Windows' `d3dcompiler_47`,
+since Android has none), depth, a one-buffer discard swap chain and
+`Present(0, 0)`. It presents into an `AImageReader`'s window, so frames go
+through a real Android buffer queue with no display.
+
+| Path, Pixel 6 Pro, Mali | D3D11 cube |
+|---|---|
+| DXVK in Windows, through gfxstream | 104 FPS |
+| Vulkan cube in Windows, for scale | 312 FPS |
+| **DXVK on the phone, 1280x720** | **363 FPS** (15 s, 254 to 658 a second) |
+
+So HwD3D goes ahead. Notes from the run:
+
+- DXVK needs Vortek here too. On the bare Mali driver it finds no adapter
+  ("A Vulkan 1.3 capable setup is required"). Through `libvulkan_vortek.so` it
+  makes a feature level 11_0 device.
+- No graphics pipeline library and no external memory features on this stack.
+- DXVK writes its cache under `$XDG_CACHE_HOME` or `$HOME/.cache`, so the host
+  must set one. In `adb shell` it aborted on the read-only root.
+- The Windows VM was running, idle, during the test, as it will be for real.
+
 ## Things to check early
 
 - DXVK's native build on bionic: its threading, `dlopen` of Vulkan, and the
