@@ -126,6 +126,48 @@ Delete the dead shared-memory pad path listed above, once types 5 and 6 work.
   PlayStation buttons and glyphs, chosen per controller.
 - An on-screen touch gamepad that feeds a slot, for phones with no controller.
 
+## As built (2026-11-18)
+
+- **Four players.** Message 5 as planned. Message 3 still goes for player 1,
+  for a driver from before. The pad device has four XUSB interfaces,
+  `pad0` to `pad3`. Each is on only while its player is connected. A handle
+  learns its player from the reference string it opened.
+- **User indices.** XInput gives each interface the index of the LED the driver
+  reports, 6 + slot. So slot n is XInput user n. XInput then sets that LED with
+  `XUSB_SET_STATE` flags 1.
+- **`XUSB_SET_STATE` on this build:** `00, LED, left motor, right motor, flags`.
+  Flags 1 set the LED, 2 the motors. LED-only calls are not forwarded.
+- **The way back** is a second vsock port, `HW_VSOCK_PORT_INPUT_BACK` (5653).
+  The input socket is synchronous, so a write on it would wait behind its
+  read. The app connects to it and reads message 6.
+- **Rumble:** one 1 s shot, restarted on each change. Two vibrators split the
+  motors, one takes the stronger. Player 1 on the phone uses
+  `max(left, right × 0.6)` as a 1 s repeating waveform, `USAGE_MEDIA`. It stops
+  after 10 s unchanged, and when the app or the Windows screen goes away.
+  Settings has one "Rumble" switch for everything, and "Player 1 rumble on the
+  phone": Auto, Phone, Controller only.
+- **HID twin, player 1 only.** Instead of a new `hwvspad.sys`, `hwhid.sys` also
+  runs a second root device, `Root\VID_045E&PID_028E&IG_00`. hidclass builds
+  the HID IDs from it, so they carry `IG_00` as a real Xbox 360 pad's do.
+  `hwvsinput.sys` hands each pad update over through the callback object
+  `\Callback\HyperWinPad`. Only player 1 has a twin. A twin is always there,
+  and DirectInput games would see four idle pads with four.
+- **Windows.Gaming.Input:** `RawGameController` sees the twin. `Gamepad` sees
+  neither the XUSB pads nor the twin. Games on that class still miss out.
+- **Cleanup done:** `WindowBridge.nativePad`, `hw_set_pad` and the bootstrap
+  `xinput.c` are gone. The `hw_header` pad fields stay, so the layout the
+  EFI tools share does not move.
+
+Measured on the Pixel, with made-up controllers from the debug broadcast
+`dev.hyperwin.app.PAD`: XInput saw players 1 and 3 with the right buttons and
+sticks, and nothing at 2 and 4. `XInputSetState` on player 3 reached the app
+as 200 and 100. Player 1's rumble ran the phone's motor with media usage. The
+twin's WinMM joystick followed: X 16767 for a stick at -16000, button 2 for B,
+D-pad up.
+
+Not checked yet, needing real controllers: replugging keeps the slot, rumble
+on a controller's own motors, an SDL game, Steam and a DirectInput game.
+
 ## Phases
 
 1. Four slots in the app and driver, with message 5. Test with

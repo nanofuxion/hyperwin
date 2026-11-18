@@ -273,6 +273,17 @@ class HomeScreen(
             MainActivity.GAME_MOUSE_MODES.indexOf(prefs.getString(MainActivity.GAME_MOUSE, "auto")).coerceAtLeast(0)) { i ->
             prefs.edit().putString(MainActivity.GAME_MOUSE, MainActivity.GAME_MOUSE_MODES[i]).apply()
         },
+        Ui.switchRow(ctx, "Rumble", "Games' rumble reaches the controllers, and the phone as set below. Off: no rumble at all.",
+            prefs.getBoolean(GamepadInput.RUMBLE, true)) { on ->
+            prefs.edit().putBoolean(GamepadInput.RUMBLE, on).apply()
+            if (!on) GamepadInput.stopAllRumble()
+        },
+        Ui.row(ctx, "Player 1 rumble on the phone",
+            "Auto: when player 1's controller has no motors, like most clip-on ones. Uses the media vibration strength."),
+        Ui.segmented(ctx, listOf("Auto", "Phone", "Controller only"),
+            GamepadInput.PHONE_RUMBLE_MODES.indexOf(prefs.getString(GamepadInput.PHONE_RUMBLE, "auto")).coerceAtLeast(0)) { i ->
+            prefs.edit().putString(GamepadInput.PHONE_RUMBLE, GamepadInput.PHONE_RUMBLE_MODES[i]).apply()
+        },
         Ui.row(ctx, "Mouse speed in games", "For high-resolution mice. 1x is the mouse's own counts."),
         Ui.slider(ctx, 0.25f, 4f, 0.25f, prefs.getFloat(MainActivity.GAME_SPEED, 1f), { "%.2fx".format(it) }) { v ->
             prefs.edit().putFloat(MainActivity.GAME_SPEED, v).apply()

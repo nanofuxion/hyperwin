@@ -67,11 +67,6 @@ $(BUILD)/obj/dll/icd.o: guest/icd/vulkan_gfxstream.c | $(BUILD)
 
 DLL_LINK = $(LLD) -dll -machine:arm64 -entry:DllMain -subsystem:windows -nodefaultlib
 
-$(BUILD)/dist/xinput1_4.dll: $(BUILD)/obj/dll/xinput.o $(BUILD)/obj/dll/map.o $(BUILD)/kernel32.lib guest/bootstrap/xinput.def
-	$(DLL_LINK) -def:guest/bootstrap/xinput.def -out:$@ $(BUILD)/obj/dll/xinput.o $(BUILD)/obj/dll/map.o $(BUILD)/kernel32.lib
-	cp $@ $(BUILD)/dist/xinput1_3.dll
-	cp $@ $(BUILD)/dist/xinput9_1_0.dll
-
 $(BUILD)/dist/d3d11.dll: $(BUILD)/obj/dll/d3d11.o $(BUILD)/obj/dll/present.o $(BUILD)/obj/dll/map.o $(BUILD)/obj/dll/ring.o $(BUILD)/obj/dll/tpm.o $(BUILD)/obj/dll/sha.o $(BUILD)/kernel32.lib
 	$(DLL_LINK) -out:$@ $(BUILD)/obj/dll/d3d11.o $(BUILD)/obj/dll/present.o $(BUILD)/obj/dll/map.o $(BUILD)/obj/dll/ring.o $(BUILD)/obj/dll/tpm.o $(BUILD)/obj/dll/sha.o $(BUILD)/kernel32.lib
 
@@ -81,7 +76,7 @@ $(BUILD)/dist/dxgi.dll: $(BUILD)/obj/dll/dxgi.o
 $(BUILD)/dist/vulkan_gfxstream.dll: $(BUILD)/obj/dll/icd.o
 	$(DLL_LINK) -out:$@ $(BUILD)/obj/dll/icd.o
 
-dll: $(BUILD)/dist/xinput1_4.dll $(BUILD)/dist/d3d11.dll $(BUILD)/dist/dxgi.dll $(BUILD)/dist/vulkan_gfxstream.dll
+dll: $(BUILD)/dist/d3d11.dll $(BUILD)/dist/dxgi.dll $(BUILD)/dist/vulkan_gfxstream.dll
 
 esp: $(BUILD)/esp/EFI/BOOT/BOOTAA64.EFI
 	cp tools/efi/startup.nsh $(BUILD)/esp/startup.nsh

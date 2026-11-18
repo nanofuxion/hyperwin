@@ -13,6 +13,8 @@ clang --target=aarch64-w64-mingw32 -nostdinc -isystem guest/drivers/hwpci/shim -
 cat > "$OUT/ntoskrnl.def" <<'DEF'
 LIBRARY ntoskrnl.exe
 EXPORTS
+ExCreateCallback
+ExNotifyCallback
 IoAttachDeviceToDeviceStack
 IoCreateDevice
 IoDeleteDevice
@@ -41,6 +43,7 @@ ZwDeviceIoControlFile
 ZwOpenKey
 ZwQueryValueKey
 ZwReadFile
+ZwWriteFile
 ZwSetValueKey
 memcpy
 memmove

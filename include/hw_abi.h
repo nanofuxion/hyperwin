@@ -43,6 +43,8 @@
 #define HW_VSOCK_PORT_FILES 5602
 /* Guest listens; the app connects and sends framed HID input reports (length byte, report). */
 #define HW_VSOCK_PORT_INPUT 5650
+/* Guest listens; the app connects and reads what hwvsinput.sys sends back (rumble). */
+#define HW_VSOCK_PORT_INPUT_BACK 5653
 /* Guest agent (guest/agent/hwagent.c): the app connects to this port. Frames are
  * u32 payload length, u8 type, payload. */
 #define HW_VSOCK_PORT_AGENT 5651

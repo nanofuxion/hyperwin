@@ -12,7 +12,10 @@ import java.io.IOException
  * on HW_VSOCK_PORT_INPUT. Each message is one length byte, then:
  *   1, make code (u16), flags (1 break, 2 E0)           a set 1 scan code
  *   2, x (u16), y (u16), buttons, wheel, wheel (s16), hwheel (s16)   absolute pointer, 0..65535
- *   3, buttons (u16), lt, rt, lx ly rx ry (s16), connected   gamepad, XInput layout
+ *   3, buttons (u16), lt, rt, lx ly rx ry (s16), connected   gamepad, XInput layout, player 1
+ *   5, slot, then as 3                                       gamepad for players 1 to 4
+ * A second connection, to HW_VSOCK_PORT_INPUT_BACK, brings messages back from the driver:
+ *   6, slot, left motor, right motor, n, n bytes              rumble
  *   4, dx (s16), dy (s16), buttons, wheel (s16), hwheel (s16)       relative pointer, mouse counts
  * Buttons: 1 left, 2 right, 4 middle, 8 back, 16 forward. Wheels in 1/120 steps; the u8 wheel in
  * message 2 is whole steps, for drivers from before the s16 ones.
@@ -20,6 +23,7 @@ import java.io.IOException
 object VsockInput {
     private const val TAG = "HyperWin"
     private const val PORT = 5650L
+    private const val BACK_PORT = 5653L
     private const val KEYBOARD = 1
     private const val POINTER = 2
     private const val RELATIVE = 4
@@ -46,6 +50,7 @@ object VsockInput {
             vm = machine
             closeLocked()
             thread = Thread({ connectLoop(machine) }, "hw-vsock-input").apply { isDaemon = true; start() }
+            Thread({ backLoop(machine) }, "hw-vsock-input-back").apply { isDaemon = true; start() }
         }
     }
 
@@ -104,13 +109,61 @@ object VsockInput {
         }
     }
 
-    /** The controller's whole state, in XInput's terms; the guest shows it as an Xbox controller. */
-    fun pad(connected: Boolean, buttons: Int, lt: Int, rt: Int, lx: Int, ly: Int, rx: Int, ry: Int): Boolean {
-        val b = java.nio.ByteBuffer.allocate(14).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        b.put(3).putShort(buttons.toShort()).put(lt.toByte()).put(rt.toByte())
+    /**
+     * One player's whole state, in XInput's terms; the guest shows it as an Xbox controller. Player 1
+     * also goes as message 3, for a driver from before message 5 (it loads at Windows' next start).
+     */
+    fun pad(slot: Int, connected: Boolean, buttons: Int, lt: Int, rt: Int, lx: Int, ly: Int, rx: Int, ry: Int): Boolean {
+        val b = java.nio.ByteBuffer.allocate(15).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        b.put(5).put(slot.toByte()).putShort(buttons.toShort()).put(lt.toByte()).put(rt.toByte())
             .putShort(lx.toShort()).putShort(ly.toShort()).putShort(rx.toShort()).putShort(ry.toShort())
             .put(if (connected) 1 else 0)
-        return send(b.array())
+        val sent = send(b.array())
+        if (slot == 0) send(byteArrayOf(3) + b.array().copyOfRange(2, 15))
+        return sent
+    }
+
+    /** Reads what the driver sends back: rumble. Reconnects while the VM runs. */
+    private fun backLoop(machine: Any) {
+        while (vm === machine) {
+            val socket = runCatching {
+                machine.javaClass.getMethod("connectVsock", Long::class.javaPrimitiveType)
+                    .invoke(machine, BACK_PORT) as ParcelFileDescriptor
+            }.getOrNull()
+            if (socket == null) { Thread.sleep(1000); continue }
+            Log.i(TAG, "input back channel connected")
+            try {
+                val input = java.io.FileInputStream(socket.fileDescriptor)
+                val buf = ByteArray(512)
+                var have = 0
+                while (vm === machine) {
+                    val n = input.read(buf, have, buf.size - have)
+                    if (n <= 0) break
+                    have += n
+                    var pos = 0
+                    while (have - pos >= 1 && have - pos >= 1 + (buf[pos].toInt() and 0xff)) {
+                        val len = buf[pos].toInt() and 0xff
+                        if (len >= 4 && buf[pos + 1].toInt() == 6) {
+                            val raw = (0 until (buf[pos + 5].toInt() and 0xff).coerceAtMost(len - 5))
+                                .joinToString(" ") { "%02x".format(buf[pos + 6 + it]) }
+                            Log.d(TAG, "rumble player ${buf[pos + 2] + 1}: ${buf[pos + 3].toInt() and 0xff} " +
+                                "${buf[pos + 4].toInt() and 0xff} ($raw)")
+                            GamepadInput.rumble(buf[pos + 2].toInt(), buf[pos + 3].toInt() and 0xff, buf[pos + 4].toInt() and 0xff)
+                        }
+                        pos += 1 + len
+                        if (len == 0) { pos = have; break }
+                    }
+                    System.arraycopy(buf, pos, buf, 0, have - pos)
+                    have -= pos
+                }
+            } catch (e: IOException) {
+                Log.i(TAG, "input back channel dropped: ${e.message}")
+            } finally {
+                runCatching { socket.close() }
+                GamepadInput.stopAllRumble()
+            }
+            Thread.sleep(1000)
+        }
     }
 
     fun key(event: KeyEvent): Boolean = synchronized(lock) {

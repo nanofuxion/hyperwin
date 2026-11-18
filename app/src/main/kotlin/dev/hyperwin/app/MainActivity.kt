@@ -244,6 +244,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     override fun onPause() {
         super.onPause()
         GuestAudio.askMic = null
+        GamepadInput.stopAllRumble()
     }
 
     // ---- game mouse: pointer capture for mouse-look (mouse/README.md) ----
@@ -311,6 +312,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         }
         immersive(next == Screen.WINDOWS)
         updateCapture()
+        if (next != Screen.WINDOWS) GamepadInput.stopAllRumble()
     }
 
     private fun immersive(on: Boolean) {

@@ -41,6 +41,8 @@ object GuestAgent {
     const val ACTION_PUSH = "dev.hyperwin.app.PUSH"
     /** Debug builds: --ei dx, dy, buttons, wheel, n (repeats, 2 ms apart) as relative mouse input. */
     const val ACTION_MOUSE = "dev.hyperwin.app.MOUSE"
+    /** Debug builds: --ei slot, buttons, lx, --ez connected: a made-up controller. */
+    const val ACTION_PAD = "dev.hyperwin.app.PAD"
 
     private val writeLock = Any()
     @Volatile private var vm: Any? = null
@@ -277,6 +279,8 @@ object GuestAgent {
                         ACTION_PUSH -> runCatching {
                             push(File(intent.getStringExtra("src")!!), intent.getStringExtra("dst")!!)
                         }.onFailure { Log.e(TAG, "push failed", it) }
+                        ACTION_PAD -> GamepadInput.fake(intent.getIntExtra("slot", 0), intent.getBooleanExtra("connected", true),
+                            intent.getIntExtra("buttons", 0), intent.getIntExtra("lx", 0))
                         ACTION_MOUSE -> repeat(intent.getIntExtra("n", 1)) {
                             VsockInput.relative(intent.getIntExtra("dx", 0), intent.getIntExtra("dy", 0),
                                 intent.getIntExtra("buttons", 0), intent.getIntExtra("wheel", 0), intent.getIntExtra("hwheel", 0))
@@ -286,6 +290,6 @@ object GuestAgent {
                 }.start()
             }
         }
-        ctx.registerReceiver(receiver, IntentFilter().apply { addAction(ACTION_EXEC); addAction(ACTION_PUSH); addAction(ACTION_MOUSE) }, Context.RECEIVER_EXPORTED)
+        ctx.registerReceiver(receiver, IntentFilter().apply { addAction(ACTION_EXEC); addAction(ACTION_PUSH); addAction(ACTION_MOUSE); addAction(ACTION_PAD) }, Context.RECEIVER_EXPORTED)
     }
 }

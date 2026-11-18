@@ -88,22 +88,6 @@ void hw_publish_audio(void *window, const int16_t *stereo, uint32_t frames)
     __atomic_store_n(&h->audio_head, head + bytes, __ATOMIC_RELEASE);
 }
 
-void hw_set_pad(void *window, uint32_t connected, uint32_t packet, uint16_t buttons,
-                uint8_t left_trigger, uint8_t right_trigger,
-                int16_t lx, int16_t ly, int16_t rx, int16_t ry)
-{
-    struct hw_header *h = window;
-    h->buttons = buttons;
-    h->left_trigger = left_trigger;
-    h->right_trigger = right_trigger;
-    h->left_x = lx;
-    h->left_y = ly;
-    h->right_x = rx;
-    h->right_y = ry;
-    h->pad_packet = packet;
-    __atomic_store_n(&h->pad_connected, connected, __ATOMIC_RELEASE);
-}
-
 int hw_copy_front(void *window, uint8_t *dst, uint32_t dst_bytes)
 {
     struct hw_header *h = window;

@@ -22,16 +22,4 @@ object WindowBridge {
     external fun nativeSetSurface(surface: android.view.Surface?)
     /** Shows the guest frame if it changed: 1 drew, 0 unchanged, -1 nothing to show yet. */
     external fun nativePresent(buffer: ByteBuffer): Int
-    external fun nativePad(
-        buffer: ByteBuffer,
-        connected: Int,
-        packet: Int,
-        buttons: Int,
-        lt: Int,
-        rt: Int,
-        lx: Int,
-        ly: Int,
-        rx: Int,
-        ry: Int,
-    )
 }

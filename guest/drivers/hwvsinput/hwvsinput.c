@@ -10,7 +10,12 @@
  *   [len] [2] [x lo] [x hi] [y lo] [y hi] [buttons] [wheel]       absolute pointer, 0..65535
  *       optionally then [wheel s16] [hwheel s16] in 1/120 steps, which replace [wheel]
  *   [len] [4] [dx s16] [dy s16] [buttons] [wheel s16] [hwheel s16]  relative pointer, mouse counts
- *   [len] [3] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  gamepad, XInput layout */
+ *   [len] [3] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  gamepad, XInput layout: player 1
+ *   [len] [5] [slot] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  the same for players 1 to 4
+ * A second port, HW_VSOCK_PORT_INPUT_BACK, carries messages the other way, to the app:
+ *   [len] [6] [slot] [left motor] [right motor] [n] [n bytes XUSB_SET_STATE sent]   rumble
+ * Each player is its own XUSB interface on the pad device (reference strings pad0 to pad3), on
+ * only while that player's controller is connected, so XInput sees controllers come and go. */
 #include <ntddk.h>
 #include <kbdmou.h>
 #include <ntddkbd.h>
@@ -23,6 +28,7 @@
 #define AF_VSOCK 40
 #define VMADDR_CID_ANY 0xffffffffu
 #define WHEEL_DELTA 120
+#define PADS 4
 
 typedef struct {
     USHORT family;
@@ -44,7 +50,7 @@ typedef struct {
     BOOLEAN mouse;
     int kind;
     CONNECT_DATA connect;
-    UNICODE_STRING iface;   /* the pad's XUSB interface */
+    UNICODE_STRING iface[PADS];   /* the pad device's XUSB interfaces, one a player */
 } PORT_EXT;
 
 /* One controller, in XInput's terms. */
@@ -61,7 +67,12 @@ static struct {
     PORT_EXT *kbd, *mou;
     UCHAR buttons;
     BOOLEAN thread;
-    PAD pad;
+    PAD pad[PADS];
+    PORT_EXT *pad_dev;
+    BOOLEAN pad_on[PADS];          /* interface state as last set, from the listener thread */
+    HANDLE back;                   /* the connection back to the app; back_lock guards writes */
+    PCALLBACK_OBJECT pads;         /* \Callback\HyperWinPad: hwhid.sys's gamepad twin listens */
+    KEVENT back_lock;
 } g;
 
 /* XUSB, as xinput1_4.dll speaks it (interface class and calls; layouts are packed). */
@@ -147,19 +158,37 @@ static void on_message(const UCHAR *m, ULONG len)
         /* relative: dx, dy in mouse counts */
         pointer(MOUSE_MOVE_RELATIVE, (SHORT)(m[1] | m[2] << 8), (SHORT)(m[3] | m[4] << 8), m[5],
                 (SHORT)(m[6] | m[7] << 8), (SHORT)(m[8] | m[9] << 8));
-    } else if (m[0] == 3 && len >= 14) {
+    } else if ((m[0] == 3 && len >= 14) || (m[0] == 5 && len >= 15 && m[1] < PADS)) {
+        ULONG slot = m[0] == 5 ? m[1] : 0;
+        const UCHAR *q = m[0] == 5 ? m + 1 : m;
+        PAD *p = &g.pad[slot];
         KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
-        g.pad.buttons = (USHORT)(m[1] | m[2] << 8);
-        g.pad.lt = m[3];
-        g.pad.rt = m[4];
-        g.pad.lx = (SHORT)(m[5] | m[6] << 8);
-        g.pad.ly = (SHORT)(m[7] | m[8] << 8);
-        g.pad.rx = (SHORT)(m[9] | m[10] << 8);
-        g.pad.ry = (SHORT)(m[11] | m[12] << 8);
-        g.pad.connected = m[13];
-        g.pad.packet++;
+        p->buttons = (USHORT)(q[1] | q[2] << 8);
+        p->lt = q[3];
+        p->rt = q[4];
+        p->lx = (SHORT)(q[5] | q[6] << 8);
+        p->ly = (SHORT)(q[7] | q[8] << 8);
+        p->rx = (SHORT)(q[9] | q[10] << 8);
+        p->ry = (SHORT)(q[11] | q[12] << 8);
+        p->connected = q[13];
+        p->packet++;
         KeReleaseSpinLock(&g.lock, irql);
+        if (g.pads) ExNotifyCallback(g.pads, (PVOID)(ULONG_PTR)slot, (PVOID)(q + 1));
+        /* XInput finds a controller by its interface: on while connected. */
+        if (g.pad_dev && g.pad_dev->iface[slot].Buffer && g.pad_on[slot] != (q[13] != 0)) {
+            g.pad_on[slot] = q[13] != 0;
+            IoSetDeviceInterfaceState(&g.pad_dev->iface[slot], g.pad_on[slot]);
+        }
     }
+}
+
+/* Sends one message back to the app, if it is listening. */
+static void send_back(const UCHAR *msg, ULONG len)
+{
+    IO_STATUS_BLOCK iosb;
+    KeWaitForSingleObject(&g.back_lock, Executive, KernelMode, FALSE, NULL);
+    if (g.back) ZwWriteFile(g.back, NULL, NULL, NULL, &iosb, (PVOID)msg, len, NULL, NULL);
+    KeSetEvent(&g.back_lock, IO_NO_INCREMENT, FALSE);
 }
 
 static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information);
@@ -167,9 +196,11 @@ static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information);
 static void put16(UCHAR *p, USHORT v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); }
 static void put32(UCHAR *p, ULONG v) { put16(p, (USHORT)v); put16(p + 2, (USHORT)(v >> 16)); }
 
-/* The XUSB calls, answered from the pad state the phone last sent. One controller, index 0. */
+/* The XUSB calls, answered from the state the phone last sent for the player whose interface the
+ * caller opened. */
 static NTSTATUS pad_ioctl(PIRP irp, PIO_STACK_LOCATION st)
 {
+    ULONG slot = st->FileObject ? (ULONG)(ULONG_PTR)st->FileObject->FsContext2 : 0;
     ULONG code = st->Parameters.DeviceIoControl.IoControlCode;
     ULONG in = st->Parameters.DeviceIoControl.InputBufferLength;
     ULONG out = st->Parameters.DeviceIoControl.OutputBufferLength;
@@ -177,7 +208,7 @@ static NTSTATUS pad_ioctl(PIRP irp, PIO_STACK_LOCATION st)
     USHORT version = in >= 2 ? (USHORT)(b[0] | b[1] << 8) : 0x0100;
     PAD p;
     KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
-    p = g.pad;
+    p = g.pad[slot < PADS ? slot : 0];
     KeReleaseSpinLock(&g.lock, irql);
     switch (code) {
     case XUSB_GET_INFORMATION:   /* version, controllers, flags (0x80: none), ..., vid, pid */
@@ -237,10 +268,10 @@ static NTSTATUS pad_ioctl(PIRP irp, PIO_STACK_LOCATION st)
         put16(b + 20, 0xFFC0); put16(b + 22, 0xFFC0); put16(b + 24, 0xFFC0); put16(b + 26, 0xFFC0);
         b[34] = 0xFF; b[35] = 0xFF;     /* motors: reported, though rumble does not reach the phone yet */
         return complete(irp, STATUS_SUCCESS, 36);
-    case XUSB_GET_LED_STATE:            /* version, LED: player 1 */
+    case XUSB_GET_LED_STATE:            /* version, LED: 6 to 9 light player 1 to 4 */
         if (out < 3) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
         put16(b, XUSB_VERSION);
-        b[2] = 6;
+        b[2] = (UCHAR)(6 + slot);
         return complete(irp, STATUS_SUCCESS, 3);
     case XUSB_GET_BATTERY:              /* version, type wired, level full */
         if (out < 4) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
@@ -248,8 +279,20 @@ static NTSTATUS pad_ioctl(PIRP irp, PIO_STACK_LOCATION st)
         b[2] = 1;
         b[3] = 3;
         return complete(irp, STATUS_SUCCESS, 4);
-    case XUSB_SET_STATE:                /* LEDs and rumble: accepted */
+    case XUSB_SET_STATE: {              /* 0, LED, left motor, right motor, flags: 1 LED, 2 rumble */
+        UCHAR msg[16] = {0};
+        ULONG n = in < 8 ? in : 8;
+        if (in < 5 || !(b[4] & 2)) return complete(irp, STATUS_SUCCESS, 0);   /* the LED only */
+        msg[0] = (UCHAR)(5 + n);
+        msg[1] = 6;
+        msg[2] = (UCHAR)slot;
+        msg[3] = in >= 4 ? b[2] : 0;
+        msg[4] = in >= 4 ? b[3] : 0;
+        msg[5] = (UCHAR)n;
+        RtlCopyMemory(msg + 6, b, n);
+        send_back(msg, 6 + n);
         return complete(irp, STATUS_SUCCESS, 0);
+    }
     default:
         return complete(irp, STATUS_NOT_SUPPORTED, 0);
     }
@@ -337,6 +380,31 @@ static void listener(PVOID context)
             }
             ZwClose(conn);
             diag(40, 3);
+        }
+        ZwClose(listen_h);
+        sleep_ms(1000);
+    }
+}
+
+/* The way back to the app: accepts its connection on HW_VSOCK_PORT_INPUT_BACK and only writes. */
+static void back_listener(PVOID context)
+{
+    (void)context;
+    for (;;) {
+        HANDLE listen_h = NULL, conn = NULL, old;
+        SOCKADDR_VM addr = { AF_VSOCK, 0, HW_VSOCK_PORT_INPUT_BACK, VMADDR_CID_ANY };
+        ULONG backlog = 1;
+        NTSTATUS s = open_socket(NULL, &listen_h);
+        if (!NT_SUCCESS(s)) { sleep_ms(1000); continue; }
+        s = socket_ioctl(listen_h, IOCTL_SOCKET_BIND, &addr, sizeof addr);
+        if (NT_SUCCESS(s)) s = socket_ioctl(listen_h, IOCTL_SOCKET_LISTEN, &backlog, sizeof backlog);
+        if (!NT_SUCCESS(s)) { ZwClose(listen_h); sleep_ms(1000); continue; }
+        while (NT_SUCCESS(open_socket(listen_h, &conn))) {
+            KeWaitForSingleObject(&g.back_lock, Executive, KernelMode, FALSE, NULL);
+            old = g.back;
+            g.back = conn;
+            KeSetEvent(&g.back_lock, IO_NO_INCREMENT, FALSE);
+            if (old) ZwClose(old);
         }
         ZwClose(listen_h);
         sleep_ms(1000);
@@ -452,13 +520,13 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
             KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
             status = irp->IoStatus.Status;
         }
-        if (NT_SUCCESS(status) && e->kind == KIND_PAD && e->iface.Buffer) IoSetDeviceInterfaceState(&e->iface, TRUE);
         if (NT_SUCCESS(status) && !g.thread) {
             HANDLE t;
             if (NT_SUCCESS(PsCreateSystemThread(&t, THREAD_ALL_ACCESS, NULL, NULL, NULL, listener, NULL))) {
                 ZwClose(t);
                 g.thread = TRUE;
             }
+            if (NT_SUCCESS(PsCreateSystemThread(&t, THREAD_ALL_ACCESS, NULL, NULL, NULL, back_listener, NULL))) ZwClose(t);
         }
         diag(e->kind == KIND_PAD ? 51 : e->mouse ? 48 : 47, NT_SUCCESS(status) ? 1 : 0x100 | ((ULONG)status & 0xff));
         return complete(irp, status, irp->IoStatus.Information);
@@ -468,9 +536,12 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
         if (g.kbd == e) g.kbd = NULL;
         if (g.mou == e) g.mou = NULL;
         KeReleaseSpinLock(&g.lock, irql);
-        if (e->iface.Buffer) {
-            IoSetDeviceInterfaceState(&e->iface, FALSE);
-            RtlFreeUnicodeString(&e->iface);
+        if (g.pad_dev == e) g.pad_dev = NULL;
+        for (int i = 0; i < PADS; i++) {
+            if (!e->iface[i].Buffer) continue;
+            IoSetDeviceInterfaceState(&e->iface[i], FALSE);
+            RtlFreeUnicodeString(&e->iface[i]);
+            g.pad_on[i] = FALSE;
         }
         irp->IoStatus.Status = STATUS_SUCCESS;
         IoSkipCurrentIrpStackLocation(irp);
@@ -501,9 +572,20 @@ static NTSTATUS pass_down(PDEVICE_OBJECT device, PIRP irp)
     return IoCallDriver(e->lower, irp);
 }
 
+/* Opening a pad interface: its reference string, \pad0 to \pad3, says which player. */
 static NTSTATUS create_close(PDEVICE_OBJECT device, PIRP irp)
 {
+    PIO_STACK_LOCATION st = IoGetCurrentIrpStackLocation(irp);
     (void)device;
+    if (st->MajorFunction == IRP_MJ_CREATE && st->FileObject) {
+        UNICODE_STRING *n = &st->FileObject->FileName;
+        ULONG slot = 0;
+        if (n->Length >= 2 * sizeof(WCHAR)) {
+            WCHAR c = n->Buffer[n->Length / sizeof(WCHAR) - 1];
+            if (c >= L'0' && c < L'0' + PADS) slot = (ULONG)(c - L'0');
+        }
+        st->FileObject->FsContext2 = (PVOID)(ULONG_PTR)slot;
+    }
     return complete(irp, STATUS_SUCCESS, 0);
 }
 
@@ -561,12 +643,20 @@ static NTSTATUS add_device(PDRIVER_OBJECT driver, PDEVICE_OBJECT pdo)
         return STATUS_NO_SUCH_DEVICE;
     }
     if (kind == KIND_PAD) {
-        if (!NT_SUCCESS(IoRegisterDeviceInterface(pdo, &XUSB_INTERFACE, NULL, &e->iface)))
-            RtlZeroMemory(&e->iface, sizeof e->iface);
-        /* A device the driver reported itself counts as started by it: no start request may come,
-         * so the interface goes on here (and again at a start, which is harmless). */
-        else
-            diag(54, (ULONG)IoSetDeviceInterfaceState(&e->iface, TRUE));
+        /* An interface a player. Each goes on when the phone says that player's controller is
+         * connected (on_message). A device the driver reported itself may never get a start
+         * request, so nothing here waits for one. */
+        for (int i = 0; i < PADS; i++) {
+            WCHAR ref[] = L"pad0";
+            UNICODE_STRING r;
+            ref[3] = (WCHAR)(L'0' + i);
+            RtlInitUnicodeString(&r, ref);
+            if (!NT_SUCCESS(IoRegisterDeviceInterface(pdo, &XUSB_INTERFACE, &r, &e->iface[i])))
+                RtlZeroMemory(&e->iface[i], sizeof e->iface[i]);
+            else if (g.pad[i].connected)
+                IoSetDeviceInterfaceState(&e->iface[i], g.pad_on[i] = TRUE);
+        }
+        g.pad_dev = e;
     }
     d->Flags |= DO_BUFFERED_IO | DO_POWER_PAGABLE;
     d->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -604,6 +694,14 @@ static void report_pad(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 {
     KeInitializeSpinLock(&g.lock);
+    KeInitializeEvent(&g.back_lock, SynchronizationEvent, TRUE);
+    {
+        UNICODE_STRING name;
+        OBJECT_ATTRIBUTES oa;
+        RtlInitUnicodeString(&name, L"\\Callback\\HyperWinPad");
+        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
+        if (!NT_SUCCESS(ExCreateCallback(&g.pads, &oa, TRUE, TRUE))) g.pads = NULL;
+    }
     diag(43, 1);
     driver->MajorFunction[IRP_MJ_CREATE] = create_close;
     driver->MajorFunction[IRP_MJ_CLOSE] = create_close;

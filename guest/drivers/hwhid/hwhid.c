@@ -150,15 +150,26 @@ static const UCHAR thqa_blob[256] = {
 _Static_assert(sizeof thqa_blob == 256, "the certification blob is 256 bytes");
 
 #define QUEUE 64
-static struct {
+/* One a device: the touch device, or the gamepad twin. hidclass keeps it as our extension. */
+typedef struct {
+    BOOLEAN pad;
     KSPIN_LOCK lock;
     LIST_ENTRY reads;                     /* READ_REPORT requests waiting for a report */
     UCHAR queue[QUEUE][TOUCH_REPORT];     /* reports waiting for a request */
     UCHAR queue_len[QUEUE];
     ULONG head, tail;
-    UCHAR input_mode;                     /* 3 once Windows has put the pad in touchpad mode */
+} DEV;
+
+static struct {
+    DEV *touch, *pad;                     /* the devices there are now */
+    UCHAR input_mode;                     /* 3 once Windows has put the touchpad in touchpad mode */
     BOOLEAN thread;
 } g;
+
+static DEV *dev_of(PDEVICE_OBJECT fdo)
+{
+    return ((HID_DEVICE_EXTENSION *)fdo->DeviceExtension)->MiniDeviceExtension;
+}
 
 static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information)
 {
@@ -170,33 +181,35 @@ static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information)
 
 static VOID cancel_read(PDEVICE_OBJECT device, PIRP irp)
 {
+    DEV *d = dev_of(device);
     KIRQL irql;
-    (void)device;
     IoReleaseCancelSpinLock(irp->CancelIrql);
-    irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
+    irql = KeAcquireSpinLockRaiseToDpc(&d->lock);
     RemoveEntryList(&irp->Tail.Overlay.ListEntry);
-    KeReleaseSpinLock(&g.lock, irql);
+    KeReleaseSpinLock(&d->lock, irql);
     complete(irp, STATUS_CANCELLED, 0);
 }
 
 /* Hands a report to a waiting read, or keeps it (dropping the oldest when full). */
-static void post(const UCHAR *report, ULONG len)
+static void post(DEV *d, const UCHAR *report, ULONG len)
 {
     PIRP irp = NULL;
-    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
-    while (!IsListEmpty(&g.reads)) {
-        PIRP r = CONTAINING_RECORD(g.reads.Flink, IRP, Tail.Overlay.ListEntry);
+    KIRQL irql;
+    if (!d) return;
+    irql = KeAcquireSpinLockRaiseToDpc(&d->lock);
+    while (!IsListEmpty(&d->reads)) {
+        PIRP r = CONTAINING_RECORD(d->reads.Flink, IRP, Tail.Overlay.ListEntry);
         RemoveEntryList(&r->Tail.Overlay.ListEntry);
         if (IoSetCancelRoutine(r, NULL)) { irp = r; break; }
         InitializeListHead(&r->Tail.Overlay.ListEntry);   /* being cancelled: its routine removes nothing */
     }
     if (!irp) {
-        if (g.head - g.tail == QUEUE) g.tail++;
-        RtlCopyMemory(g.queue[g.head % QUEUE], report, len);
-        g.queue_len[g.head % QUEUE] = (UCHAR)len;
-        g.head++;
+        if (d->head - d->tail == QUEUE) d->tail++;
+        RtlCopyMemory(d->queue[d->head % QUEUE], report, len);
+        d->queue_len[d->head % QUEUE] = (UCHAR)len;
+        d->head++;
     }
-    KeReleaseSpinLock(&g.lock, irql);
+    KeReleaseSpinLock(&d->lock, irql);
     if (irp) {
         ULONG room = IoGetCurrentIrpStackLocation(irp)->Parameters.DeviceIoControl.OutputBufferLength;
         if (room < len) { complete(irp, STATUS_BUFFER_TOO_SMALL, 0); return; }
@@ -205,30 +218,30 @@ static void post(const UCHAR *report, ULONG len)
     }
 }
 
-static NTSTATUS read_report(PIRP irp)
+static NTSTATUS read_report(DEV *d, PIRP irp)
 {
     ULONG room = IoGetCurrentIrpStackLocation(irp)->Parameters.DeviceIoControl.OutputBufferLength;
-    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
-    if (g.head != g.tail) {
-        ULONG len = g.queue_len[g.tail % QUEUE];
+    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&d->lock);
+    if (d->head != d->tail) {
+        ULONG len = d->queue_len[d->tail % QUEUE];
         UCHAR report[TOUCH_REPORT];
-        RtlCopyMemory(report, g.queue[g.tail % QUEUE], len);
-        g.tail++;
-        KeReleaseSpinLock(&g.lock, irql);
+        RtlCopyMemory(report, d->queue[d->tail % QUEUE], len);
+        d->tail++;
+        KeReleaseSpinLock(&d->lock, irql);
         if (room < len) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
         RtlCopyMemory(irp->UserBuffer, report, len);
         return complete(irp, STATUS_SUCCESS, len);
     }
     IoMarkIrpPending(irp);
-    InsertTailList(&g.reads, &irp->Tail.Overlay.ListEntry);
+    InsertTailList(&d->reads, &irp->Tail.Overlay.ListEntry);
     IoSetCancelRoutine(irp, cancel_read);
     if (irp->Cancel && IoSetCancelRoutine(irp, NULL)) {
         RemoveEntryList(&irp->Tail.Overlay.ListEntry);
-        KeReleaseSpinLock(&g.lock, irql);
+        KeReleaseSpinLock(&d->lock, irql);
         complete(irp, STATUS_CANCELLED, 0);
         return STATUS_PENDING;
     }
-    KeReleaseSpinLock(&g.lock, irql);
+    KeReleaseSpinLock(&d->lock, irql);
     return STATUS_PENDING;
 }
 
@@ -265,7 +278,7 @@ static void on_message(const UCHAR *m, ULONG len)
     put16(r + 1 + 6 * max, scan_time());
     r[3 + 6 * max] = (UCHAR)n;
     if (pad) r[4 + 6 * max] = m[2] & 1;
-    post(r, size);
+    post(g.touch, r, size);
 }
 
 static NTSTATUS open_socket(HANDLE parent, HANDLE *out)
@@ -369,11 +382,58 @@ static NTSTATUS get_feature(PIRP irp)
     return complete(irp, STATUS_SUCCESS, need);
 }
 
-static NTSTATUS get_string(PIRP irp, PIO_STACK_LOCATION st)
+/* ---- The gamepad twin ----
+ * A wired Xbox 360 controller also shows Windows a HID game controller, with IG_00 in its IDs, for
+ * DirectInput, joy.cpl, SDL and Steam; programs that know XInput skip anything with IG_. This is
+ * that for player 1: device Root\VID_045E&PID_028E&IG_00, whose HID IDs take the IG_00 from it.
+ * hwvsinput.sys hands each pad update over through the \Callback\HyperWinPad callback object. */
+static const UCHAR pad_descriptor[] = {
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01,                               /* Gamepad */
+    0xa1, 0x00, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00,
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xc0,                         /* left stick X, Y */
+    0xa1, 0x00, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00,
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xc0,                         /* right stick Rx, Ry */
+    0x09, 0x32, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02,   /* triggers, Z */
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x0a, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0a, 0x81, 0x02,
+    0x75, 0x06, 0x95, 0x01, 0x81, 0x03,                               /* buttons 1 to 10 */
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x66, 0x14, 0x00,
+    0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03, 0x65, 0x00,   /* hat */
+    0xc0,
+};
+#define PAD_HID_REPORT 13
+
+/* The callback: Argument1 the player (0 to 3), Argument2 the 13 bytes of message 3 after its type. */
+static VOID pad_update(PVOID context, PVOID slot, PVOID state)
 {
-    static const WCHAR maker[] = L"HyperWin", product[] = L"HyperWin Touch", serial[] = L"1";
+    static const USHORT map[10] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, 0x0020, 0x0010, 0x0040, 0x0080 };
+    static const UCHAR hats[16] = { 0, 1, 5, 0, 7, 8, 6, 7, 3, 2, 4, 3, 0, 1, 5, 0 };   /* by up, down, left, right */
+    const UCHAR *q = state;
+    UCHAR r[PAD_HID_REPORT] = {0};
+    USHORT b = (USHORT)(q[0] | q[1] << 8), buttons = 0;
+    LONG lx = (SHORT)(q[4] | q[5] << 8), ly = (SHORT)(q[6] | q[7] << 8);
+    LONG rx = (SHORT)(q[8] | q[9] << 8), ry = (SHORT)(q[10] | q[11] << 8);
+    LONG z = 32768 + ((LONG)q[2] - (LONG)q[3]) * 128;
+    (void)context;
+    if ((ULONG_PTR)slot != 0 || !g.pad) return;
+    if (!q[12]) { lx = ly = rx = ry = 0; z = 32768; b = 0; }   /* disconnected: at rest */
+    put16(r + 0, (USHORT)(lx + 32768));
+    put16(r + 2, (USHORT)(32767 - ly));
+    put16(r + 4, (USHORT)(rx + 32768));
+    put16(r + 6, (USHORT)(32767 - ry));
+    put16(r + 8, (USHORT)(z < 0 ? 0 : z > 65535 ? 65535 : z));
+    for (int i = 0; i < 10; i++)
+        if (b & map[i]) buttons |= (USHORT)(1 << i);
+    put16(r + 10, buttons);
+    r[12] = hats[b & 0xf];
+    post(g.pad, r, sizeof r);
+}
+
+static NTSTATUS get_string(PIRP irp, PIO_STACK_LOCATION st, BOOLEAN pad)
+{
+    static const WCHAR maker[] = L"HyperWin", product[] = L"HyperWin Touch", pad_name[] = L"Controller (HyperWin)",
+                       serial[] = L"1";
     ULONG id = (ULONG)(ULONG_PTR)st->Parameters.DeviceIoControl.Type3InputBuffer & 0xffff;
-    const WCHAR *s = id == 14 ? maker : id == 15 ? product : id == 16 ? serial : NULL;
+    const WCHAR *s = id == 14 ? maker : id == 15 ? (pad ? pad_name : product) : id == 16 ? serial : NULL;
     ULONG bytes;
     if (!s) return complete(irp, STATUS_INVALID_PARAMETER, 0);
     bytes = (ULONG)(wcslen(s) + 1) * sizeof(WCHAR);
@@ -386,39 +446,41 @@ static NTSTATUS internal_ioctl(PDEVICE_OBJECT device, PIRP irp)
 {
     PIO_STACK_LOCATION st = IoGetCurrentIrpStackLocation(irp);
     ULONG out = st->Parameters.DeviceIoControl.OutputBufferLength;
-    (void)device;
+    DEV *dev = dev_of(device);
+    const UCHAR *desc = dev->pad ? pad_descriptor : report_descriptor;
+    USHORT desc_len = dev->pad ? sizeof pad_descriptor : sizeof report_descriptor;
     switch (st->Parameters.DeviceIoControl.IoControlCode) {
     case IOCTL_HID_GET_DEVICE_DESCRIPTOR: {
-        HID_DESCRIPTOR d = { sizeof(HID_DESCRIPTOR), 0x21, 0x0100, 0, 1, 0x22, sizeof report_descriptor };
+        HID_DESCRIPTOR d = { sizeof(HID_DESCRIPTOR), 0x21, 0x0100, 0, 1, 0x22, desc_len };
         if (out < sizeof d) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
         RtlCopyMemory(irp->UserBuffer, &d, sizeof d);
         return complete(irp, STATUS_SUCCESS, sizeof d);
     }
     case IOCTL_HID_GET_REPORT_DESCRIPTOR:
-        if (out < sizeof report_descriptor) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-        RtlCopyMemory(irp->UserBuffer, report_descriptor, sizeof report_descriptor);
-        return complete(irp, STATUS_SUCCESS, sizeof report_descriptor);
+        if (out < desc_len) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        RtlCopyMemory(irp->UserBuffer, desc, desc_len);
+        return complete(irp, STATUS_SUCCESS, desc_len);
     case IOCTL_HID_GET_DEVICE_ATTRIBUTES: {
         HID_DEVICE_ATTRIBUTES *a = irp->UserBuffer;
         if (out < sizeof *a) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
         RtlZeroMemory(a, sizeof *a);
         a->Size = sizeof *a;
-        a->VendorID = 0x1209;     /* pid.codes, open hardware */
-        a->ProductID = 0x4857;
+        a->VendorID = dev->pad ? 0x045E : 0x1209;    /* the pad: an Xbox 360 controller; else pid.codes */
+        a->ProductID = dev->pad ? 0x028E : 0x4857;
         a->VersionNumber = 0x0100;
         return complete(irp, STATUS_SUCCESS, sizeof *a);
     }
     case IOCTL_HID_READ_REPORT:
-        return read_report(irp);
+        return read_report(dev, irp);
     case IOCTL_HID_GET_FEATURE:
-        return get_feature(irp);
+        return dev->pad ? complete(irp, STATUS_NOT_SUPPORTED, 0) : get_feature(irp);
     case IOCTL_HID_SET_FEATURE: {
         HID_XFER_PACKET *p = irp->UserBuffer;
-        if (p && p->reportBuffer && p->reportId == ID_MODE && p->reportBufferLen >= 2) g.input_mode = p->reportBuffer[1];
+        if (!dev->pad && p && p->reportBuffer && p->reportId == ID_MODE && p->reportBufferLen >= 2) g.input_mode = p->reportBuffer[1];
         return complete(irp, STATUS_SUCCESS, 0);
     }
     case IOCTL_HID_GET_STRING:
-        return get_string(irp, st);
+        return get_string(irp, st, dev->pad);
     case IOCTL_HID_ACTIVATE_DEVICE:
     case IOCTL_HID_DEACTIVATE_DEVICE:
     case IOCTL_HID_WRITE_REPORT:
@@ -435,6 +497,11 @@ static PDEVICE_OBJECT lower(PDEVICE_OBJECT device)
 
 static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
 {
+    if (IoGetCurrentIrpStackLocation(irp)->MinorFunction == IRP_MN_REMOVE_DEVICE) {
+        DEV *d = dev_of(device);
+        if (g.touch == d) g.touch = NULL;
+        if (g.pad == d) g.pad = NULL;
+    }
     IoSkipCurrentIrpStackLocation(irp);
     return IoCallDriver(lower(device), irp);
 }
@@ -446,10 +513,27 @@ static NTSTATUS power(PDEVICE_OBJECT device, PIRP irp)
     return PoCallDriver(lower(device), irp);
 }
 
+/* Which device this is: the gamepad twin's hardware ID carries IG_. */
+static BOOLEAN is_pad(PDEVICE_OBJECT pdo)
+{
+    WCHAR ids[256];
+    ULONG len = 0, i;
+    if (!NT_SUCCESS(IoGetDeviceProperty(pdo, DevicePropertyHardwareID, sizeof ids - sizeof(WCHAR), ids, &len))) return FALSE;
+    for (i = 0; i + 3 <= len / sizeof(WCHAR); i++)
+        if (ids[i] == L'I' && ids[i + 1] == L'G' && ids[i + 2] == L'_') return TRUE;
+    return FALSE;
+}
+
 static NTSTATUS add_device(PDRIVER_OBJECT driver, PDEVICE_OBJECT fdo)
 {
+    DEV *d = dev_of(fdo);
     (void)driver;
-    if (!g.thread) {
+    RtlZeroMemory(d, sizeof *d);
+    KeInitializeSpinLock(&d->lock);
+    InitializeListHead(&d->reads);
+    d->pad = is_pad(((HID_DEVICE_EXTENSION *)fdo->DeviceExtension)->PhysicalDeviceObject);
+    if (d->pad) g.pad = d; else g.touch = d;
+    if (!d->pad && !g.thread) {
         HANDLE t;
         if (NT_SUCCESS(PsCreateSystemThread(&t, THREAD_ALL_ACCESS, NULL, NULL, NULL, listener, NULL))) {
             ZwClose(t);
@@ -467,15 +551,20 @@ static VOID unload(PDRIVER_OBJECT driver) { (void)driver; }
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 {
     HID_MINIDRIVER_REGISTRATION r;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    PCALLBACK_OBJECT pads;
     ObReferenceObject(driver);
-    KeInitializeSpinLock(&g.lock);
-    InitializeListHead(&g.reads);
+    RtlInitUnicodeString(&name, L"\\Callback\\HyperWinPad");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
+    if (NT_SUCCESS(ExCreateCallback(&pads, &oa, TRUE, TRUE))) ExRegisterCallback(pads, pad_update, NULL);
     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = internal_ioctl;
     driver->MajorFunction[IRP_MJ_PNP] = pnp;
     driver->MajorFunction[IRP_MJ_POWER] = power;
     driver->DriverExtension->AddDevice = add_device;
     driver->DriverUnload = unload;
     RtlZeroMemory(&r, sizeof r);
+    r.DeviceExtensionSize = sizeof(DEV);
     r.Revision = 1;
     r.DriverObject = driver;
     r.RegistryPath = registry;

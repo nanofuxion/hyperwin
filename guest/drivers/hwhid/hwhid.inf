@@ -25,6 +25,7 @@ HwHid.CopyList=12
 
 [HyperWin.NTARM64]
 %HwHid.DeviceDesc%=HwHid,Root\HwHid
+%HwHid.PadDesc%=HwHid,Root\VID_045E&PID_028E&IG_00
 
 [HwHid.CopyList]
 hwhid.sys
@@ -46,3 +47,4 @@ ServiceBinary=%12%\hwhid.sys
 HyperWin="HyperWin"
 DiskName="HyperWin touch"
 HwHid.DeviceDesc="HyperWin Touch"
+HwHid.PadDesc="HyperWin Controller"

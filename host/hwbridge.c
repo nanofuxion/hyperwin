@@ -44,7 +44,6 @@ static int cmd_init(const char *path, off_t offset, off_t span)
     p = mmap(NULL, HW_WINDOW_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
     if (p == MAP_FAILED) die("mmap");
     hw_window_init(p, HW_WINDOW_SIZE);
-    hw_set_pad(p, 1, 1, 0x1000, 0, 0, 0, 0, 0, 0);
     __atomic_store_n(&((struct hw_header *)p)->tpm_status, 1, __ATOMIC_RELEASE);
     msync(p, HW_WINDOW_SIZE, MS_SYNC);
     munmap(p, HW_WINDOW_SIZE);
@@ -85,7 +84,6 @@ static int cmd_run(const char *path, const char *ppm, int timeout_s, off_t offse
     uint32_t last = 0;
     memset(seed, 0xA5, sizeof seed);
     hw_tpm_init(&tpm, seed);
-    hw_set_pad(window, 1, 1, 0x1000, 0, 0, 0, 0, 0, 0);
     __atomic_store_n(&h->tpm_status, 1, __ATOMIC_RELEASE);
     frame = malloc(HW_WIDTH * HW_HEIGHT * 4);
     if (!frame) die("malloc");
@@ -189,14 +187,6 @@ static int cmd_test(void)
             printf("FAIL audio head %llu\n", (unsigned long long)h->audio_head);
             fail++;
         } else printf("ok audio\n");
-    }
-    hw_set_pad(window, 1, 7, 0x1000, 10, 20, 1, 2, 3, 4);
-    {
-        struct hw_header *h = (struct hw_header *)window;
-        if (!h->pad_connected || h->buttons != 0x1000 || h->left_trigger != 10) {
-            printf("FAIL pad\n");
-            fail++;
-        } else printf("ok pad\n");
     }
     memset(seed, 0xA5, sizeof seed);
     hw_tpm_init(&tpm, seed);

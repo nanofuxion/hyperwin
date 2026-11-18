@@ -220,18 +220,6 @@ out:
     return rc;
 }
 
-JNIEXPORT void JNICALL
-Java_dev_hyperwin_app_WindowBridge_nativePad(JNIEnv *env, jclass cls, jobject buffer,
-    jint connected, jint packet, jint buttons, jint lt, jint rt, jint lx, jint ly, jint rx, jint ry)
-{
-    void *window = (*env)->GetDirectBufferAddress(env, buffer);
-    (void)env;
-    (void)cls;
-    if (!window) return;
-    hw_set_pad(window, (uint32_t)connected, (uint32_t)packet, (uint16_t)buttons,
-               (uint8_t)lt, (uint8_t)rt, (int16_t)lx, (int16_t)ly, (int16_t)rx, (int16_t)ry);
-}
-
 JNIEXPORT jint JNICALL
 Java_dev_hyperwin_app_WindowsInstall_nativePack(JNIEnv *env, jclass cls, jstring dir, jstring image)
 {
