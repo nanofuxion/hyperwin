@@ -390,3 +390,126 @@ out:
     if (ap) (*env)->ReleaseStringUTFChars(env, assets, ap);
     return (*env)->NewStringUTF(env, err);
 }
+
+/* Offline repair: deletes files inside the Windows partition of a machine disk before the machine
+ * starts, for when a driver stops Windows booting. Each path is like /Windows/System32/x.sys.
+ * The partition is the biggest GPT entry. Returns how many were deleted, or -1. */
+#include <sys/stat.h>
+#include <time.h>
+#define HAVE_SYS_STAT_H 1
+#include <errno.h>
+#include <ntfs-3g/volume.h>
+#include <ntfs-3g/device.h>
+#include <ntfs-3g/attrib.h>
+#include <ntfs-3g/dir.h>
+#include <ntfs-3g/inode.h>
+#include <ntfs-3g/unistr.h>
+
+/* A directory component written as prefix* stands for every entry starting with prefix. */
+struct hw_ls { const char *prefix; char names[16][160]; int n; };
+static int hw_ls_fill(void *de, const ntfschar *name, const int len, const int type, const s64 pos, const MFT_REF mref, const unsigned dt)
+{
+    (void)type; (void)pos; (void)mref; (void)dt;
+    struct hw_ls *l = de;
+    char *mb = NULL;
+    if (ntfs_ucstombs(name, len, &mb, 0) < 0 || !mb) return 0;
+    if (!strncmp(mb, l->prefix, strlen(l->prefix)) && l->n < 16 && strlen(mb) < 160) strcpy(l->names[l->n++], mb);
+    free(mb);
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_hyperwin_app_MachinePrep_nativeNtfsDelete(JNIEnv *env, jobject self, jstring disk, jobjectArray paths)
+{
+    (void)self;
+    const char *d = (*env)->GetStringUTFChars(env, disk, NULL);
+    int fd = open(d, O_RDONLY);
+    int done = fd < 0 ? -2 : -3;
+    if (fd >= 0) {
+        unsigned char hdr[512], ent[128];
+        uint64_t best = 0, best_first = 0;
+        if (pread(fd, hdr, sizeof hdr, 512) == (ssize_t)sizeof hdr) {
+            uint64_t tab = *(uint64_t *)(hdr + 72);
+            uint32_t n = *(uint32_t *)(hdr + 80), sz = *(uint32_t *)(hdr + 84);
+            for (uint32_t i = 0; i < n && sz == sizeof ent; i++) {
+                if (pread(fd, ent, sizeof ent, (off_t)(tab * 512 + (uint64_t)i * sz)) != (ssize_t)sizeof ent) break;
+                uint64_t first = *(uint64_t *)(ent + 32), last = *(uint64_t *)(ent + 40);
+                if (last >= first && last - first + 1 > best) { best = last - first + 1; best_first = first; }
+            }
+        }
+        close(fd);
+        if (best) {
+            char win[1300];
+            snprintf(win, sizeof win, "hwwin:%llu:%llu:%s", (unsigned long long)(best_first * 512), (unsigned long long)(best * 512), d);
+            errno = 0;
+            struct ntfs_device *ndev = ntfs_device_alloc(win, 0, &ntfs_device_default_io_ops, NULL);
+            ntfs_volume *vol = ndev ? ntfs_device_mount(ndev, NTFS_MNT_RDONLY | NTFS_MNT_IGNORE_HIBERFILE) : NULL;
+            if (!vol) done = -100 - errno;
+            if (vol) {
+                done = 0;
+                jsize count = (*env)->GetArrayLength(env, paths);
+                for (jsize i = 0; i < count; i++) {
+                    jstring js = (jstring)(*env)->GetObjectArrayElement(env, paths, i);
+                    const char *path0 = (*env)->GetStringUTFChars(env, js, NULL);
+                    char expanded[16][1024];
+                    int ne = 0;
+                    const char *star = strchr(path0, '*');
+                    if (!star) {
+                        snprintf(expanded[ne++], sizeof expanded[0], "%s", path0);
+                    } else {
+                        char parent[1024], prefix[160];
+                        const char *cs = star;
+                        while (cs > path0 && cs[-1] != '/') cs--;
+                        snprintf(parent, sizeof parent, "%.*s", (int)(cs - path0) > 1 ? (int)(cs - path0) - 1 : 1, path0);
+                        snprintf(prefix, sizeof prefix, "%.*s", (int)(star - cs), cs);
+                        const char *rest = strchr(star, '/');
+                        ntfs_inode *pi = ntfs_pathname_to_inode(vol, NULL, parent);
+                        if (pi) {
+                            struct hw_ls ls = { prefix, { { 0 } }, 0 };
+                            s64 pos = 0;
+                            ntfs_readdir(pi, &pos, &ls, hw_ls_fill);
+                            ntfs_inode_close(pi);
+                            for (int k = 0; k < ls.n && ne < 16; k++)
+                                snprintf(expanded[ne++], sizeof expanded[0], "%s/%s%s", parent[1] ? parent : "", ls.names[k], rest ? rest : "");
+                        }
+                    }
+                    for (int e = 0; e < ne; e++) {
+                    const char *path = expanded[e];
+                    char dir[1024];
+                    snprintf(dir, sizeof dir, "%s", path);
+                    char *slash = strrchr(dir, '/');
+                    if (slash && slash != dir) {
+                        *slash = 0;
+                        /* The volume may hold Windows' cached metadata, which must not be changed. File data is
+                         * not journaled, so the first cluster of the file is overwritten in place instead. */
+                        ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, path);
+                        (void)dir;
+                        if (ni) {
+                            ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+                            if (na && NAttrNonResident(na) && ntfs_attr_map_whole_runlist(na) == 0) {
+                                LCN lcn = ntfs_attr_vcn_to_lcn(na, 0);
+                                int wfd = open(d, O_RDWR);
+                                if (lcn >= 0 && wfd >= 0) {
+                                    static const unsigned char zeros[4096];
+                                    off_t at = (off_t)(best_first * 512 + (uint64_t)lcn * (uint64_t)vol->cluster_size);
+                                    if (pwrite(wfd, zeros, sizeof zeros, at) == (ssize_t)sizeof zeros) done++;
+                                }
+                                if (wfd >= 0) close(wfd);
+                            }
+                            if (na) ntfs_attr_close(na);
+                            ntfs_inode_close(ni);
+                        }
+                        ntfschar *uname = NULL;
+                        (void)slash;
+                        free(uname);
+                    }
+                    }
+                    (*env)->ReleaseStringUTFChars(env, js, path0);
+                }
+                ntfs_umount(vol, 0);
+            }
+        }
+    }
+    (*env)->ReleaseStringUTFChars(env, disk, d);
+    return done;
+}

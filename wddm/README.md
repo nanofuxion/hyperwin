@@ -596,6 +596,36 @@ object wanted.
   reads the program's PE header and copies the 32-bit build for i686 programs.
 - Done means still open: `dxtest 12`, the AIO scenes through the driver, DWM on the GPU.
 
+## Phase 6, first slice (2026-11-18): the screen half behind a switch
+
+`gpu/guest/wddm/hwdisplay.inc` is the display half of `hwgpuw.sys`. It is off unless
+`Services\hwgpuw\Parameters\Display` is 1 (read in DriverEntry, so the driver must reload). With it on:
+
+- The adapter reports one source and one child (uid 0, which is also the target id), no EDID, and
+  answers the VidPN entries. `dispinfo.exe` (`guest/tools/dispinfo.c`) then shows it as `render=1 display=1`
+  with `\\.\DISPLAY2 | HyperWin GPU` and modes 1280x720@60 and 800x600@60. Windows boots with it on.
+- Basic Display keeps the screen. Extending the desktop onto DISPLAY2 is accepted
+  (`ChangeDisplaySettingsEx` returns 0) but the display does not attach yet: the primary surface path
+  (standard allocations, source address, flips to the phone) is the next slice.
+- `DisplayWidth` and `DisplayHeight` in the same key set the largest mode (default 1280x720).
+
+What went wrong on the way, and what is there now because of it:
+
+- Calling `pfnPinMode` from the driver made dxgkrnl stop answering: every later graphics call hung, and
+  with the switch on Windows hung at the boot logo. The driver never pins now, and leaves a mode set that
+  already has a pinned mode alone.
+- The start guard did not catch it. Its count was written but not flushed, so a hang seconds later lost
+  it. `guard_count` and `report` now flush the key. Each display entry also leaves its last status in
+  `Parameters\D_<name>` and a step number in `D_Step`.
+- Registry writes made just before `shutdown /s /t 0` can be lost on this machine. Wait about 20 s.
+- Offline repair, for a driver that stops Windows booting: put paths in
+  `/data/local/tmp/hyperwin/ntfsdel.txt` on the phone (one per line, like
+  `/Windows/System32/DriverStore/FileRepository/hwgpuw.inf_arm64_*/hwgpuw.sys`, one `prefix*` folder
+  allowed). At the next start the app overwrites the first cluster of each file, so Windows refuses to
+  load it and boots without it. It does not change NTFS metadata: after a crash the volume holds
+  Windows' cached metadata and ntfs-3g will only mount it read-only. Remove the list afterwards, then
+  reinstall the package (`install-driver.ps1 hwgpuw Root\HwGpuAdapter`).
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

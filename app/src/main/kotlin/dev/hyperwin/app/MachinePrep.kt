@@ -13,6 +13,27 @@ object MachinePrep {
     private external fun nativePrepare(json: String, isoFd: Int, assets: String, progress: Progress): String
     private external fun nativeReplaceBootFile(disk: String, path: String, data: ByteArray): Boolean
     private external fun nativeHardenBoot(disk: String, scratch: String): Int
+    private external fun nativeNtfsDelete(disk: String, paths: Array<String>): Int
+
+    /**
+     * Repair hook: when /data/local/tmp/hyperwin/ntfsdel.txt exists, each line is a path inside the
+     * Windows partition (like /Windows/System32/x.sys) that is deleted before the machine starts.
+     * For a driver that keeps Windows from booting. It is applied once per file time; remove the file afterwards.
+     */
+    fun applyOfflineDeletes(machine: Machine) {
+        val list = File("/data/local/tmp/hyperwin/ntfsdel.txt")
+        runCatching {
+            if (!list.canRead()) return
+            val paths = list.readLines().map { it.trim() }.filter { it.startsWith("/") }
+            // The list is shell-owned, so it cannot be renamed from here: it is applied once per file
+            // time, and whoever wrote it removes it.
+            val seen = File(machine.disk.parentFile, "ntfsdel.applied")
+            if (seen.exists() && seen.readText() == list.lastModified().toString()) return
+            val n = nativeNtfsDelete(machine.disk.absolutePath, paths.toTypedArray())
+            android.util.Log.i("HyperWin", "offline deletes on ${machine.name}: $n of ${paths.size}")
+            seen.writeText(list.lastModified().toString())
+        }
+    }
 
     /** Keeps Windows out of its recovery screens after a cut-short boot. Cheap when already so. */
     fun hardenBoot(ctx: android.content.Context, machine: Machine) {

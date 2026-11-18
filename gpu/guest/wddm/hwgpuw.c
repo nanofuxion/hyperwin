@@ -78,6 +78,8 @@ struct adapter {
 static struct adapter g;
 static BOOLEAN g_notify_set;
 
+#include "hwdisplay.inc"
+
 static void *window(void) { return (UCHAR *)g.ring - HWGPU_RING_OFF; }
 
 /* ---- the crash-loop breaker ---- */
@@ -98,6 +100,7 @@ static ULONG guard_count(BOOLEAN write, ULONG value)
     RtlInitUnicodeString(&name, L"Attempts");
     if (write) {
         ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof value);
+        ZwFlushKey(key);   /* a crash right after DriverEntry must still leave the count */
     } else {
         UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 4];
         ULONG len = 0;
@@ -121,6 +124,7 @@ static void report(const WCHAR *what, ULONG value)
     if (!NT_SUCCESS(ZwCreateKey(&key, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp))) return;
     RtlInitUnicodeString(&name, (PWSTR)what);
     ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof value);
+    ZwFlushKey(key);   /* a crash right after must not lose it */
     ZwClose(key);
 }
 
@@ -591,8 +595,8 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     (void)ctx;
     (void)info;
     g.dxgk = *iface;
-    *sources = 0;   /* render-only: no screen, no monitors */
-    *children = 0;
+    *sources = d.on ? 1 : 0;   /* render-only unless Parameters\Display asks for the screen half */
+    *children = d.on ? 1 : 0;
     InitializeListHead(&g.chans);
     ExInitializeFastMutex(&g.lock);
     KeInitializeSpinLock(&g.pending_lock);
@@ -1157,5 +1161,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     init.DxgkDdiCalibrateGpuClock = HwCalibrateGpuClock;
     init.DxgkDdiQueryEngineStatus = HwQueryEngineStatus;
     init.DxgkDdiQueryDependentEngineGroup = HwQueryDependentEngineGroup;
+    hwd_setup(&init);
     return HwDxgkInitialize(driver, registry, &init);
 }

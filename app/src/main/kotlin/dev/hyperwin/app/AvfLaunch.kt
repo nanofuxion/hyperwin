@@ -200,6 +200,7 @@ object AvfLaunch {
         copyAsset(ctx, "edk2-gunyah.fd", firmware)
         if (machine != null && machine.prepared) {
             // A disk with older boot files only knows the default frame size.
+            MachinePrep.applyOfflineDeletes(machine)
             MachinePrep.hardenBoot(ctx, machine)
             val (width, height) = if (MachinePrep.refreshLoader(ctx, machine)) machine.frameSize()
                 else AvfPlan.FRAME_WIDTH to AvfPlan.FRAME_HEIGHT
