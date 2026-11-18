@@ -211,6 +211,58 @@ Remove `ScreamAudio.kt`, the port 4010 hook in `GuestNet.kt` (line ~184), and
 (`hw_publish_audio` in `guest/efi/probe.c:236` and
 `guest/payload/main.c:164`), since it writes where the control page will be.
 
+## As built (2026-11-18)
+
+Where the build differs from the plan above:
+
+- **Plain C, no packet mode.** `guest/drivers/hwaudio/hwaudio.c` fills the
+  COM vtables by hand, so the mingw clang chain needs no C++ runtime. The
+  packet-mode interfaces were not needed: Windows' audio engine runs this
+  driver in plain polled WaveRT mode (it asked for no notifications), waking
+  every 10 ms and reading the position.
+- **Underruns without a write cursor.** The driver fills a new speaker buffer
+  with a marker (`HWA_MARK_F32`, a NaN, or `HWA_MARK_S16`), and the phone stamps
+  each frame with it again after playing it. A marked frame at the play cursor
+  means Windows fell behind: the phone plays silence there, never old sound,
+  and counts it. The distance to the first mark is how much Windows has queued.
+- **A lead.** The engine's own write-ahead is 10 to 30 ms, and it sometimes
+  wakes late. The phone reports a position 10 to 16 ms past what it has played
+  (a quarter of the engine's 64 ms buffer at most), so Windows writes that much
+  further ahead. The lead grows after an underrun and shrinks slowly. A new run
+  starts only once Windows has queued 10 ms.
+- **Formats.** 16-bit PCM and 32-bit float, both 48 kHz stereo. Windows picks
+  16-bit by default. The phone converts.
+- **Mic cursor.** The voice-communication mic delivers 20 ms blocks, and a
+  cursor that jumps by 20 ms made Windows flag glitches. The watcher thread
+  moves the cursor Windows sees over each block smoothly instead.
+- **Install.** `install.ps1` makes and signs the catalog in Windows, then runs
+  `devcon install` or `devcon update` with the audio service stopped, so an
+  update takes effect at once. Windows keeps one package per INF text, so
+  `build.sh` sets `DriverVer` from the driver's hash, and old packages are
+  deleted. It runs from `gpu-install.cmd` whenever `hwaudio.sys` changes, which
+  covers new machines and old ones. It also removes Scream.
+- **Foreground service.** `WindowsService.kt`, types `mediaPlayback` and, once
+  the permission is granted, `microphone`. Game mode can share it.
+- **The boot test tone stays.** It writes before Windows starts, and the
+  driver clears the control page when it loads.
+- **No `audio_ring_test`.** The markers made the real thing measurable on the
+  phone instead: `guest/tools/audtest.exe play|record` in Windows, and the
+  `HyperWinAudio` log every 10 s while sound plays.
+
+Measured on the Pixel 6 Pro:
+
+| | |
+|---|---|
+| AAudio speaker | exclusive, 2 ms bursts, 4 ms buffer, about 8 ms held |
+| Windows queued ahead | 25 to 50 ms, lead included |
+| Clock seen by Windows | 47993 to 48025 Hz |
+| Idle, 10 s tone | 0 underruns, most runs |
+| All 8 CPUs busy, 1 min | a few stalls, the longest 90 ms |
+| Mic | shared, 20 ms blocks, 1 Windows glitch flag a run besides the start |
+
+Not done yet: route changes with wired and Bluetooth headphones, a clap test,
+and Discord with the phone speaker on. They need someone at the phone.
+
 ## Phases
 
 0. **Quick relief, optional.** In `ScreamAudio.kt`, swap the packet queue for a

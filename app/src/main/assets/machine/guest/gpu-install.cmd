@@ -1,7 +1,7 @@
 @echo off
 rem Installs or updates the HyperWin GPU in Windows (gpu/README.md): the ring driver hwgpu.sys and
-rem the Vulkan driver vulkan_hwgpu.dll; also the input driver hwvsinput.sys and the phone storage
-rem service hwfiles.exe. Run as administrator or SYSTEM, by firstboot.cmd on new machines and by
+rem the Vulkan driver vulkan_hwgpu.dll; also the input driver hwvsinput.sys, the phone storage
+rem service hwfiles.exe and the sound driver hwaudio.sys. Run as administrator or SYSTEM, by firstboot.cmd on new machines and by
 rem the app on older ones. Safe to run again.
 set G=C:\HyperWin\gpu
 rem The storage service keeps the ring driver open, so it stops first.
@@ -31,6 +31,9 @@ copy /y %G%\hwfiles.exe C:\HyperWin\files\hwfiles.exe
 sc query HyperWinFiles >nul 2>&1 || sc create HyperWinFiles type= own start= auto binPath= C:\HyperWin\files\hwfiles.exe DisplayName= "HyperWin phone storage"
 sc failure HyperWinFiles reset= 60 actions= restart/2000 >nul
 sc start HyperWinFiles
+rem Speakers and microphone over the shared window (audio/README.md), installed again when the driver
+rem changes. The script makes and signs the package's catalog, and takes out the older Scream card.
+fc /b %G%\audio\hwaudio.sys %SystemRoot%\System32\drivers\hwaudio.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\audio\install.ps1
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
 rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).

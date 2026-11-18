@@ -86,6 +86,10 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             }
         }.start()
     }
+    private val requestMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        GuestAudio.micChanged(this)
+    }
+    private var micAsked = false
     private val collapseToolbar = Runnable { showBar(false) }
     private val hideBooting = Runnable { booting.visibility = View.GONE }
 
@@ -213,8 +217,23 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     override fun onResume() {
         super.onResume()
         FileShare.publish(this)   // the all-files permission may have just been granted
+        GuestAudio.micChanged(this)   // so may the microphone
+        GuestAudio.askMic = { runOnUiThread { askMic() } }
+        if (GuestAudio.micWanted) askMic()
         if (AvfLaunch.machine != null) guestDisplay.vmStarted(AvfLaunch.sharedWindow)
         if (screen == Screen.WINDOWS) immersive(true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        GuestAudio.askMic = null
+    }
+
+    /** Once per launch, when Windows has opened the microphone. */
+    private fun askMic() {
+        if (micAsked || GuestAudio.micPermitted(this)) return
+        micAsked = true
+        requestMic.launch(android.Manifest.permission.RECORD_AUDIO)
     }
 
     private fun preparedMachine(): Machine? =

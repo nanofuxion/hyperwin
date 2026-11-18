@@ -1,0 +1,110 @@
+; HyperWin speakers and microphone (guest/drivers/hwaudio/hwaudio.c).
+; Installed as a root device: devcon install hwaudio.inf Root\HwAudio
+; The catalog is made and signed inside Windows at install time (install.ps1).
+[Version]
+Signature="$WINDOWS NT$"
+Class=MEDIA
+ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%HyperWin%
+; build.sh sets the version from the driver's hash
+DriverVer=11/17/2026,1.0.0.0
+CatalogFile=hwaudio.cat
+PnpLockdown=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[SourceDisksFiles]
+hwaudio.sys=1
+
+[DestinationDirs]
+HwAudio.CopyList=12
+
+[Manufacturer]
+%HyperWin%=HyperWin,NTARM64
+
+[HyperWin.NTARM64]
+%HwAudio.DeviceDesc%=HwAudio,Root\HwAudio
+
+[HwAudio.CopyList]
+hwaudio.sys
+
+[HwAudio.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration,WDMAUDIO.Registration
+CopyFiles=HwAudio.CopyList
+AddReg=HwAudio.AddReg
+
+[HwAudio.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,redbook"
+HKR,,Driver,,hwaudio.sys
+HKR,Drivers,SubClasses,,"wave,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%HwAudio.DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%HwAudio.DeviceDesc%
+
+[HwAudio.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_WaveRender%,HwAudio.I.WaveRender
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_WaveRender%,HwAudio.I.WaveRender
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveRender%,HwAudio.I.WaveRender
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologyRender%,HwAudio.I.TopologyRender
+AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyRender%,HwAudio.I.TopologyRender
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_WaveCapture%,HwAudio.I.WaveCapture
+AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_WaveCapture%,HwAudio.I.WaveCapture
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveCapture%,HwAudio.I.WaveCapture
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologyCapture%,HwAudio.I.TopologyCapture
+AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyCapture%,HwAudio.I.TopologyCapture
+
+[HwAudio.I.WaveRender]
+AddReg=HwAudio.I.WaveRender.AddReg
+[HwAudio.I.WaveRender.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%HwAudio.WaveRender%
+
+[HwAudio.I.TopologyRender]
+AddReg=HwAudio.I.TopologyRender.AddReg
+[HwAudio.I.TopologyRender.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%HwAudio.TopologyRender%
+
+[HwAudio.I.WaveCapture]
+AddReg=HwAudio.I.WaveCapture.AddReg
+[HwAudio.I.WaveCapture.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%HwAudio.WaveCapture%
+
+[HwAudio.I.TopologyCapture]
+AddReg=HwAudio.I.TopologyCapture.AddReg
+[HwAudio.I.TopologyCapture.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%HwAudio.TopologyCapture%
+
+[HwAudio.NT.Services]
+AddService=HwAudio,0x00000002,HwAudio.Service
+
+[HwAudio.Service]
+DisplayName=%HwAudio.DeviceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\hwaudio.sys
+
+[Strings]
+HyperWin="HyperWin"
+DiskName="HyperWin audio"
+HwAudio.DeviceDesc="HyperWin Audio"
+HwAudio.WaveRender="HyperWin Speakers Wave"
+HwAudio.TopologyRender="HyperWin Speakers"
+HwAudio.WaveCapture="HyperWin Microphone Wave"
+HwAudio.TopologyCapture="HyperWin Microphone"
+Proxy.CLSID="{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE="{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY="{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSNAME_WaveRender="WaveRender"
+KSNAME_TopologyRender="TopologyRender"
+KSNAME_WaveCapture="WaveCapture"
+KSNAME_TopologyCapture="TopologyCapture"

@@ -80,7 +80,6 @@ class GuestNet(private val ctx: Context, private val lan: Boolean, private val t
         udp.values.forEach { it.close() }
         listeners.values.forEach { runCatching { it.close() } }
         runCatching { multicastLock?.release() }
-        ScreamAudio.stop()
     }
 
     // ---- packets from the guest ----
@@ -180,10 +179,7 @@ class GuestNet(private val ctx: Context, private val lan: Boolean, private val t
         val dport = u16(p, ihl + 2)
         val n = minOf(u16(p, ihl + 4), total - ihl) - 8
         if (n < 0) return
-        if (dst == hostIp) {
-            if (dport == ScreamAudio.PORT) ScreamAudio.packet(p, ihl + 8, n)
-            return
-        }
+        if (dst == hostIp) return
         val target: InetAddress = when {
             dst == dnsIp -> realDns
             dst == broadcast || dst == LIMITED_BROADCAST -> if (lanActive) broadcast else return

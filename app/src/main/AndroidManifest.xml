@@ -8,6 +8,11 @@
     <!-- Phone storage as Windows drives (FileShare.kt). -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.USE_CUSTOM_VIRTUAL_MACHINE" />
+    <!-- Windows' microphone, and the foreground service while Windows runs (GuestAudio.kt, WindowsService.kt). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-feature android:name="android.software.virtualization_framework" android:required="false" />
     <application
         android:label="HyperWin"
@@ -26,5 +31,7 @@
         </activity>
         <!-- The GPU renderer and its Vulkan driver, apart from the VM's owner (HwGpu.kt). -->
         <service android:name=".GpuService" android:process=":gpu" android:exported="false" />
+        <service android:name=".WindowsService" android:exported="false"
+            android:foregroundServiceType="mediaPlayback|microphone" />
     </application>
 </manifest>

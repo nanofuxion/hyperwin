@@ -180,6 +180,7 @@ object AvfPlan {
     ) {
         fun close() {
             FileShare.stop()   // its threads read the window
+            GuestAudio.stop()  // so do its streams
             runCatching { SharedMemory.unmap(buffer) }
             runCatching { fd.close() }
             runCatching { memory.close() }

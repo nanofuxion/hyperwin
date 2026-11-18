@@ -208,6 +208,8 @@ object AvfLaunch {
             sharedWindow = window
             HwGpu.start(ctx, window, width, height)
             FileShare.start(ctx, window.buffer)
+            GuestAudio.start(ctx, window.buffer)
+            WindowsService.start(ctx)
             startDebugTap(window, File(dir, "frame.bgra"))
             startCppcCounter(window)
             val report = boot(
@@ -251,6 +253,8 @@ object AvfLaunch {
         sharedWindow = window
         HwGpu.start(ctx, window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
         FileShare.start(ctx, window.buffer)
+        GuestAudio.start(ctx, window.buffer)
+        WindowsService.start(ctx)
         startDebugTap(window, File(dir, "frame.bgra"))
         startCppcCounter(window)
         val report = boot(
@@ -285,6 +289,7 @@ object AvfLaunch {
             VsockInput.stop()
             GuestAgent.stop()
             HwGpu.stop()
+            WindowsService.stop()
             runCatching { onVmStopped() }
             sharedWindow?.let { window ->
                 sharedWindow = null
@@ -516,6 +521,7 @@ object AvfLaunch {
         VsockInput.stop()
         GuestAgent.stop()
         HwGpu.stop()
+        WindowsService.stop()
         runCatching { onVmStopped() }
         if (window != null && sharedWindow === window) {
             sharedWindow = null

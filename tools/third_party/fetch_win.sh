@@ -2,7 +2,7 @@
 # Downloads what the Windows-side pieces need into build/third_party/win:
 #   llvm-mingw  compiler for guest/agent (Windows ARM64 user mode)
 #   wintun      network adapter the agent drives (prebuilt, signed)
-#   scream      virtual sound card; tools/machine_assets.sh re-signs it
+#   scream      only for its ARM64 devcon.exe, which installs the root sound device (hwaudio)
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 DL=$ROOT/build/third_party/dl
