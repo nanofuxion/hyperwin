@@ -622,6 +622,7 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
 static NTSTATUS NTAPI HwStopDevice(CONST PVOID ctx)
 {
     (void)ctx;
+    hwd_stop();
     if (g.timer) {
         ExDeleteTimer(g.timer, TRUE, FALSE, NULL);
         g.timer = NULL;
@@ -987,9 +988,7 @@ static NTSTATUS NTAPI HwCollectDbgInfo(const HANDLE hAdapter, const DXGKARG_COLL
 static NTSTATUS NTAPI HwControlInterrupt(const HANDLE hAdapter, const DXGK_INTERRUPT_TYPE type, BOOLEAN enable)
 {
     (void)hAdapter;
-    (void)type;
-    (void)enable;
-    return STATUS_SUCCESS;
+    return hwd_control_interrupt(type, enable);
 }
 
 /* The engine and power DDIs of WDDM 1.2 and later, answered for an adapter with one engine that is

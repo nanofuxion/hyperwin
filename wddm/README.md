@@ -626,6 +626,20 @@ What went wrong on the way, and what is there now because of it:
   Windows' cached metadata and ntfs-3g will only mount it read-only. Remove the list afterwards, then
   reinstall the package (`install-driver.ps1 hwgpuw Root\HwGpuAdapter`).
 
+### Second slice (2026-11-18): surfaces, present and vsync, not working yet
+
+With the switch on, the driver now answers Windows' surface entries (standard allocations for the
+primary, shadow and staging surfaces, create, open, describe, destroy), a kernel present that only
+moves a fenced no-op buffer, and a 60 Hz timer that stands in for the phone's vsync while Windows has
+the interrupt on. Allocation records carry `struct hww_alloc` (`include/hw_wddm.h`).
+
+Result: once Windows extends the desktop onto the adapter's screen, it logs `VIDEO_TDR_TIMEOUT_DETECTED`
+(0x117) live dumps in `C:\Windows\LiveKernelReports\WATCHDOG` about once a minute and finally stops.
+The desktop arrangement is remembered, so the next boot attaches again. The way out is to set
+`Display` to 0 in the minute after boot. Six of these runs ended with a disk check at boot, which found
+no problems. Not yet known: which submission times out. The next step is to log each submit's fence and
+flags and each vsync's address, and to try it on a spare machine, not the main one.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

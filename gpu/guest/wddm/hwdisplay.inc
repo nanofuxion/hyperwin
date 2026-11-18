@@ -17,7 +17,7 @@ static struct {
     BOOLEAN visible;
     PHYSICAL_ADDRESS source_addr;
     HANDLE source_alloc;
-    UINT commits, source_sets;
+    UINT commits, source_sets, presents, vsyncs;
 } d;
 
 static const struct hwd_mode hwd_extra[] = { { 1920, 1080 }, { 1600, 900 }, { 1366, 768 }, { 1280, 720 }, { 1024, 768 }, { 800, 600 } };
@@ -493,12 +493,252 @@ static NTSTATUS NTAPI HwdUpdateActiveVidPnPresentPath(const HANDLE hAdapter, con
     return ns;
 }
 
+/* ---- surfaces ----
+ * With the screen half on, Windows makes allocations here: its own (the desktop's primary, shadow and
+ * staging surfaces) and the user-mode driver's flippable ones. Each is a small record; the pixels of a
+ * program's surface live on the phone. Windows' own get system memory through the aperture segment, so
+ * what the CPU draws into them before DWM runs has somewhere to go. */
+struct hwd_alloc {
+    struct hww_alloc a;
+    D3DDDI_RATIONAL refresh;
+};
+static volatile LONG64 hwd_next_id;
+
+static NTSTATUS NTAPI HwdGetStandardData_impl(const HANDLE hAdapter, DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *arg)
+{
+    (void)hAdapter;
+    arg->ResourcePrivateDriverDataSize = 0;
+    if (!arg->pAllocationPrivateDriverData) {
+        arg->AllocationPrivateDriverDataSize = sizeof(struct hww_alloc);
+        return STATUS_SUCCESS;
+    }
+    if (arg->AllocationPrivateDriverDataSize < sizeof(struct hww_alloc)) return STATUS_BUFFER_TOO_SMALL;
+    struct hww_alloc *a = arg->pAllocationPrivateDriverData;
+    RtlZeroMemory(a, sizeof *a);
+    a->magic = HWW_ALLOC_MAGIC;
+    a->id = (uint64_t)InterlockedIncrement64(&hwd_next_id) | (1ull << 63);
+    switch (arg->StandardAllocationType) {
+    case D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE:
+        a->kind = HWW_ALLOC_PRIMARY;
+        a->width = arg->pCreateSharedPrimarySurfaceData->Width;
+        a->height = arg->pCreateSharedPrimarySurfaceData->Height;
+        a->format = arg->pCreateSharedPrimarySurfaceData->Format;
+        a->source = arg->pCreateSharedPrimarySurfaceData->VidPnSourceId;
+        return STATUS_SUCCESS;
+    case D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE:
+        a->kind = HWW_ALLOC_SHADOW;
+        a->width = arg->pCreateShadowSurfaceData->Width;
+        a->height = arg->pCreateShadowSurfaceData->Height;
+        a->format = arg->pCreateShadowSurfaceData->Format;
+        arg->pCreateShadowSurfaceData->Pitch = a->width * 4;
+        return STATUS_SUCCESS;
+    case D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE:
+        a->kind = HWW_ALLOC_STAGING;
+        a->width = arg->pCreateStagingSurfaceData->Width;
+        a->height = arg->pCreateStagingSurfaceData->Height;
+        a->format = D3DDDIFMT_A8R8G8B8;
+        arg->pCreateStagingSurfaceData->Pitch = a->width * 4;
+        return STATUS_SUCCESS;
+    default:
+        return STATUS_NOT_SUPPORTED;
+    }
+}
+
+static NTSTATUS NTAPI HwdCreateAllocation_impl(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *ca)
+{
+    (void)hAdapter;
+    for (UINT i = 0; i < ca->NumAllocations; i++) {
+        DXGK_ALLOCATIONINFO *ai = &ca->pAllocationInfo[i];
+        const struct hww_alloc *in = ai->pPrivateDriverData;
+        if (!in || ai->PrivateDriverDataSize < sizeof *in || in->magic != HWW_ALLOC_MAGIC || !in->width || !in->height ||
+            in->width > 16384 || in->height > 16384)
+            return STATUS_INVALID_PARAMETER;
+        struct hwd_alloc *al = ExAllocatePoolWithTag(NonPagedPoolNx, sizeof *al, 'lAwH');
+        if (!al) return STATUS_NO_MEMORY;
+        RtlZeroMemory(al, sizeof *al);
+        al->a = *in;
+        al->refresh.Numerator = HWD_REFRESH_N;
+        al->refresh.Denominator = HWD_REFRESH_D;
+        ai->Alignment = 0;
+        ai->Size = ((SIZE_T)in->width * in->height * 4 + 0xfff) & ~(SIZE_T)0xfff;
+        ai->PitchAlignedSize = 0;
+        ai->HintedBank.Value = 0;
+        ai->PreferredSegment.Value = 0;
+        ai->SupportedReadSegmentSet = 1;
+        ai->SupportedWriteSegmentSet = 1;
+        ai->EvictionSegmentSet = 0;
+        ai->MaximumRenamingListLength = 0;
+        ai->hAllocation = al;
+        ai->Flags.Value = 0;
+        ai->Flags.CpuVisible = 1;
+        ai->pAllocationUsageHint = NULL;
+        ai->AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
+    }
+    if (ca->Flags.Resource && !ca->hResource) ca->hResource = (HANDLE)(ULONG_PTR)1;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwdDestroyAllocation_impl(const HANDLE hAdapter, const DXGKARG_DESTROYALLOCATION *da)
+{
+    (void)hAdapter;
+    for (UINT i = 0; i < da->NumAllocations; i++) {
+        if (da->pAllocationList[i] == d.source_alloc) d.source_alloc = NULL;
+        if (da->pAllocationList[i]) ExFreePoolWithTag(da->pAllocationList[i], 'lAwH');
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwdDescribeAllocation_impl(const HANDLE hAdapter, DXGKARG_DESCRIBEALLOCATION *da)
+{
+    (void)hAdapter;
+    const struct hwd_alloc *al = da->hAllocation;
+    if (!al) return STATUS_INVALID_PARAMETER;
+    da->Width = al->a.width;
+    da->Height = al->a.height;
+    da->Format = al->a.kind == HWW_ALLOC_UMD ? D3DDDIFMT_A8R8G8B8 : (D3DDDIFORMAT)al->a.format;
+    da->MultisampleMethod.NumSamples = 1;
+    da->MultisampleMethod.NumQualityLevels = 0;
+    da->RefreshRate = al->refresh;
+    da->PrivateDriverFormatAttribute = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwdOpenAllocation_impl(const HANDLE hDevice, const DXGKARG_OPENALLOCATION *oa)
+{
+    (void)hDevice;
+    for (UINT i = 0; i < oa->NumAllocations; i++) {
+        DXGKARGCB_GETHANDLEDATA gh;
+        RtlZeroMemory(&gh, sizeof gh);
+        gh.hObject = oa->pOpenAllocation[i].hAllocation;
+        gh.Type = DXGK_HANDLE_ALLOCATION;
+        PVOID al = g.dxgk.DxgkCbGetHandleData(&gh);
+        if (!al) return STATUS_INVALID_HANDLE;
+        oa->pOpenAllocation[i].hDeviceSpecificAllocation = al;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* A present asks for a DMA buffer that copies or flips. The copy or flip itself is the phone's: the
+ * user-mode driver tells its renderer. Here the buffer only has to exist and move through the queue. */
+static NTSTATUS NTAPI HwdPresent_impl(const HANDLE hContext, DXGKARG_PRESENT *pr)
+{
+    (void)hContext;
+    if (pr->DmaSize < 16) return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+    RtlZeroMemory(pr->pDmaBuffer, 16);
+    pr->pDmaBuffer = (UCHAR *)pr->pDmaBuffer + 16;
+    if (pr->pDmaBufferPrivateData && pr->DmaBufferPrivateDataSize >= sizeof(struct hww_marker)) {
+        RtlZeroMemory(pr->pDmaBufferPrivateData, sizeof(struct hww_marker));
+        pr->pDmaBufferPrivateData = (UCHAR *)pr->pDmaBufferPrivateData + sizeof(struct hww_marker);
+    }
+    d.presents++;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS NTAPI HwdQueryDeviceDescriptor(CONST PVOID ctx, ULONG uid, PDXGK_DEVICE_DESCRIPTOR desc)
 {
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdQueryDeviceDescriptor_impl(ctx, uid, desc);
     hwd_log("QueryDeviceDescriptor", ns);
     return ns;
+}
+
+static NTSTATUS NTAPI HwdGetStandardData(const HANDLE hAdapter, DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *arg)
+{
+    HWD_STEP(1000 + __COUNTER__);
+    NTSTATUS ns = HwdGetStandardData_impl(hAdapter, arg);
+    hwd_log("GetStandardData", ns);
+    return ns;
+}
+
+static NTSTATUS NTAPI HwdCreateAllocation(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *ca)
+{
+    HWD_STEP(1000 + __COUNTER__);
+    NTSTATUS ns = HwdCreateAllocation_impl(hAdapter, ca);
+    hwd_log("CreateAllocation", ns);
+    return ns;
+}
+
+static NTSTATUS NTAPI HwdDestroyAllocation(const HANDLE hAdapter, const DXGKARG_DESTROYALLOCATION *da)
+{
+    HWD_STEP(1000 + __COUNTER__);
+    NTSTATUS ns = HwdDestroyAllocation_impl(hAdapter, da);
+    hwd_log("DestroyAllocation", ns);
+    return ns;
+}
+
+static NTSTATUS NTAPI HwdDescribeAllocation(const HANDLE hAdapter, DXGKARG_DESCRIBEALLOCATION *da)
+{
+    HWD_STEP(1000 + __COUNTER__);
+    NTSTATUS ns = HwdDescribeAllocation_impl(hAdapter, da);
+    hwd_log("DescribeAllocation", ns);
+    return ns;
+}
+
+static NTSTATUS NTAPI HwdOpenAllocation(const HANDLE hDevice, const DXGKARG_OPENALLOCATION *oa)
+{
+    HWD_STEP(1000 + __COUNTER__);
+    NTSTATUS ns = HwdOpenAllocation_impl(hDevice, oa);
+    hwd_log("OpenAllocation", ns);
+    return ns;
+}
+
+static NTSTATUS NTAPI HwdPresent(const HANDLE hContext, DXGKARG_PRESENT *pr)
+{
+    HWD_STEP(1000 + __COUNTER__);
+    NTSTATUS ns = HwdPresent_impl(hContext, pr);
+    hwd_log("Present", ns);
+    return ns;
+}
+
+/* ---- vsync ----
+ * A flip is finished when the screen reports a vsync with the new address. Until the phone's own vsync
+ * timeline drives this (vsync/README.md), a 60 Hz timer stands in for it, running only while Windows
+ * has the interrupt enabled. Without it dxgkrnl's flip queue never moves and its watchdog fires. */
+static PEX_TIMER hwd_vsync_timer;
+static volatile LONG hwd_vsync_on;
+
+static BOOLEAN NTAPI hwd_vsync_sync(PVOID context)
+{
+    (void)context;
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA n;
+    RtlZeroMemory(&n, sizeof n);
+    n.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
+    n.CrtcVsync.VidPnTargetId = 0;
+    n.CrtcVsync.PhysicalAddress = d.source_addr;
+    g.dxgk.DxgkCbNotifyInterrupt(g.dxgk.DeviceHandle, &n);
+    g.dxgk.DxgkCbQueueDpc(g.dxgk.DeviceHandle);
+    return TRUE;
+}
+
+static VOID NTAPI hwd_vsync_tick(PEX_TIMER timer, PVOID context)
+{
+    (void)timer;
+    (void)context;
+    if (!hwd_vsync_on) return;
+    BOOLEAN ret;
+    g.dxgk.DxgkCbSynchronizeExecution(g.dxgk.DeviceHandle, hwd_vsync_sync, NULL, 0, &ret);
+    d.vsyncs++;
+}
+
+static NTSTATUS hwd_control_interrupt(DXGK_INTERRUPT_TYPE type, BOOLEAN enable)
+{
+    if (!d.on || type != DXGK_INTERRUPT_CRTC_VSYNC) return STATUS_SUCCESS;
+    if (!hwd_vsync_timer) {
+        hwd_vsync_timer = ExAllocateTimer(hwd_vsync_tick, NULL, EX_TIMER_HIGH_RESOLUTION);
+        if (!hwd_vsync_timer) return STATUS_NO_MEMORY;
+        ExSetTimer(hwd_vsync_timer, -166667, 166667, NULL);   /* 100 ns units: 60 Hz */
+    }
+    InterlockedExchange(&hwd_vsync_on, enable ? 1 : 0);
+    return STATUS_SUCCESS;
+}
+
+static void hwd_stop(void)
+{
+    InterlockedExchange(&hwd_vsync_on, 0);
+    if (hwd_vsync_timer) {
+        ExDeleteTimer(hwd_vsync_timer, TRUE, TRUE, NULL);
+        hwd_vsync_timer = NULL;
+    }
 }
 
 /* Called from DriverEntry: read the switch, and fill the display entries only when it is on. */
@@ -527,4 +767,10 @@ static void hwd_setup(DRIVER_INITIALIZATION_DATA *init)
     init->DxgkDdiGetScanLine = HwdGetScanLine;
     init->DxgkDdiSetPointerPosition = HwdSetPointerPosition;
     init->DxgkDdiSetPointerShape = HwdSetPointerShape;
+    init->DxgkDdiGetStandardAllocationDriverData = HwdGetStandardData;
+    init->DxgkDdiCreateAllocation = HwdCreateAllocation;
+    init->DxgkDdiDestroyAllocation = HwdDestroyAllocation;
+    init->DxgkDdiDescribeAllocation = HwdDescribeAllocation;
+    init->DxgkDdiOpenAllocation = HwdOpenAllocation;
+    init->DxgkDdiPresent = HwdPresent;
 }

@@ -109,4 +109,22 @@ _Static_assert(sizeof(struct hww_chan) == 32, "hww_chan");
 _Static_assert(sizeof(struct hww_escape) == 16 + 96, "hww_escape");
 _Static_assert(sizeof(struct hww_marker) == 24, "hww_marker");
 
+/* What an allocation is, as its private driver data: written by the kernel driver for Windows' own
+ * surfaces (the desktop's primary and friends) and by the user-mode driver for a program's. Windows
+ * hands it back to whoever opens the allocation, in any process, so `id` names the surface everywhere. */
+#define HWW_ALLOC_MAGIC   0x4c415748u   /* "HWAL" */
+#define HWW_ALLOC_PRIMARY 1u   /* a screen's primary surface */
+#define HWW_ALLOC_SHADOW  2u
+#define HWW_ALLOC_STAGING 3u
+#define HWW_ALLOC_UMD     4u   /* made by the user-mode driver */
+struct hww_alloc {
+    uint32_t magic;
+    uint32_t kind;
+    uint32_t width, height;
+    uint32_t format;      /* D3DDDIFORMAT for Windows' own, DXGI_FORMAT for the user-mode driver's */
+    uint32_t source;      /* screen (VidPN source) of a primary */
+    uint64_t id;          /* kernel-made ids have the top bit set */
+};
+_Static_assert(sizeof(struct hww_alloc) == 32, "hww_alloc");
+
 #endif
