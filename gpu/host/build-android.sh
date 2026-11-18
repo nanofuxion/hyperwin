@@ -14,8 +14,12 @@ OUT=$HERE/../work/android/arm64-v8a
 mkdir -p "$OUT"
 "$CXX" -std=c++17 -O2 -fPIC -shared -Wall -Wextra -Wno-missing-field-initializers \
   -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/hwgpu_host.cpp" "$HERE/hwgpu_jni.cpp" \
-  -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
+  -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -ldl -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
   -o "$OUT/libhwgpu.so"
+# libhwd3d.so (hwd3d/hwd3d.cpp): HwD3D channels, which libhwgpu.so hands over (d3d/README.md).
+"$CXX" -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra -Wno-missing-field-initializers \
+  -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -llog -nostdlib++ -lc++_shared \
+  -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
 cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"
 # ring_test for the phone's shell: adb push gpu/work/android/arm64-v8a /data/local/tmp/hwgpu, then

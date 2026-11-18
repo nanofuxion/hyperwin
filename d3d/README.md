@@ -235,6 +235,34 @@ So HwD3D goes ahead. Notes from the run:
   must set one. In `adb shell` it aborted on the read-only root.
 - The Windows VM was running, idle, during the test, as it will be for real.
 
+## Phase 1 result (2026-11-18): the channel speaks HwD3D
+
+- **`include/hw_d3d.h`**: every message starts with a 16-byte header: size,
+  the magic `HD3D`, op, flags, sequence. Hello, NOP and PING so far, with
+  static asserts on every size.
+- **The protocol choice:** `serve_one` in `gpu/host/hwgpu_host.cpp` reads a
+  new request's first 28 bytes as before. When the second word is the magic, no
+  sgpu command can have that type, so the channel is HwD3D's. It `dlopen`s
+  `libhwd3d.so` once and hands the channel to a thread of its own, which
+  serves it until the program closes the device. The sgpu loop skips that
+  channel. Stopping the renderer ends those threads first.
+- **`libhwd3d.so`** (`gpu/host/hwd3d/hwd3d.cpp`, built by
+  `gpu/host/build-android.sh`, packed in the app) answers hello with its
+  version, counts NOPs and answers PING with the count. An unknown op gets
+  `E_NOTIMPL`. A bad header drops the channel, as sgpu does.
+- **The test:** `guest/tools/d3dping.c` in Windows.
+
+| d3dping, Pixel 6 Pro | Result |
+|---|---|
+| 10,000 no-reply requests, then a ping | all 10,002 counted, 1.3 ms, 0.13 us each |
+| Round trip, one waiting request at a time | 1 to 7 us |
+| Round trip before the 200 us spin below | 86.5 us |
+
+The thread first waited with `hwgpu_read_all`'s sleeps, 50 us at least, so
+each answer cost two of them. It now only yields for 200 us after each
+request, as the sgpu loop does. Vulkan programs still run on the other
+channels.
+
 ## Things to check early
 
 - DXVK's native build on bionic: its threading, `dlopen` of Vulkan, and the

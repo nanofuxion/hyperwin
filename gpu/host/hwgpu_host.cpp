@@ -11,6 +11,9 @@
 
 #include "hwgpu_host.h"
 
+#include <hw_d3d.h>
+
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +68,7 @@ struct Mapping {
 
 struct Slot {
     uint32_t generation = 0;  // the connection being served, 0 for none
+    bool hwd3d = false;       // libhwd3d.so's thread serves this connection, not serve_one
     std::set<uint32_t> resources, contexts;
     // Heap ranges a process still had mapped when this renderer started: kept from reuse until
     // that process lets go of its channel.
@@ -850,6 +854,33 @@ fence:
     return true;
 }
 
+// libhwd3d.so (gpu/host/hwd3d/hwd3d.cpp), loaded on the first HwD3D channel.
+std::atomic<int> g_hwd3d_threads{0};
+using hwd3d_serve_fn = void (*)(void* chan, uint32_t slot, uint32_t generation, const void* first, size_t first_len);
+
+// Hands channel i's connection, whose first bytes are `first`, to a thread in libhwd3d.so.
+bool start_hwd3d(uint32_t i, uint32_t gen, const uint8_t* first, size_t len) {
+    static hwd3d_serve_fn serve = [] {
+        void* lib = dlopen("libhwd3d.so", RTLD_NOW | RTLD_LOCAL);
+        auto fn = lib ? reinterpret_cast<hwd3d_serve_fn>(dlsym(lib, "hwd3d_serve")) : nullptr;
+        if (!fn) LOG("no HwD3D: %s", dlerror());
+        return fn;
+    }();
+    if (!serve) return false;
+    std::vector<uint8_t> head(first, first + len);
+    g_hwd3d_threads++;
+    std::thread([i, gen, head = std::move(head)] {
+        void* chan = chan_base(i);
+        serve(chan, i, gen, head.data(), head.size());
+        // Ended by the program closing, or by a bad stream: then stop serving the channel, and
+        // its program gets errors until it closes the device, as with sgpu.
+        hwgpu_ctl* c = hwgpu_chan_ctl(chan);
+        if (hwgpu_alive(c, gen)) __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
+        g_hwd3d_threads--;
+    }).detach();
+    return true;
+}
+
 // Serves one request on a channel when one has started arriving. Returns true when it did.
 bool serve_one(uint32_t i) {
     void* chan = chan_base(i);
@@ -874,9 +905,11 @@ bool serve_one(uint32_t i) {
         memset(c->scanout_free, 0, sizeof(c->scanout_free));
         __atomic_store_n(&c->scanout_flags, g_scanout_flags.load(), __ATOMIC_RELEASE);
         s.generation = gen;
+        s.hwd3d = false;
         __atomic_store_n(&c->host_state, HWGPU_HOST_READY, __ATOMIC_RELEASE);
         LOG("channel %u open, generation %u", i, gen);
     }
+    if (s.hwd3d) return false;
     if (__atomic_load_n(&c->host_state, __ATOMIC_RELAXED) != HWGPU_HOST_READY) return false;  // dropped
     if (__atomic_load_n(&c->tx_head, __ATOMIC_ACQUIRE) == __atomic_load_n(&c->tx_tail, __ATOMIC_RELAXED))
         return false;
@@ -887,10 +920,17 @@ bool serve_one(uint32_t i) {
     uint32_t len = 0;
     std::vector<uint8_t> m;
     bool ok = hwgpu_read_all(chan, gen, 0, prefix, sizeof(prefix));
-    if (ok) {
+    uint32_t word1;
+    memcpy(&word1, prefix + sizeof(len), sizeof(word1));
+    if (ok && word1 == HWD3D_MAGIC) {
+        // Not sgpu: an HwD3D program (include/hw_d3d.h). Its channel gets a thread of its own.
+        ok = start_hwd3d(i, gen, prefix, sizeof(prefix));
+        if (ok) s.hwd3d = true;
+    } else if (ok) {
         memcpy(&len, prefix, sizeof(len));
         ok = len >= sizeof(vgpu_hdr) && len <= kMaxMessage;
     }
+    if (ok && s.hwd3d) return true;
     if (ok) {
         m.resize(len);
         memcpy(m.data(), prefix + sizeof(len), sizeof(vgpu_hdr));
@@ -1092,6 +1132,10 @@ uint64_t hwgpu_host_scanout_frames(void) {
 void hwgpu_host_stop(void) {
     if (!g_run.exchange(false)) return;
     g_thread.join();
+    // HwD3D threads end when their channel stops being served.
+    for (uint32_t i = 0; i < HWGPU_CHANNELS; i++)
+        if (g_slots[i].hwd3d) __atomic_store_n(&hwgpu_chan_ctl(chan_base(i))->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
+    while (g_hwd3d_threads.load()) hwgpu_pause(1000);
     for (auto& s : g_slots) drop_slot(s);
     __atomic_store_n(&hwgpu_hdr(g_window)->magic, 0, __ATOMIC_RELEASE);
 }
