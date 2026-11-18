@@ -15,6 +15,9 @@ rem Apps link to the Vulkan loader, which Windows does not ship. Keep one someth
 rem and update ours (the marker says System32's copy came from here).
 if not exist %SystemRoot%\System32\vulkan-1.dll echo.> %G%\vulkan-1.ours
 if exist %G%\vulkan-1.ours copy /y %G%\vulkan-1.dll %SystemRoot%\System32\vulkan-1.dll
+rem The same for 32-bit programs, which look in SysWOW64.
+if not exist %SystemRoot%\SysWOW64\vulkan-1.dll echo.> %G%\vulkan-1-x86.ours
+if exist %G%\vulkan-1-x86.ours copy /y %G%\vulkan-1_x86.dll %SystemRoot%\SysWOW64\vulkan-1.dll
 rem The keyboard, mouse and gamepad driver: Windows keeps a loaded driver's file open, so the old
 rem one is moved aside, and the new one loads at the next start.
 set D=%SystemRoot%\System32\drivers

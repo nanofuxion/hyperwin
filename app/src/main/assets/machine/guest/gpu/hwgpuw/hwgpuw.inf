@@ -7,7 +7,7 @@ Class       = System
 ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %Mfg%
 CatalogFile = hwgpuw.cat
-DriverVer   = 11/18/2026,1.0.49628.24433
+DriverVer   = 11/18/2026,1.0.59977.51759
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -22,6 +22,8 @@ Hw.D3D      = 13
 hwgpuw.sys        = 1
 vulkan_hwgpu.dll  = 1
 vulkan_hwgpu.json = 1
+vulkan_hwgpu_x86.dll  = 1
+vulkan_hwgpu_x86.json = 1
 hwd3d_umd.dll     = 1
 hwd3d_umd_x86.dll = 1
 
@@ -42,6 +44,8 @@ hwgpuw.sys,,,0x100
 [Hw.Vulkan]
 vulkan_hwgpu.dll,,,0x100
 vulkan_hwgpu.json,,,0x100
+vulkan_hwgpu_x86.dll,,,0x100
+vulkan_hwgpu_x86.json,,,0x100
 
 [Hw.D3D]
 hwd3d_umd.dll,,,0x100
@@ -59,6 +63,7 @@ ServiceBinary  = %13%\hwgpuw.sys
 
 [Install.AddReg]
 HKR,,VulkanDriverName,0,"%13%\vulkan_hwgpu.json"
+HKR,,VulkanDriverNameWow,0,"%13%\vulkan_hwgpu_x86.json"
 ; The Direct3D 10/11 driver (gpu/guest/hwd3d/umd.cpp, wddm/README.md phase 4). The 32-bit one is the same code built for i686.
 ; One name per Direct3D version, in order: 9, 10, 11, 12. Full paths: the kernel opens them to read their version.
 HKR,,UserModeDriverName,0x00010000,"%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll"

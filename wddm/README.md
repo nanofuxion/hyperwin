@@ -588,7 +588,11 @@ object wanted.
 - Byte counters after Vulkan, Direct3D 11 and OpenGL (Zink beside the program) runs: 0 bytes copied into
   or out of Windows by the phone, 0 by the kernel driver. The windowed Direct3D read-back (see "Present,
   until the display phase") is a program's own Map and is not in these counters yet.
-- Done means still open: `gltest` as x86, `dxtest 12`, the AIO scenes through the driver, DWM on the GPU.
+- 32-bit Vulkan: `vkpresent` built as i686 runs through the x86 loader and driver, 59.4 FPS (ARM64 55.8).
+  The INF's `VulkanDriverNameWow` names the 32-bit manifest.
+- The start guard (`Attempts` in the service's Parameters key) counted two fast restarts in a row as two
+  crashes and kept the adapter off (problem 0x19, status 0xC0000001). A clean stop now clears the count.
+- Done means still open: `gltest` as x86 (needs a 32-bit Zink), `dxtest 12`, the AIO scenes through the driver, DWM on the GPU.
 
 ## Things to check early
 

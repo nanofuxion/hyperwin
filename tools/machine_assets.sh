@@ -22,13 +22,13 @@ cp "$ROOT/build/agent/hwagent.exe" "$WIN/wintun/wintun/bin/arm64/wintun.dll" "$R
 # GPU (gpu/README.md): the ring driver and the Vulkan driver Windows apps load. Built here when
 # missing; the Mesa build takes a while the first time.
 [ -f "$ROOT/gpu/work/direct/hwgpu.sys" ] || sh "$ROOT/gpu/guest/direct/build.sh"
-[ -f "$ROOT/gpu/work/out/vulkan_hwgpu.dll" ] || bash "$ROOT/gpu/guest/mesa/build.sh"
-[ -f "$ROOT/gpu/work/out/vulkan-1.dll" ] || bash "$ROOT/gpu/guest/loader/build.sh"
+[ -f "$ROOT/gpu/work/out/vulkan_hwgpu.dll" ] && [ -f "$ROOT/gpu/work/out/vulkan_hwgpu_x86.dll" ] || bash "$ROOT/gpu/guest/mesa/build.sh"
+[ -f "$ROOT/gpu/work/out/vulkan-1.dll" ] && [ -f "$ROOT/gpu/work/out/vulkan-1_x86.dll" ] || bash "$ROOT/gpu/guest/loader/build.sh"
 [ -f "$ROOT/gpu/work/out/dx/zink/opengl32.dll" ] || bash "$ROOT/gpu/guest/dx/build.sh"
 [ -f "$ROOT/gpu/work/out/dx/test/gltest-x64.exe" ] || bash "$ROOT/gpu/guest/dx/test/build.sh"
 mkdir -p "$OUT/guest/gpu"
 cp "$ROOT/gpu/work/direct/hwgpu.sys" "$ROOT/gpu/work/out/vulkan_hwgpu.dll" "$ROOT/gpu/work/out/vulkan_hwgpu.json" \
-   "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vktest-x64.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$OUT/guest/gpu/"
+   "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vktest-x64.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$ROOT/gpu/work/out/vulkan-1_x86.dll" "$OUT/guest/gpu/"
 # The input driver too, so machines made before a change get it (gpu-install.cmd swaps it in;
 # it loads at the next start). New machines already have it from drivers.json.
 cp "$ROOT/build/hwvsinput/hwvsinput.sys" "$OUT/guest/gpu/"

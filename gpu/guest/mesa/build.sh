@@ -3,7 +3,7 @@
 # (windows.patch), plus vktest.exe, SweetCider's triangle check, to run inside Windows. The driver
 # is ARM64X (gpu/guest/arm64x): ARM64 apps and x64 apps under emulation both load it.
 #   gpu/guest/mesa/build.sh [workdir]
-# Output in gpu/work/out/: vulkan_hwgpu.dll, vulkan_hwgpu.json, vktest.exe.
+# Output in gpu/work/out/: vulkan_hwgpu.dll, vulkan_hwgpu.json, the same as _x86 for 32-bit programs, vktest.exe.
 # Needs meson, ninja, mako, pyyaml, and llvm-mingw in build/third_party/win (tools/third_party).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -45,6 +45,29 @@ cat > "$OUT/vulkan_hwgpu.json" <<'JSON'
     }
 }
 JSON
+# The 32-bit driver, for x86 programs: a plain i686 build of the same source (gpu/guest/mesa/x86.ini).
+cat > "$WORK/x86.ini" <<INI
+[binaries]
+c = '$T/i686-w64-mingw32-clang'
+cpp = '$T/i686-w64-mingw32-clang++'
+ar = '$T/llvm-ar'
+strip = '$T/llvm-strip'
+windres = '$T/i686-w64-mingw32-windres'
+pkg-config = 'false'
+[host_machine]
+system = 'windows'
+cpu_family = 'x86'
+cpu = 'i686'
+endian = 'little'
+INI
+[ -d "$WORK/build-x86" ] || meson setup "$WORK/build-x86" "$SRC" --cross-file "$WORK/x86.ini" \
+  -Dvulkan-drivers=gfxstream -Dgallium-drivers= -Dplatforms=windows -Dglx=disabled -Degl=disabled \
+  -Dgles1=disabled -Dgles2=disabled -Dopengl=false -Dllvm=disabled -Dvalgrind=disabled \
+  -Dlibunwind=disabled -Dzstd=disabled -Dmicrosoft-clc=disabled -Dspirv-to-dxil=false \
+  -Dbuildtype=debugoptimized "-Dc_link_args=['-static','-Wl,--gc-sections','-Wl,--kill-at']" "-Dcpp_link_args=['-static','-Wl,--gc-sections','-Wl,--kill-at']"
+ninja -C "$WORK/build-x86" src/gfxstream/guest/vulkan/libvulkan_gfxstream.dll
+"$T/llvm-strip" -o "$OUT/vulkan_hwgpu_x86.dll" "$WORK/build-x86/src/gfxstream/guest/vulkan/libvulkan_gfxstream.dll"
+sed -e 's/vulkan_hwgpu.dll/vulkan_hwgpu_x86.dll/' -e 's/"64"/"32"/' "$OUT/vulkan_hwgpu.json" > "$OUT/vulkan_hwgpu_x86.json"
 # vktest loads the driver directly; dlopen and friends map onto LoadLibrary.
 cat > "$WORK/shim/dlfcn.h" <<'H'
 #include <windows.h>

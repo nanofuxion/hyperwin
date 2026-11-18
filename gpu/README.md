@@ -200,7 +200,9 @@ Windows apps reach the driver through `vulkan-1.dll` (`guest/loader/build.sh`), 
 
 Every Windows DLL here is ARM64X (`guest/arm64x`): one file with ARM64 code for ARM64 programs and
 ARM64EC code for x64 programs under emulation, so both run natively against the same driver and
-loader. 32-bit x86 programs are not covered. ARM64EC claims `__x86_64__`, so windows.patch also
+loader. 32-bit x86 programs have their own plain i686 build of both: `vulkan_hwgpu_x86.dll` (linked
+with `--kill-at`, or the loader cannot find `vk_icdGetInstanceProcAddr`) found through the adapter's
+`VulkanDriverNameWow`, and `vulkan-1_x86.dll`, which `gpu-install.cmd` puts in SysWOW64. ARM64EC claims `__x86_64__`, so windows.patch also
 keeps Mesa off its x86 paths there, and gives Mesa's optional entry points `/alternatename`
 fallbacks in the ARM64EC half, since lld resolves weak symbols there to NULL.
 

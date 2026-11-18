@@ -84,7 +84,7 @@ static void *window(void) { return (UCHAR *)g.ring - HWGPU_RING_OFF; }
 
 /* A miniport that bugchecks while it starts would stop Windows booting. DriverEntry counts attempts in
  * the service's Parameters key and refuses to load when two went wrong in a row; the count is cleared
- * once the adapter has been up for ten seconds. */
+ * once the adapter has been up for ten seconds, or stops cleanly. */
 static ULONG guard_count(BOOLEAN write, ULONG value)
 {
     HANDLE key = NULL;
@@ -185,6 +185,8 @@ static void guard_stop(void)
     KeWaitForSingleObject(g_guard_thread, Executive, KernelMode, FALSE, NULL);
     ObDereferenceObject(g_guard_thread);
     g_guard_thread = NULL;
+    /* A start that reaches a stop did not crash, however soon after it began. */
+    guard_count(TRUE, 0);
 }
 
 /* ---- mapping into a process ---- */
