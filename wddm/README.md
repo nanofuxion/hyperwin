@@ -640,6 +640,41 @@ The desktop arrangement is remembered, so the next boot attaches again. The way 
 no problems. Not yet known: which submission times out. The next step is to log each submit's fence and
 flags and each vsync's address, and to try it on a spare machine, not the main one.
 
+### The screen as an indirect display (2026-11-18): working on the spare machine
+
+The kernel screen half above froze Windows. The route now is IddCx: `gpu/guest/idd/hwidd.dll`, a UMDF 2
+driver in WUDFHost.exe, so a fault ends a process, not Windows. On a spare machine (machine2 in the app,
+made from the same ISO) it shows as `\\.\DISPLAYn | HyperWin screen` with 1280x720, 1920x1080, 1600x900
+and 1024x768 at 60 Hz, takes the desktop when extended onto it, and receives frames: the saved one shows
+the wallpaper and taskbar.
+
+How it is built, within the WDK rules:
+
+- WDF headers: Microsoft's MIT-licensed Windows-Driver-Frameworks (UMDF 2.33), copied into `gpu/work` and
+  patched in three places for clang (`build.sh`). `mingw-shim.h` fills what mingw lacks.
+- IddCx.h: WDK, headers only, version 1.8 by default (`IDDV`). Windows 11 22621 runs IddCx 1.9.
+- No WDK library: `fxstub.cpp` is the start-up the WDK stubs would give. `FxDriverEntryUm` gets WUDFHost's
+  loader interface (version bind at +0x08, class bind at +0x18) and binds WDF (`WUDFx02000`, 2.33) and
+  IddCx with the public bind record layouts, then calls `DriverEntry`.
+
+What Windows insisted on (IddCx.dll's own messages say so):
+
+- `UmdfExtensions = IddCx0102` goes in the service section, as in Windows' `rdpidd.inf`. In the `.Wdf`
+  section the extension is not loaded and binding fails with `STATUS_INVALID_PARAMETER`.
+- Monitor modes need vsync divider 0; target modes need it non-zero. Otherwise arrival fails, also with
+  `STATUS_INVALID_PARAMETER`.
+- `MaxDisplayPipelineRate` 0 leaves the screen with no modes.
+- The monitor has an EDID (built in `make_edid`).
+- DWM on the HyperWin GPU fails today (the Direct3D driver refuses programs in System32, and surfaces are
+  not shared across programs yet), and the screen then gets no frames. So the driver asks for Windows'
+  software renderer (`IddCxAdapterSetRenderAdapter`). Frames are CPU-drawn until those two land; then the
+  render adapter becomes the HyperWin GPU and frames stay on the phone.
+
+Not yet: the frames go nowhere (counted, one saved to `C:\ProgramData\HyperWin\idd-frame.raw`). Next:
+send them to the phone's screen, make this screen the main one, and the steps above for zero copies.
+Install by hand for now: put `build/hwidd/pkg` in `C:\HyperWin\gpu\hwidd` and run
+`install-driver.ps1 hwidd Root\HwIdd`. Log: `C:\ProgramData\HyperWin\idd.log`.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
