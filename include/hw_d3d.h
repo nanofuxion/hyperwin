@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 #define HWD3D_MAGIC    0x44334448u   /* "HD3D" little endian */
-#define HWD3D_VERSION  5u
+#define HWD3D_VERSION  6u   /* 6: the staging area is asked for (HWD3D_OP_STAGING), not given at hello */
 
 /* hwd3d_msg.flags */
 #define HWD3D_NO_REPLY 0x0001u   /* the phone answers nothing, not even an error */
@@ -33,6 +33,7 @@
 #define HWD3D_OP_RELEASE        0x0011u   /* the guest let go of object; no answer */
 #define HWD3D_OP_CREATE_FACTORY 0x0012u   /* CreateDXGIFactory1: riid -> handle, interface */
 #define HWD3D_OP_CREATE_DEVICE  0x0013u   /* D3D11CreateDevice -> device, level, context */
+#define HWD3D_OP_STAGING        0x0014u   /* hwd3d_msg only -> hwd3d_hello_reply with the staging area, when the guest first needs one */
 
 /* hwd3d_msg arrays: inline, or in the staging area. */
 #define HWD3D_INLINE 1u

@@ -832,7 +832,14 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
         r.r.hdr = {uint32_t(sizeof r), HWD3D_MAGIC, h.op, HWD3D_REPLY, h.seq};
         r.r.status = hello.version == HWD3D_VERSION ? 0 : int32_t(0x80004005);  // E_FAIL
         r.version = HWD3D_VERSION;
-        if (!c.stage && hello.version == HWD3D_VERSION) {
+        return (h.flags & HWD3D_NO_REPLY) || send(c, &r, sizeof r);
+    }
+    case HWD3D_OP_STAGING: {
+        // Asked for when a program first has a big array to send. A program that never does holds no heap.
+        hwd3d_hello_reply r{};
+        r.r.hdr = {uint32_t(sizeof r), HWD3D_MAGIC, h.op, HWD3D_REPLY, h.seq};
+        r.version = HWD3D_VERSION;
+        if (!c.stage) {
             uint64_t off = 0;
             c.stage = static_cast<uint8_t*>(hwgpu_host_heap_grant(c.slot, kStaging, &off));
             if (c.stage) {

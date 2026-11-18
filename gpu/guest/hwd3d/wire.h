@@ -29,6 +29,9 @@ static uint8_t g_qused[HWD3D_QUERY_SLOTS];
 static SRWLOCK g_lock = SRWLOCK_INIT;  /* one call at a time on the channel */
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static int g_ok;                       /* the phone speaks HwD3D */
+static HANDLE g_dev = INVALID_HANDLE_VALUE;  /* the legacy device, when the channel did not come from the adapter */
+static uint32_t g_slot;
+static int g_stage_tried;              /* the staging area has been asked for */
 
 static void hlog(const char *fmt, ...)
 {
@@ -123,19 +126,8 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
     if (raw_send(&h, sizeof h) && raw_recv(&r, sizeof r) && r.r.hdr.magic == HWD3D_MAGIC && r.r.status == 0 &&
         r.version == HWD3D_VERSION) {
         g_ok = 1;
-        /* The staging area, where uploads go instead of the ring. Without it they ride inline. */
-        struct hwgpu_map_in in = {r.staging_offset, r.staging_size};
-        struct hwgpu_map_out out = {0};
-        int mapped = 0;
-        if (r.staging_size > HWD3D_STAGING_DATA) {
-            if (g_adapter) mapped = hww_map(g_adapter, o.slot, r.staging_offset, r.staging_size, &out.user) >= 0 && out.user;
-            else mapped = DeviceIoControl(dev, IOCTL_HWGPU_MAP, &in, sizeof in, &out, sizeof out, &got, NULL) && out.user;
-        }
-        if (mapped) {
-            g_stage = (uint8_t *)(uintptr_t)out.user;
-            g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
-            g_qpage = (volatile struct hwd3d_query_slot *)(g_stage + r.staging_size - HWD3D_QUERY_PAGE);
-        }
+        g_dev = dev;
+        g_slot = o.slot;
         send_program();
     } else
         hlog("hwd3d: the phone has no HwD3D %u (status 0x%lx), using Windows' Direct3D\n", HWD3D_VERSION,
@@ -177,11 +169,39 @@ static void put(struct wbuf *b, const void *v, uint32_t n)
 static void put32(struct wbuf *b, uint32_t v) { put(b, &v, 4); }
 static void put_want(struct wbuf *b, const void *p) { put32(b, p != NULL); }
 
+/* The staging area, where big uploads go instead of the ring, is asked of the phone when a program first has
+ * one. Many programs never do, and each area is a share of a heap that holds frames and Vulkan memory too.
+ * Without it, data rides inline. Under g_lock; nothing of the request being built has been sent. */
+#define HWD3D_STAGING_MIN (32u << 10)
+static void ensure_staging(void)
+{
+    if (g_stage || g_stage_tried || !g_ok) return;
+    g_stage_tried = 1;
+    struct hwd3d_msg m = {sizeof m, HWD3D_MAGIC, HWD3D_OP_STAGING, 0, ++g_seq};
+    struct hwd3d_hello_reply r;
+    memset(&r, 0, sizeof r);
+    if (!raw_send(&m, sizeof m) || !raw_recv(&r, sizeof r) || r.r.hdr.magic != HWD3D_MAGIC || r.r.status != 0) return;
+    struct hwgpu_map_in in = {r.staging_offset, r.staging_size};
+    struct hwgpu_map_out out = {0};
+    DWORD got = 0;
+    int mapped = 0;
+    if (r.staging_size > HWD3D_STAGING_DATA) {
+        if (g_adapter) mapped = hww_map(g_adapter, g_slot, r.staging_offset, r.staging_size, &out.user) >= 0 && out.user;
+        else mapped = DeviceIoControl(g_dev, IOCTL_HWGPU_MAP, &in, sizeof in, &out, sizeof out, &got, NULL) && out.user;
+    }
+    if (mapped) {
+        g_stage = (uint8_t *)(uintptr_t)out.user;
+        g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
+        g_qpage = (volatile struct hwd3d_query_slot *)(g_stage + r.staging_size - HWD3D_QUERY_PAGE);
+    }
+}
+
 /* Room for n bytes in the staging area, or null when it is missing or the data is too big for it.
  * Waits while the phone still needs what is there. Under g_lock, before the request is sent: every
  * request the phone is waiting on to free room has gone already. */
 static uint8_t *stage_alloc(uint64_t n, uint64_t *pos)
 {
+    if (!g_stage && n >= HWD3D_STAGING_MIN) ensure_staging();
     if (!g_stage || n > g_stage_cap / 2) return NULL;
     uint64_t at = g_stage_pos % g_stage_cap;
     if (at + n > g_stage_cap) g_stage_pos += g_stage_cap - at;  /* one array never wraps */
