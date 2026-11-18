@@ -257,13 +257,15 @@ HwD3D's per-program DLLs and the OpenGL ICD need neither.
    alongside.
 4. **The Direct3D 11 driver part.** Waits on the WDK. Test: `dxtest 11` with
    nothing copied beside it, DXGI lists a hardware adapter, and a game that
-   refused Basic Render now starts.
+   refused Basic Render now starts. Then measure the cost per submit and decide
+   on batching (see "Batching submits").
 5. **The OpenGL ICD on the adapter.** Test: `gltest` with nothing beside it,
    as ARM64, x64 and x86.
 6. **Display and render.** Modes, flips, vsync, GOP takeover, hardware
    cursor. Test: DWM draws on the GPU, the host's CPU use on a still desktop is
    near zero, a windowed game shows no read-back in the counters below, and
-   boot and recovery still show.
+   boot and recovery still show. Batching is settled before it starts, and flips
+   use the batched submit path if batching stays (see "Batching submits").
 7. **The Direct3D 9 driver part,** ARM64 and i686, which also covers 8, 7 and
    DirectDraw. Waits on the WDK. Test: AIO's D3D9, D3D8 and D3D7 cubes and a
    few 32-bit games, all with nothing beside them.
@@ -479,6 +481,38 @@ What the work found, for whoever picks it up:
 - **The default adapter.** DXGI lists the HyperWin GPU first, so a program that
   passes no adapter gets it. Until the driver makes a device, such a program fails
   with `0x887A0004`, as it did before this driver existed.
+
+## Batching submits (planned, 2026-11-18)
+
+A submit is one hand-over of work across the Windows kernel driver: a program's
+ring write that the phone will read, an answer the phone writes back, or a
+marker fence through `DxgkDdiSubmitCommand`. Each costs a trip through the driver
+and wakes the phone's serve loop. The question is whether fewer, bigger submits
+save power and frame time. The plan is to measure first and batch only if it pays.
+
+Counters, now. The byte counters gain submit counters beside them:
+
+- the ring control block of each channel counts messages guest to phone and phone
+  to guest, so a program's submits are read off its own channel;
+- the driver adds the totals of closed channels, the marker submits it handled,
+  and the live per-channel numbers (an escape reads them one channel at a time);
+- `hwwtest counters` prints them, per program (process id) and per direction.
+
+The baseline is recorded in this file, under "Submit baseline", as submits per
+second and per frame for the AIO scenes and the cube, before any batching.
+
+Rules, for the work in phase 4 and phase 6:
+
+- **Flush at every present and at every fence the program waits on.** A frame
+  must never wait on a queue nobody flushed. Any wait the program makes (a query
+  read, a map that reads, an event) flushes first.
+- **The batch size is a tunable constant** (`HWD3D_BATCH_BYTES` and
+  `HWD3D_BATCH_MESSAGES`, with defaults in one header), not a number written into
+  the code. A value of 0 turns batching off, so the unbatched path stays testable.
+- **Measure before and after**: latency of one call round trip, frame times (the
+  99th percentile as well as the mean), and the phone's power and heat over a
+  five minute run of the same scene. Keep batching only if it wins on both power
+  and frames. If it does not, take it out.
 
 ## Things to check early
 
