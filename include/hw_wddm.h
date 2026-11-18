@@ -22,6 +22,7 @@
 #define HWW_ESC_MAP      4u   /* map: a range of the shared GPU heap the channel was granted */
 #define HWW_ESC_UNMAP    5u   /* map.user */
 #define HWW_ESC_COUNTERS 6u   /* -> counters */
+#define HWW_ESC_CHANNEL  7u   /* chan.index -> chan: the index-th open channel, for submits per program */
 
 #pragma pack(push, 8)
 struct hww_info {
@@ -58,6 +59,19 @@ struct hww_counters {
     uint64_t markers_pending;        /* fences Windows is waiting on */
     uint64_t markers_done;
     uint64_t resets;                 /* times the renderer was replaced under a running adapter */
+    uint64_t submits_to_phone;       /* ring writes by programs, closed channels and open ones */
+    uint64_t submits_to_guest;       /* ring writes by the phone */
+    uint64_t marker_submits;         /* submissions with a marker through DxgkDdiSubmitCommand */
+};
+
+/* One open channel's own numbers: who has it and how many submits crossed it. */
+struct hww_chan {
+    uint32_t index;                  /* in: 0, 1, ... over the open channels */
+    uint32_t slot;                   /* out */
+    uint32_t pid;                    /* out: the process that has it */
+    uint32_t reserved;
+    uint64_t submits_to_phone;
+    uint64_t submits_to_guest;
 };
 
 struct hww_escape {
@@ -70,6 +84,7 @@ struct hww_escape {
         struct hww_open open;
         struct hww_map map;
         struct hww_counters counters;
+        struct hww_chan chan;
         uint32_t slot;         /* HWW_ESC_CLOSE */
     } u;
 };
@@ -89,8 +104,9 @@ struct hww_marker {
 
 _Static_assert(sizeof(struct hww_info) == 88, "hww_info");
 _Static_assert(sizeof(struct hww_map) == 32, "hww_map");
-_Static_assert(sizeof(struct hww_counters) == 72, "hww_counters");
-_Static_assert(sizeof(struct hww_escape) == 16 + 88, "hww_escape");
+_Static_assert(sizeof(struct hww_counters) == 96, "hww_counters");
+_Static_assert(sizeof(struct hww_chan) == 32, "hww_chan");
+_Static_assert(sizeof(struct hww_escape) == 16 + 96, "hww_escape");
 _Static_assert(sizeof(struct hww_marker) == 24, "hww_marker");
 
 #endif

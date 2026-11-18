@@ -23,7 +23,7 @@ DEF
 # The imports the object file asks for, taken from its own undefined symbols.
 llvm-nm -u "$OUT/hwgpuw.o" | sed -n 's/^ *U *//p' | sed 's/^__imp_//' | sort -u | /usr/bin/grep -v '^$' | sed 's/^PsThreadType$/PsThreadType DATA/' >> "$OUT/ntoskrnl.def"
 "$DLLTOOL" -m arm64 -d "$OUT/ntoskrnl.def" -l "$OUT/ntoskrnl.lib"
-lld-link /driver /subsystem:native /entry:DriverEntry /machine:arm64 /nodefaultlib /release /tsaware:no \
+lld-link /driver /subsystem:native /entry:DriverEntry /machine:arm64 /nodefaultlib /release /tsaware:no /integritycheck \
   /out:"$OUT/hwgpuw.unsigned.sys" "$OUT/hwgpuw.o" "$OUT/ntoskrnl.lib"
 osslsigncode sign -certs build/testcert/hyperwin-test.crt -key build/testcert/hyperwin-test.key -h sha256 \
   -n "HyperWin GPU" -in "$OUT/hwgpuw.unsigned.sys" -out "$OUT/hwgpuw.sys.new" >/dev/null

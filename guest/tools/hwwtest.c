@@ -25,6 +25,17 @@ static void counters(struct hww *w)
     printf("kernel driver copies:        %llu bytes\n", (unsigned long long)c->kernel_copies);
     printf("escapes %llu, channels opened %llu, mapped %llu bytes\n", (unsigned long long)c->escapes,
            (unsigned long long)c->channels_opened, (unsigned long long)c->mapped_bytes);
+    printf("submits to the phone %llu, to Windows %llu, with a marker %llu\n", (unsigned long long)c->submits_to_phone,
+           (unsigned long long)c->submits_to_guest, (unsigned long long)c->marker_submits);
+    for (uint32_t i = 0;; i++) {
+        struct hww_escape q;
+        memset(&q, 0, sizeof q);
+        q.op = HWW_ESC_CHANNEL;
+        q.u.chan.index = i;
+        if (hww_call(w, &q) < 0) break;
+        printf("  channel %u, process %u: %llu to the phone, %llu to Windows\n", q.u.chan.slot, q.u.chan.pid,
+               (unsigned long long)q.u.chan.submits_to_phone, (unsigned long long)q.u.chan.submits_to_guest);
+    }
     printf("markers pending %llu, done %llu, resets %llu\n", (unsigned long long)c->markers_pending,
            (unsigned long long)c->markers_done, (unsigned long long)c->resets);
 }

@@ -109,6 +109,21 @@ static ULONG guard_count(BOOLEAN write, ULONG value)
     return got;
 }
 
+/* A status for whoever reads the service's Parameters key: what the last start found. */
+static void report(const WCHAR *what, ULONG value)
+{
+    HANDLE key = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING path, name;
+    ULONG disp;
+    RtlInitUnicodeString(&path, g.guard_path);
+    InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateKey(&key, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp))) return;
+    RtlInitUnicodeString(&name, (PWSTR)what);
+    ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof value);
+    ZwClose(key);
+}
+
 /* Bring-up trace, built with -DHWW_TRACE: the names of the driver entries dxgkrnl calls, in order, kept in the
  * service's Parameters key as Trace2. */
 #ifdef HWW_TRACE
@@ -211,6 +226,11 @@ static void unmap_in_process(struct chan_ctx *c, PVOID user, PMDL mdl)
 
 static void free_chan(struct chan_ctx *c)
 {
+    {
+        struct hwgpu_ctl *ctl = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off((uint32_t)c->slot));
+        g.counters.submits_to_phone += __atomic_load_n(&ctl->submits_to_phone, __ATOMIC_RELAXED);
+        g.counters.submits_to_guest += __atomic_load_n(&ctl->submits_to_guest, __ATOMIC_RELAXED);
+    }
     /* Heap views first: the phone may hand their memory to someone else once the channel is free. */
     for (UINT i = 0; i < MAX_VIEWS; i++) {
         if (c->views[i].user) {
@@ -236,10 +256,12 @@ static struct chan_ctx *find_chan(int slot)
 
 /* A process is going away: its channels and mappings go with it. This runs in that process, as
  * Windows tears down its last thread, while its address space still exists. */
+static volatile LONG g_exits;
 static VOID NTAPI process_notify(HANDLE parent, HANDLE pid, BOOLEAN create)
 {
     (void)parent;
     if (create) return;
+    g_exits++;
     LIST_ENTRY dead;
     InitializeListHead(&dead);
     ExAcquireFastMutex(&g.lock);
@@ -415,6 +437,22 @@ static NTSTATUS NTAPI HwEscape(const HANDLE hAdapter, const DXGKARG_ESCAPE *arg)
     case HWW_ESC_UNMAP:
         st = esc_unmap(&e->u.map);
         break;
+    case HWW_ESC_CHANNEL: {
+        uint32_t want = e->u.chan.index, at = 0;
+        st = STATUS_NO_MORE_ENTRIES;
+        for (PLIST_ENTRY l = g.chans.Flink; l != &g.chans; l = l->Flink, at++) {
+            struct chan_ctx *c = CONTAINING_RECORD(l, struct chan_ctx, link);
+            if (at != want) continue;
+            struct hwgpu_ctl *ctl = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off((uint32_t)c->slot));
+            e->u.chan.slot = (uint32_t)c->slot;
+            e->u.chan.pid = (uint32_t)(ULONG_PTR)c->pid;
+            e->u.chan.submits_to_phone = __atomic_load_n(&ctl->submits_to_phone, __ATOMIC_RELAXED);
+            e->u.chan.submits_to_guest = __atomic_load_n(&ctl->submits_to_guest, __ATOMIC_RELAXED);
+            st = STATUS_SUCCESS;
+            break;
+        }
+        break;
+    }
     case HWW_ESC_COUNTERS: {
         struct hww_counters k = g.counters;
         if (g.ring && hwgpu_ring_valid(window())) {
@@ -422,6 +460,13 @@ static NTSTATUS NTAPI HwEscape(const HANDLE hAdapter, const DXGKARG_ESCAPE *arg)
             k.phone_copy_from_guest = __atomic_load_n(&hwgpu_hdr(window())->copy_from_guest, __ATOMIC_RELAXED);
         }
         k.markers_pending = g.pend_count;
+        /* The closed channels are in g.counters already; add the open ones. */
+        for (PLIST_ENTRY l = g.chans.Flink; l != &g.chans; l = l->Flink) {
+            struct chan_ctx *c = CONTAINING_RECORD(l, struct chan_ctx, link);
+            struct hwgpu_ctl *ctl = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off((uint32_t)c->slot));
+            k.submits_to_phone += __atomic_load_n(&ctl->submits_to_phone, __ATOMIC_RELAXED);
+            k.submits_to_guest += __atomic_load_n(&ctl->submits_to_guest, __ATOMIC_RELAXED);
+        }
         e->u.counters = k;
         st = STATUS_SUCCESS;
         break;
@@ -558,7 +603,11 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     g.epoch = hwgpu_ring_valid(window()) ? hwgpu_hdr(window())->epoch : 0;
     g.timer = ExAllocateTimer(poll_timer, NULL, EX_TIMER_HIGH_RESOLUTION);
     guard_start();
-    if (!g_notify_set && NT_SUCCESS(PsSetCreateProcessNotifyRoutine(process_notify, FALSE))) g_notify_set = TRUE;
+    if (!g_notify_set) {
+        NTSTATUS ns = PsSetCreateProcessNotifyRoutine(process_notify, FALSE);
+        report(L"ExitHookStatus", (ULONG)ns);
+        if (NT_SUCCESS(ns)) g_notify_set = TRUE;
+    }
     const char *name = g.ring && hwgpu_ring_valid(window()) && hwgpu_hdr(window())->gpu_name[0] ? hwgpu_hdr(window())->gpu_name : "Phone GPU";
     write_adapter_strings(name);
     return STATUS_SUCCESS;
@@ -880,6 +929,7 @@ static NTSTATUS NTAPI HwSubmitCommand(const HANDLE hAdapter, const DXGKARG_SUBMI
             }
             KeReleaseSpinLock(&g.pending_lock, irql);
             if (queued) {
+                g.counters.marker_submits++;
                 start_polling();
                 return STATUS_SUCCESS;
             }

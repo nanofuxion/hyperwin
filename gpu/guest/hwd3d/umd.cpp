@@ -10,6 +10,7 @@
 
 #include <initializer_list>
 #include <new>
+#include <vector>
 
 #include <d3d11.h>
 #include <d3d10umddi.h>
@@ -317,12 +318,9 @@ static void APIENTRY u_ResourceCopy(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst,
     call_async(b);
 }
 
-static void APIENTRY u_Flush(D3D10DDI_HDEVICE hd) { call_async(cx(DV(hd), HMX_ID3D11DeviceContext_Flush)); }
-
-/* 11.1's Flush takes flags and says whether it flushed. */
-static BOOL APIENTRY u_Flush1(D3D10DDI_HDEVICE hd, UINT)
+static BOOL APIENTRY u_Flush(D3D10DDI_HDEVICE hd, UINT)
 {
-    u_Flush(hd);
+    call_async(cx(DV(hd), HMX_ID3D11DeviceContext_Flush));
     return TRUE;
 }
 
@@ -492,7 +490,7 @@ static void APIENTRY u_CheckFormatSupport(D3D10DDI_HDEVICE hd, DXGI_FORMAT f, UI
     if (GetEnvironmentVariableA("HWD3D_UMDFMT", v, sizeof v)) ulog("hwd3d_umd: format %u -> %08x\n", (unsigned)f, *out);
 }
 
-static void APIENTRY u_CheckMultisampleQualityLevels(D3D10DDI_HDEVICE hd, DXGI_FORMAT f, UINT samples, UINT *out)
+static void APIENTRY u_CheckMultisampleQualityLevels(D3D10DDI_HDEVICE hd, DXGI_FORMAT f, UINT samples, UINT, UINT *out)
 {
     ulog_call("CheckMultisampleQualityLevels");
     Dev *d = DV(hd);
@@ -520,12 +518,6 @@ static void APIENTRY u_CheckMultisampleQualityLevels(D3D10DDI_HDEVICE hd, DXGI_F
     if (GetEnvironmentVariableA("HWD3D_UMDFMT", v, sizeof v)) ulog("hwd3d_umd:   msaa %u x%u -> %u\n", (unsigned)f, samples, *out);
 }
 
-/* WDDM 1.3 adds flags (tiled resources); the answer is the same. */
-static void APIENTRY u_CheckMultisampleQualityLevels1(D3D10DDI_HDEVICE hd, DXGI_FORMAT f, UINT samples, UINT, UINT *out)
-{
-    u_CheckMultisampleQualityLevels(hd, f, samples, out);
-}
-
 /* The phone offers no device-specific counters. The runtime reads these, so they are zeroed. */
 static void APIENTRY u_CheckCounterInfo(D3D10DDI_HDEVICE, D3D10DDI_COUNTER_INFO *info) { memset(info, 0, sizeof *info); }
 
@@ -549,6 +541,827 @@ static void APIENTRY u_DestroyDevice(D3D10DDI_HDEVICE hd)
 
 /* ---- the device's function table ---- */
 
+/* ---- the rest of the device: states, shaders, views, draws ---- */
+
+static_assert(sizeof(Obj) <= 128, "the stubs of the Calc entries answer 128");
+
+template <class T> static uint32_t H(T t)
+{
+    Obj *o = static_cast<Obj *>(t.pDrvPrivate);
+    return o ? o->h : 0;
+}
+
+template <class T> static Obj *O(T t) { return static_cast<Obj *>(t.pDrvPrivate); }
+
+/* A create on the phone's device with one description in and one object out. */
+static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first = 0)
+{
+    struct wbuf *b = dc(d, method);
+    if (first) put32(b, first);
+    put_arr(b, desc, 1, size);
+    put32(b, 1);
+    struct rd r;
+    HRESULT hr = (HRESULT)call_wait(b, &r);
+    uint32_t h = take32(&r);
+    call_end(&r);
+    if (FAILED(hr) || !h) {
+        fail(d, FAILED(hr) ? hr : E_FAIL);
+        return 0;
+    }
+    return h;
+}
+
+template <class T> static void APIENTRY u_destroy(D3D10DDI_HDEVICE, T h) { release_obj(O(h)); }
+
+/* -- states -- */
+
+static void APIENTRY u_CreateBlendState(D3D10DDI_HDEVICE hd, const D3D11_1_DDI_BLEND_DESC *a, D3D10DDI_HBLENDSTATE hs, D3D10DDI_HRTBLENDSTATE)
+{
+    Obj *o = new (hs.pDrvPrivate) Obj();
+    D3D11_BLEND_DESC d;
+    memset(&d, 0, sizeof d);
+    d.AlphaToCoverageEnable = a->AlphaToCoverageEnable;
+    d.IndependentBlendEnable = a->IndependentBlendEnable;
+    for (int i = 0; i < 8; i++) {
+        const D3D11_1_DDI_RENDER_TARGET_BLEND_DESC &s = a->RenderTarget[i];
+        D3D11_RENDER_TARGET_BLEND_DESC &t = d.RenderTarget[i];
+        t.BlendEnable = s.BlendEnable;
+        t.SrcBlend = (D3D11_BLEND)s.SrcBlend;
+        t.DestBlend = (D3D11_BLEND)s.DestBlend;
+        t.BlendOp = (D3D11_BLEND_OP)s.BlendOp;
+        t.SrcBlendAlpha = (D3D11_BLEND)s.SrcBlendAlpha;
+        t.DestBlendAlpha = (D3D11_BLEND)s.DestBlendAlpha;
+        t.BlendOpAlpha = (D3D11_BLEND_OP)s.BlendOpAlpha;
+        t.RenderTargetWriteMask = s.RenderTargetWriteMask;
+    }
+    o->h = phone_create(DV(hd), HMX_ID3D11Device_CreateBlendState, &d, sizeof d);
+}
+
+static void APIENTRY u_CreateDepthStencilState(D3D10DDI_HDEVICE hd, const D3D10_DDI_DEPTH_STENCIL_DESC *a, D3D10DDI_HDEPTHSTENCILSTATE hs, D3D10DDI_HRTDEPTHSTENCILSTATE)
+{
+    Obj *o = new (hs.pDrvPrivate) Obj();
+    D3D11_DEPTH_STENCIL_DESC d;
+    memset(&d, 0, sizeof d);
+    d.DepthEnable = a->DepthEnable;
+    d.DepthWriteMask = (D3D11_DEPTH_WRITE_MASK)a->DepthWriteMask;
+    d.DepthFunc = (D3D11_COMPARISON_FUNC)a->DepthFunc;
+    d.StencilEnable = a->StencilEnable;
+    d.StencilReadMask = a->StencilReadMask;
+    d.StencilWriteMask = a->StencilWriteMask;
+    /* A face that is not enabled keeps whatever is there. */
+    auto face = [](D3D11_DEPTH_STENCILOP_DESC &t, const D3D10_DDI_DEPTH_STENCILOP_DESC &s, BOOL on) {
+        t.StencilFailOp = on ? (D3D11_STENCIL_OP)s.StencilFailOp : D3D11_STENCIL_OP_KEEP;
+        t.StencilDepthFailOp = on ? (D3D11_STENCIL_OP)s.StencilDepthFailOp : D3D11_STENCIL_OP_KEEP;
+        t.StencilPassOp = on ? (D3D11_STENCIL_OP)s.StencilPassOp : D3D11_STENCIL_OP_KEEP;
+        t.StencilFunc = on ? (D3D11_COMPARISON_FUNC)s.StencilFunc : D3D11_COMPARISON_ALWAYS;
+    };
+    face(d.FrontFace, a->FrontFace, a->FrontEnable);
+    face(d.BackFace, a->BackFace, a->BackEnable);
+    o->h = phone_create(DV(hd), HMX_ID3D11Device_CreateDepthStencilState, &d, sizeof d);
+}
+
+static void APIENTRY u_CreateRasterizerState(D3D10DDI_HDEVICE hd, const D3D11_1_DDI_RASTERIZER_DESC *a, D3D10DDI_HRASTERIZERSTATE hs, D3D10DDI_HRTRASTERIZERSTATE)
+{
+    Obj *o = new (hs.pDrvPrivate) Obj();
+    D3D11_RASTERIZER_DESC d;
+    d.FillMode = (D3D11_FILL_MODE)a->FillMode;
+    d.CullMode = (D3D11_CULL_MODE)a->CullMode;
+    d.FrontCounterClockwise = a->FrontCounterClockwise;
+    d.DepthBias = a->DepthBias;
+    d.DepthBiasClamp = a->DepthBiasClamp;
+    d.SlopeScaledDepthBias = a->SlopeScaledDepthBias;
+    d.DepthClipEnable = a->DepthClipEnable;
+    d.ScissorEnable = a->ScissorEnable;
+    d.MultisampleEnable = a->MultisampleEnable;
+    d.AntialiasedLineEnable = a->AntialiasedLineEnable;
+    o->h = phone_create(DV(hd), HMX_ID3D11Device_CreateRasterizerState, &d, sizeof d);
+}
+
+static void APIENTRY u_CreateSampler(D3D10DDI_HDEVICE hd, const D3D10_DDI_SAMPLER_DESC *a, D3D10DDI_HSAMPLER hs, D3D10DDI_HRTSAMPLER)
+{
+    Obj *o = new (hs.pDrvPrivate) Obj();
+    D3D11_SAMPLER_DESC d;
+    d.Filter = (D3D11_FILTER)a->Filter;
+    d.AddressU = (D3D11_TEXTURE_ADDRESS_MODE)a->AddressU;
+    d.AddressV = (D3D11_TEXTURE_ADDRESS_MODE)a->AddressV;
+    d.AddressW = (D3D11_TEXTURE_ADDRESS_MODE)a->AddressW;
+    d.MipLODBias = a->MipLODBias;
+    d.MaxAnisotropy = a->MaxAnisotropy;
+    d.ComparisonFunc = (D3D11_COMPARISON_FUNC)a->ComparisonFunc;
+    memcpy(d.BorderColor, a->BorderColor, sizeof d.BorderColor);
+    d.MinLOD = a->MinLOD;
+    d.MaxLOD = a->MaxLOD;
+    o->h = phone_create(DV(hd), HMX_ID3D11Device_CreateSamplerState, &d, sizeof d);
+}
+
+static void APIENTRY u_SetBlendState(D3D10DDI_HDEVICE hd, D3D10DDI_HBLENDSTATE s, const FLOAT factor[4], UINT mask)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_OMSetBlendState);
+    put32(b, H(s));
+    put_arr(b, factor, 4, sizeof(FLOAT));
+    put32(b, mask);
+    call_async(b);
+}
+
+static void APIENTRY u_SetDepthStencilState(D3D10DDI_HDEVICE hd, D3D10DDI_HDEPTHSTENCILSTATE s, UINT ref)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_OMSetDepthStencilState);
+    put32(b, H(s));
+    put32(b, ref);
+    call_async(b);
+}
+
+static void APIENTRY u_SetRasterizerState(D3D10DDI_HDEVICE hd, D3D10DDI_HRASTERIZERSTATE s)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetState);
+    put32(b, H(s));
+    call_async(b);
+}
+
+static void APIENTRY u_SetViewports(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D10_DDI_VIEWPORT *v)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetViewports);
+    put32(b, n);
+    put_arr(b, v, n, sizeof *v);
+    call_async(b);
+}
+
+static void APIENTRY u_SetScissorRects(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D10_DDI_RECT *r)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetScissorRects);
+    put32(b, n);
+    put_arr(b, r, n, sizeof *r);
+    call_async(b);
+}
+
+/* -- shaders -- */
+
+/* The runtime hands a shader as bare tokens plus its signatures. DXVK reads a DXBC container, so one is built:
+ * the signatures (names made from the registers, since only registers cross this interface) and the code. */
+struct Sig {
+    uint32_t sys, reg, mask, type;
+};
+
+static const char *sv_name(uint32_t sv, bool output)
+{
+    switch (sv) {
+    case 1: return "SV_Position";
+    case 2: return "SV_ClipDistance";
+    case 3: return "SV_CullDistance";
+    case 4: return "SV_RenderTargetArrayIndex";
+    case 5: return "SV_ViewportArrayIndex";
+    case 6: return "SV_VertexID";
+    case 7: return "SV_PrimitiveID";
+    case 8: return "SV_InstanceID";
+    case 9: return "SV_IsFrontFace";
+    case 10: return "SV_SampleIndex";
+    case 64: return "SV_Target";
+    case 65: return "SV_Depth";
+    case 66: return "SV_Coverage";
+    case 67: return "SV_DepthGreaterEqual";
+    case 68: return "SV_DepthLessEqual";
+    default: return output ? "TEXCOORD" : "TEXCOORD";
+    }
+}
+
+static void put_u32(std::vector<uint8_t> &v, uint32_t x) { v.insert(v.end(), (uint8_t *)&x, (uint8_t *)&x + 4); }
+
+/* One signature chunk's body: count, 8, the entries, then the names. */
+static std::vector<uint8_t> sig_chunk(const Sig *e, uint32_t n, bool output)
+{
+    std::vector<uint8_t> body, names;
+    uint32_t base = 8 + n * 24;
+    put_u32(body, n);
+    put_u32(body, 8);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = sv_name(e[i].sys, output);
+        uint32_t index = (e[i].sys == 0 || e[i].sys == 64) ? e[i].reg : 0;
+        put_u32(body, base + (uint32_t)names.size());
+        put_u32(body, index);
+        put_u32(body, (e[i].sys == 64 || e[i].sys == 65 || e[i].sys == 66 || e[i].sys == 67 || e[i].sys == 68) ? 0 : e[i].sys);
+        put_u32(body, e[i].type);
+        put_u32(body, e[i].reg);
+        uint32_t m = e[i].mask & 0xF;
+        put_u32(body, m | (output ? ((~m & 0xF) << 8) : (m << 8)));
+        names.insert(names.end(), nm, nm + strlen(nm) + 1);
+    }
+    while (names.size() & 3) names.push_back(0);
+    body.insert(body.end(), names.begin(), names.end());
+    return body;
+}
+
+static std::vector<uint8_t> dxbc(const UINT *code, const std::vector<Sig> *in, const std::vector<Sig> *out)
+{
+    uint32_t words = code[1], major = (code[0] >> 4) & 0xF;
+    struct Chunk { uint32_t tag; std::vector<uint8_t> body; };
+    std::vector<Chunk> chunks;
+    if (in) chunks.push_back({(uint32_t)'NGSI', sig_chunk(in->data(), (uint32_t)in->size(), false)});
+    if (out) chunks.push_back({(uint32_t)'NGSO', sig_chunk(out->data(), (uint32_t)out->size(), true)});
+    Chunk sh{(uint32_t)(major >= 5 ? 'XEHS' : 'RDHS'), {}};
+    sh.body.assign((const uint8_t *)code, (const uint8_t *)code + words * 4);
+    chunks.push_back(sh);
+    uint32_t head = 32 + 4 * (uint32_t)chunks.size(), total = head;
+    for (auto &c : chunks) total += 8 + (uint32_t)c.body.size();
+    std::vector<uint8_t> v;
+    put_u32(v, 'CBXD');
+    for (int i = 0; i < 4; i++) put_u32(v, 0);  /* the checksum: DXVK does not look */
+    put_u32(v, 1);
+    put_u32(v, total);
+    put_u32(v, (uint32_t)chunks.size());
+    uint32_t at = head;
+    for (auto &c : chunks) {
+        put_u32(v, at);
+        at += 8 + (uint32_t)c.body.size();
+    }
+    for (auto &c : chunks) {
+        put_u32(v, c.tag);
+        put_u32(v, (uint32_t)c.body.size());
+        v.insert(v.end(), c.body.begin(), c.body.end());
+    }
+    return v;
+}
+
+static std::vector<Sig> sigs_of(const D3D11_1DDIARG_SIGNATURE_ENTRY2 *e, UINT n)
+{
+    std::vector<Sig> v;
+    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, (uint32_t)e[i].RegisterComponentType});
+    return v;
+}
+
+static void make_shader(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, D3D10DDI_HSHADER hs, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *sg)
+{
+    Dev *d = DV(hd);
+    Obj *o = new (hs.pDrvPrivate) Obj();
+    std::vector<Sig> in, out;
+    if (sg) {
+        in = sigs_of(sg->pInputSignature, sg->NumInputSignatureEntries);
+        out = sigs_of(sg->pOutputSignature, sg->NumOutputSignatureEntries);
+    }
+    std::vector<uint8_t> bc = dxbc(code, sg ? &in : nullptr, sg ? &out : nullptr);
+    struct wbuf *b = dc(d, method);
+    put_arr(b, bc.data(), bc.size(), 1);
+    uint64_t len = bc.size();
+    put(b, &len, 8);
+    put32(b, 0);
+    put32(b, 1);
+    struct rd r;
+    HRESULT hr = (HRESULT)call_wait(b, &r);
+    o->h = take32(&r);
+    call_end(&r);
+    if (FAILED(hr) || !o->h) {
+        ulog("hwd3d_umd: the phone refused a shader (0x%08lx)\n", (unsigned long)hr);
+        fail(d, FAILED(hr) ? hr : E_FAIL);
+    }
+}
+
+#define SHADER_CREATE(Name, Method, Hs) \
+    static void APIENTRY u_Create##Name##Shader(D3D10DDI_HDEVICE hd, const UINT *code, D3D10DDI_HSHADER hs, D3D10DDI_HRTSHADER, \
+                                                const D3D11_1DDIARG_STAGE_IO_SIGNATURES *sg) \
+    { \
+        make_shader(hd, HMX_ID3D11Device_Create##Method, code, hs, sg); \
+    }
+SHADER_CREATE(Vertex, VertexShader, 0)
+SHADER_CREATE(Geometry, GeometryShader, 0)
+SHADER_CREATE(Pixel, PixelShader, 0)
+
+static void APIENTRY u_CreateComputeShader(D3D10DDI_HDEVICE hd, const UINT *code, D3D10DDI_HSHADER hs, D3D10DDI_HRTSHADER)
+{
+    make_shader(hd, HMX_ID3D11Device_CreateComputeShader, code, hs, nullptr);
+}
+
+/* Input layouts: the runtime has turned semantic names into registers, so the phone gets a made-up shader
+ * whose input signature names the registers, and the elements named alike. */
+static void APIENTRY u_CreateElementLayout(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATEELEMENTLAYOUT *a, D3D10DDI_HELEMENTLAYOUT hl, D3D10DDI_HRTELEMENTLAYOUT)
+{
+    Dev *d = DV(hd);
+    Obj *o = new (hl.pDrvPrivate) Obj();
+    std::vector<Sig> in;
+    for (UINT i = 0; i < a->NumElements; i++) in.push_back({0, a->pVertexElements[i].InputRegister, 0xF, 3});
+    static const UINT vs[2] = {0x00010040, 2};  /* vs_4_0 with no instructions */
+    std::vector<uint8_t> bc = dxbc(vs, &in, nullptr);
+    struct wbuf *b = dc(d, HMX_ID3D11Device_CreateInputLayout);
+    put32(b, a->NumElements);
+    for (UINT i = 0; i < a->NumElements; i++) {
+        const D3D10DDIARG_INPUT_ELEMENT_DESC &e = a->pVertexElements[i];
+        put_arr(b, "TEXCOORD", 9, 1);
+        uint32_t f[6] = {e.InputRegister, (uint32_t)e.Format, e.InputSlot, e.AlignedByteOffset, (uint32_t)e.InputSlotClass, e.InstanceDataStepRate};
+        put(b, f, sizeof f);
+    }
+    put_arr(b, bc.data(), bc.size(), 1);
+    uint64_t len = bc.size();
+    put(b, &len, 8);
+    put32(b, 1);
+    struct rd r;
+    HRESULT hr = (HRESULT)call_wait(b, &r);
+    o->h = take32(&r);
+    call_end(&r);
+    if (FAILED(hr) || !o->h) fail(d, FAILED(hr) ? hr : E_FAIL);
+}
+
+static void APIENTRY u_SetInputLayout(D3D10DDI_HDEVICE hd, D3D10DDI_HELEMENTLAYOUT l)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetInputLayout);
+    put32(b, H(l));
+    call_async(b);
+}
+
+template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
+{
+    if (!h) {
+        put32(b, 0);
+        return;
+    }
+    put32(b, 1);
+    put32(b, n);
+    for (UINT i = 0; i < n; i++) put32(b, H(h[i]));
+}
+
+#define STAGE(Stage, S) \
+    static void APIENTRY u_##Stage##SetShader(D3D10DDI_HDEVICE hd, D3D10DDI_HSHADER s) \
+    { \
+        struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetShader); \
+        put32(b, H(s)); \
+        put32(b, 0); \
+        put32(b, 0); \
+        call_async(b); \
+    } \
+    static void APIENTRY u_##Stage##SetShaderResources(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HSHADERRESOURCEVIEW *v) \
+    { \
+        struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetShaderResources); \
+        put32(b, start); \
+        put32(b, n); \
+        put_handles(b, v, n); \
+        call_async(b); \
+    } \
+    static void APIENTRY u_##Stage##SetSamplers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HSAMPLER *v) \
+    { \
+        struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetSamplers); \
+        put32(b, start); \
+        put32(b, n); \
+        put_handles(b, v, n); \
+        call_async(b); \
+    } \
+    static void APIENTRY u_##Stage##SetConstantBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HRESOURCE *v, const UINT *first, const UINT *num) \
+    { \
+        if (first || num) note_constant_ranges(first, num, n); \
+        struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetConstantBuffers); \
+        put32(b, start); \
+        put32(b, n); \
+        put_handles(b, v, n); \
+        call_async(b); \
+    }
+
+/* The phone's Direct3D 11.0 context binds a whole buffer. A range of it (11.1) is noted, not honoured yet. */
+static void note_constant_ranges(const UINT *first, const UINT *num, UINT n)
+{
+    for (UINT i = 0; i < n; i++)
+        if ((first && first[i]) || (num && num[i] && num[i] != 4096)) {
+            ulog("hwd3d_umd: a constant buffer range is not done yet\n");
+            return;
+        }
+}
+
+STAGE(Vs, VS)
+STAGE(Ps, PS)
+STAGE(Gs, GS)
+STAGE(Hs, HS)
+STAGE(Ds, DS)
+STAGE(Cs, CS)
+
+static void APIENTRY u_SetTopology(D3D10DDI_HDEVICE hd, D3D10_DDI_PRIMITIVE_TOPOLOGY t)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetPrimitiveTopology);
+    put32(b, (uint32_t)t);
+    call_async(b);
+}
+
+static void APIENTRY u_SetVertexBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HRESOURCE *v, const UINT *strides, const UINT *offsets)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetVertexBuffers);
+    put32(b, start);
+    put32(b, n);
+    put_handles(b, v, n);
+    put_arr(b, strides, n, 4);
+    put_arr(b, offsets, n, 4);
+    call_async(b);
+}
+
+static void APIENTRY u_SetIndexBuffer(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, DXGI_FORMAT f, UINT offset)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetIndexBuffer);
+    put32(b, H(r));
+    put32(b, (uint32_t)f);
+    put32(b, offset);
+    call_async(b);
+}
+
+/* -- views -- */
+
+static void APIENTRY u_CreateShaderResourceView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *a, D3D10DDI_HSHADERRESOURCEVIEW hv, D3D10DDI_HRTSHADERRESOURCEVIEW)
+{
+    Dev *d = DV(hd);
+    Obj *v = new (hv.pDrvPrivate) Obj();
+    Obj *res = O(a->hDrvResource);
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+    memset(&vd, 0, sizeof vd);
+    vd.Format = a->Format;
+    switch (a->ResourceDimension) {
+    case D3D10DDIRESOURCE_BUFFER:
+        if (a->BufferEx.Flags & D3D11_DDI_BUFFEREX_SRV_FLAG_RAW) {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+            vd.BufferEx = {a->BufferEx.FirstElement, a->BufferEx.NumElements, D3D11_BUFFEREX_SRV_FLAG_RAW};
+        } else {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+            vd.Buffer.FirstElement = a->Buffer.FirstElement;
+            vd.Buffer.NumElements = a->Buffer.NumElements;
+        }
+        break;
+    case D3D10DDIRESOURCE_TEXTURE1D:
+        if (a->Tex1D.ArraySize > 1 || a->Tex1D.FirstArraySlice) {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE1DARRAY;
+            vd.Texture1DArray = {a->Tex1D.MostDetailedMip, a->Tex1D.MipLevels, a->Tex1D.FirstArraySlice, a->Tex1D.ArraySize};
+        } else {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE1D;
+            vd.Texture1D = {a->Tex1D.MostDetailedMip, a->Tex1D.MipLevels};
+        }
+        break;
+    case D3D10DDIRESOURCE_TEXTURE3D:
+        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+        vd.Texture3D = {a->Tex3D.MostDetailedMip, a->Tex3D.MipLevels};
+        break;
+    case D3D10DDIRESOURCE_TEXTURECUBE:
+        if (a->TexCube.NumCubes > 1 || a->TexCube.First2DArrayFace) {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
+            vd.TextureCubeArray = {a->TexCube.MostDetailedMip, a->TexCube.MipLevels, a->TexCube.First2DArrayFace, a->TexCube.NumCubes};
+        } else {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+            vd.TextureCube = {a->TexCube.MostDetailedMip, a->TexCube.MipLevels};
+        }
+        break;
+    default:
+        if (res->samples > 1) {
+            if (a->Tex2D.ArraySize > 1 || a->Tex2D.FirstArraySlice) {
+                vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                vd.Texture2DMSArray = {a->Tex2D.FirstArraySlice, a->Tex2D.ArraySize};
+            } else {
+                vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+            }
+        } else if (a->Tex2D.ArraySize > 1 || a->Tex2D.FirstArraySlice) {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            vd.Texture2DArray = {a->Tex2D.MostDetailedMip, a->Tex2D.MipLevels, a->Tex2D.FirstArraySlice, a->Tex2D.ArraySize};
+        } else {
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            vd.Texture2D = {a->Tex2D.MostDetailedMip, a->Tex2D.MipLevels};
+        }
+        break;
+    }
+    v->h = phone_create(d, HMX_ID3D11Device_CreateShaderResourceView, &vd, sizeof vd, res->h);
+}
+
+static void APIENTRY u_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *a, D3D10DDI_HDEPTHSTENCILVIEW hv, D3D10DDI_HRTDEPTHSTENCILVIEW)
+{
+    Dev *d = DV(hd);
+    Obj *v = new (hv.pDrvPrivate) Obj();
+    Obj *res = O(a->hDrvResource);
+    D3D11_DEPTH_STENCIL_VIEW_DESC vd;
+    memset(&vd, 0, sizeof vd);
+    vd.Format = a->Format;
+    vd.Flags = a->Flags;
+    if (a->ResourceDimension == D3D10DDIRESOURCE_TEXTURE1D) {
+        if (res->array > 1) {
+            vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE1DARRAY;
+            vd.Texture1DArray = {a->Tex1D.MipSlice, a->Tex1D.FirstArraySlice, a->Tex1D.ArraySize};
+        } else {
+            vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE1D;
+            vd.Texture1D.MipSlice = a->Tex1D.MipSlice;
+        }
+    } else if (res->samples > 1) {
+        if (res->array > 1) {
+            vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY;
+            vd.Texture2DMSArray = {a->Tex2D.FirstArraySlice, a->Tex2D.ArraySize};
+        } else {
+            vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+        }
+    } else if (res->array > 1) {
+        vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        vd.Texture2DArray = {a->Tex2D.MipSlice, a->Tex2D.FirstArraySlice, a->Tex2D.ArraySize};
+    } else {
+        vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        vd.Texture2D.MipSlice = a->Tex2D.MipSlice;
+    }
+    v->h = phone_create(d, HMX_ID3D11Device_CreateDepthStencilView, &vd, sizeof vd, res->h);
+}
+
+static void APIENTRY u_CreateUnorderedAccessView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *a, D3D11DDI_HUNORDEREDACCESSVIEW hv, D3D11DDI_HRTUNORDEREDACCESSVIEW)
+{
+    Dev *d = DV(hd);
+    Obj *v = new (hv.pDrvPrivate) Obj();
+    Obj *res = O(a->hDrvResource);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC vd;
+    memset(&vd, 0, sizeof vd);
+    vd.Format = a->Format;
+    switch (a->ResourceDimension) {
+    case D3D10DDIRESOURCE_BUFFER:
+        vd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        vd.Buffer = {a->Buffer.FirstElement, a->Buffer.NumElements, a->Buffer.Flags};
+        break;
+    case D3D10DDIRESOURCE_TEXTURE1D:
+        if (res->array > 1) {
+            vd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE1DARRAY;
+            vd.Texture1DArray = {a->Tex1D.MipSlice, a->Tex1D.FirstArraySlice, a->Tex1D.ArraySize};
+        } else {
+            vd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE1D;
+            vd.Texture1D.MipSlice = a->Tex1D.MipSlice;
+        }
+        break;
+    case D3D10DDIRESOURCE_TEXTURE3D:
+        vd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+        vd.Texture3D = {a->Tex3D.MipSlice, a->Tex3D.FirstW, a->Tex3D.WSize};
+        break;
+    default:
+        if (res->array > 1) {
+            vd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+            vd.Texture2DArray = {a->Tex2D.MipSlice, a->Tex2D.FirstArraySlice, a->Tex2D.ArraySize};
+        } else {
+            vd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            vd.Texture2D.MipSlice = a->Tex2D.MipSlice;
+        }
+        break;
+    }
+    v->h = phone_create(d, HMX_ID3D11Device_CreateUnorderedAccessView, &vd, sizeof vd, res->h);
+}
+
+static void APIENTRY u_SetRenderTargets(D3D10DDI_HDEVICE hd, const D3D10DDI_HRENDERTARGETVIEW *rtv, UINT n, UINT, D3D10DDI_HDEPTHSTENCILVIEW dsv,
+                                        const D3D11DDI_HUNORDEREDACCESSVIEW *uav, const UINT *counts, UINT uavStart, UINT nUav, UINT, UINT)
+{
+    Dev *d = DV(hd);
+    struct wbuf *b;
+    if (!nUav) {
+        b = cx(d, HMX_ID3D11DeviceContext_OMSetRenderTargets);
+        put32(b, n);
+        put_handles(b, rtv, n);
+        put32(b, H(dsv));
+    } else {
+        b = cx(d, HMX_ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews);
+        put32(b, n);
+        put_handles(b, rtv, n);
+        put32(b, H(dsv));
+        put32(b, uavStart);
+        put32(b, nUav);
+        put_handles(b, uav, nUav);
+        put_arr(b, counts, nUav, 4);
+    }
+    call_async(b);
+}
+
+static void APIENTRY u_ClearDepthStencilView(D3D10DDI_HDEVICE hd, D3D10DDI_HDEPTHSTENCILVIEW v, UINT flags, FLOAT depth, UINT8 stencil)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ClearDepthStencilView);
+    put32(b, H(v));
+    put32(b, flags);
+    put(b, &depth, 4);
+    put32(b, stencil);
+    call_async(b);
+}
+
+static void APIENTRY u_ClearUnorderedAccessViewUint(D3D10DDI_HDEVICE hd, D3D11DDI_HUNORDEREDACCESSVIEW v, const UINT c[4])
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ClearUnorderedAccessViewUint);
+    put32(b, H(v));
+    put_arr(b, c, 4, 4);
+    call_async(b);
+}
+
+static void APIENTRY u_ClearUnorderedAccessViewFloat(D3D10DDI_HDEVICE hd, D3D11DDI_HUNORDEREDACCESSVIEW v, const FLOAT c[4])
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ClearUnorderedAccessViewFloat);
+    put32(b, H(v));
+    put_arr(b, c, 4, 4);
+    call_async(b);
+}
+
+static void APIENTRY u_CsSetUnorderedAccessViews(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D11DDI_HUNORDEREDACCESSVIEW *v, const UINT *counts)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_CSSetUnorderedAccessViews);
+    put32(b, start);
+    put32(b, n);
+    put_handles(b, v, n);
+    put_arr(b, counts, n, 4);
+    call_async(b);
+}
+
+/* -- draws -- */
+
+static void APIENTRY u_Draw(D3D10DDI_HDEVICE hd, UINT count, UINT start)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Draw);
+    put32(b, count);
+    put32(b, start);
+    call_async(b);
+}
+
+static void APIENTRY u_DrawIndexed(D3D10DDI_HDEVICE hd, UINT count, UINT start, INT base)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawIndexed);
+    put32(b, count);
+    put32(b, start);
+    put32(b, (uint32_t)base);
+    call_async(b);
+}
+
+static void APIENTRY u_DrawInstanced(D3D10DDI_HDEVICE hd, UINT count, UINT inst, UINT start, UINT start_inst)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawInstanced);
+    put32(b, count);
+    put32(b, inst);
+    put32(b, start);
+    put32(b, start_inst);
+    call_async(b);
+}
+
+static void APIENTRY u_DrawIndexedInstanced(D3D10DDI_HDEVICE hd, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawIndexedInstanced);
+    put32(b, count);
+    put32(b, inst);
+    put32(b, start);
+    put32(b, (uint32_t)base);
+    put32(b, start_inst);
+    call_async(b);
+}
+
+static void APIENTRY u_DrawInstancedIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT off)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawInstancedIndirect);
+    put32(b, H(r));
+    put32(b, off);
+    call_async(b);
+}
+
+static void APIENTRY u_DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT off)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DrawIndexedInstancedIndirect);
+    put32(b, H(r));
+    put32(b, off);
+    call_async(b);
+}
+
+static void APIENTRY u_Dispatch(D3D10DDI_HDEVICE hd, UINT x, UINT y, UINT z)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Dispatch);
+    put32(b, x);
+    put32(b, y);
+    put32(b, z);
+    call_async(b);
+}
+
+static void APIENTRY u_DispatchIndirect(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT off)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_DispatchIndirect);
+    put32(b, H(r));
+    put32(b, off);
+    call_async(b);
+}
+
+/* -- copies -- */
+
+static void APIENTRY u_ResourceCopyRegion(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT dsub, UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT ssub,
+                                          const D3D10_DDI_BOX *box, UINT)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_CopySubresourceRegion);
+    put32(b, H(dst));
+    put32(b, dsub);
+    put32(b, x);
+    put32(b, y);
+    put32(b, z);
+    put32(b, H(src));
+    put32(b, ssub);
+    put_arr(b, box, 1, sizeof *box);
+    call_async(b);
+}
+
+static void update_subresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT pitch, UINT slice_pitch)
+{
+    Obj *o = O(hr);
+    uint32_t row, rows, slices;
+    if (!hwd3d_region(&o->r, sub, (const uint32_t *)box, &row, &rows, &slices)) {
+        ulog("hwd3d_umd: an update of this format or box is not done yet\n");
+        return;
+    }
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_UpdateSubresource);
+    put32(b, o->h);
+    put32(b, sub);
+    put_arr(b, box, 1, sizeof *box);
+    put_rows(b, (const uint8_t *)src, row, rows, slices, o->dim == 2 ? row : pitch, slice_pitch);
+    call_async(b);
+}
+
+static void APIENTRY u_ResourceUpdateSubresourceUP(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT p, UINT sp, UINT)
+{
+    update_subresource(hd, r, sub, box, src, p, sp);
+}
+
+static void APIENTRY u_ResourceResolveSubresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT dsub, D3D10DDI_HRESOURCE src, UINT ssub, DXGI_FORMAT f)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_ResolveSubresource);
+    put32(b, H(dst));
+    put32(b, dsub);
+    put32(b, H(src));
+    put32(b, ssub);
+    put32(b, (uint32_t)f);
+    call_async(b);
+}
+
+static void APIENTRY u_GenMips(D3D10DDI_HDEVICE hd, D3D10DDI_HSHADERRESOURCEVIEW v)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_GenerateMips);
+    put32(b, H(v));
+    call_async(b);
+}
+
+static void APIENTRY u_SetResourceMinLOD(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, FLOAT lod)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_SetResourceMinLOD);
+    put32(b, H(r));
+    put(b, &lod, 4);
+    call_async(b);
+}
+
+static void APIENTRY u_CopyStructureCount(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT off, D3D11DDI_HUNORDEREDACCESSVIEW v)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_CopyStructureCount);
+    put32(b, H(dst));
+    put32(b, off);
+    put32(b, H(v));
+    call_async(b);
+}
+
+static BOOL APIENTRY u_ResourceIsStagingBusy(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE) { return FALSE; }
+
+/* -- queries -- */
+
+static uint32_t query_type(uint32_t q)
+{
+    if (q <= 7) return q;            /* the ten's numbers are the eleven's */
+    if (q == 8) return 4;            /* the pipeline statistics of eleven */
+    if (q >= 9 && q <= 12) return q - 1;
+    if (q >= 13 && q <= 16) return q - 1;
+    return 0xFFFFFFFFu;
+}
+
+static SIZE_T APIENTRY u_CalcPrivateQuerySize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATEQUERY *) { return sizeof(Obj); }
+
+static void APIENTRY u_CreateQuery(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATEQUERY *a, D3D10DDI_HQUERY hq, D3D10DDI_HRTQUERY)
+{
+    Obj *o = new (hq.pDrvPrivate) Obj();
+    uint32_t t = query_type((uint32_t)a->Query);
+    if (t == 0xFFFFFFFFu) {
+        fail(DV(hd), E_NOTIMPL);
+        return;
+    }
+    D3D11_QUERY_DESC qd = {(D3D11_QUERY)t, a->MiscFlags};
+    o->h = phone_create(DV(hd), HMX_ID3D11Device_CreateQuery, &qd, sizeof qd);
+}
+
+static void APIENTRY u_QueryBegin(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Begin);
+    put32(b, H(q));
+    call_async(b);
+}
+
+static void APIENTRY u_QueryEnd(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_End);
+    put32(b, H(q));
+    put32(b, 0);  /* no result slot: GetData asks the phone */
+    put32(b, 0);
+    call_async(b);
+}
+
+static void APIENTRY u_QueryGetData(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, void *data, UINT size, UINT flags)
+{
+    Dev *d = DV(hd);
+    struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_GetData);
+    put32(b, H(q));
+    put32(b, data ? size : 0);
+    put32(b, (flags & D3D10_DDI_GET_DATA_DO_NOT_FLUSH) ? D3D11_ASYNC_GETDATA_DONOTFLUSH : 0);
+    struct rd r;
+    HRESULT hr = (HRESULT)call_wait(b, &r);
+    take(&r, data, data ? size : 0);
+    call_end(&r);
+    if (hr == S_FALSE) fail(d, DXGI_DDI_ERR_WASSTILLDRAWING);
+    else if (FAILED(hr)) fail(d, hr);
+}
+
+static void APIENTRY u_SetPredication(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, BOOL v)
+{
+    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_SetPredication);
+    put32(b, H(q));
+    put32(b, (uint32_t)v);
+    call_async(b);
+}
+
 template <class A, class B> struct Same { static constexpr bool v = false; };
 template <class A> struct Same<A, A> { static constexpr bool v = true; };
 
@@ -568,17 +1381,105 @@ template <class Tbl> static void fill_device_funcs(Tbl *t)
     t->pfnCalcPrivateRenderTargetViewSize = u_CalcPrivateRenderTargetViewSize;
     t->pfnCreateRenderTargetView = u_CreateRenderTargetView;
     t->pfnDestroyRenderTargetView = u_DestroyRenderTargetView;
+    t->pfnCreateShaderResourceView = u_CreateShaderResourceView;
+    t->pfnDestroyShaderResourceView = u_destroy<D3D10DDI_HSHADERRESOURCEVIEW>;
+    t->pfnCreateDepthStencilView = u_CreateDepthStencilView;
+    t->pfnDestroyDepthStencilView = u_destroy<D3D10DDI_HDEPTHSTENCILVIEW>;
+    t->pfnCreateUnorderedAccessView = u_CreateUnorderedAccessView;
+    t->pfnDestroyUnorderedAccessView = u_destroy<D3D11DDI_HUNORDEREDACCESSVIEW>;
+    t->pfnCreateElementLayout = u_CreateElementLayout;
+    t->pfnDestroyElementLayout = u_destroy<D3D10DDI_HELEMENTLAYOUT>;
+    t->pfnCreateBlendState = u_CreateBlendState;
+    t->pfnDestroyBlendState = u_destroy<D3D10DDI_HBLENDSTATE>;
+    t->pfnCreateDepthStencilState = u_CreateDepthStencilState;
+    t->pfnDestroyDepthStencilState = u_destroy<D3D10DDI_HDEPTHSTENCILSTATE>;
+    t->pfnCreateRasterizerState = u_CreateRasterizerState;
+    t->pfnDestroyRasterizerState = u_destroy<D3D10DDI_HRASTERIZERSTATE>;
+    t->pfnCreateSampler = u_CreateSampler;
+    t->pfnDestroySampler = u_destroy<D3D10DDI_HSAMPLER>;
+    t->pfnCreateVertexShader = u_CreateVertexShader;
+    t->pfnCreateGeometryShader = u_CreateGeometryShader;
+    t->pfnCreatePixelShader = u_CreatePixelShader;
+    t->pfnCreateComputeShader = u_CreateComputeShader;
+    t->pfnDestroyShader = u_destroy<D3D10DDI_HSHADER>;
+    t->pfnCreateQuery = u_CreateQuery;
+    t->pfnCalcPrivateQuerySize = u_CalcPrivateQuerySize;
+    t->pfnDestroyQuery = u_destroy<D3D10DDI_HQUERY>;
+    t->pfnQueryBegin = u_QueryBegin;
+    t->pfnQueryEnd = u_QueryEnd;
+    t->pfnQueryGetData = u_QueryGetData;
+    t->pfnSetPredication = u_SetPredication;
+    t->pfnSetBlendState = u_SetBlendState;
+    t->pfnSetDepthStencilState = u_SetDepthStencilState;
+    t->pfnSetRasterizerState = u_SetRasterizerState;
+    t->pfnSetViewports = u_SetViewports;
+    t->pfnSetScissorRects = u_SetScissorRects;
+    t->pfnIaSetInputLayout = u_SetInputLayout;
+    t->pfnIaSetVertexBuffers = u_SetVertexBuffers;
+    t->pfnIaSetIndexBuffer = u_SetIndexBuffer;
+    t->pfnIaSetTopology = u_SetTopology;
+    t->pfnVsSetShader = u_VsSetShader;
+    t->pfnVsSetShaderResources = u_VsSetShaderResources;
+    t->pfnVsSetSamplers = u_VsSetSamplers;
+    t->pfnVsSetConstantBuffers = u_VsSetConstantBuffers;
+    t->pfnPsSetShader = u_PsSetShader;
+    t->pfnPsSetShaderResources = u_PsSetShaderResources;
+    t->pfnPsSetSamplers = u_PsSetSamplers;
+    t->pfnPsSetConstantBuffers = u_PsSetConstantBuffers;
+    t->pfnGsSetShader = u_GsSetShader;
+    t->pfnGsSetShaderResources = u_GsSetShaderResources;
+    t->pfnGsSetSamplers = u_GsSetSamplers;
+    t->pfnGsSetConstantBuffers = u_GsSetConstantBuffers;
+    t->pfnHsSetShader = u_HsSetShader;
+    t->pfnHsSetShaderResources = u_HsSetShaderResources;
+    t->pfnHsSetSamplers = u_HsSetSamplers;
+    t->pfnHsSetConstantBuffers = u_HsSetConstantBuffers;
+    t->pfnDsSetShader = u_DsSetShader;
+    t->pfnDsSetShaderResources = u_DsSetShaderResources;
+    t->pfnDsSetSamplers = u_DsSetSamplers;
+    t->pfnDsSetConstantBuffers = u_DsSetConstantBuffers;
+    t->pfnCsSetShader = u_CsSetShader;
+    t->pfnCsSetShaderResources = u_CsSetShaderResources;
+    t->pfnCsSetSamplers = u_CsSetSamplers;
+    t->pfnCsSetConstantBuffers = u_CsSetConstantBuffers;
+    t->pfnCsSetUnorderedAccessViews = u_CsSetUnorderedAccessViews;
+    t->pfnSetRenderTargets = u_SetRenderTargets;
     t->pfnClearRenderTargetView = u_ClearRenderTargetView;
+    t->pfnClearDepthStencilView = u_ClearDepthStencilView;
+    t->pfnClearUnorderedAccessViewUint = u_ClearUnorderedAccessViewUint;
+    t->pfnClearUnorderedAccessViewFloat = u_ClearUnorderedAccessViewFloat;
+    t->pfnDraw = u_Draw;
+    t->pfnDrawIndexed = u_DrawIndexed;
+    t->pfnDrawInstanced = u_DrawInstanced;
+    t->pfnDrawIndexedInstanced = u_DrawIndexedInstanced;
+    t->pfnDrawInstancedIndirect = u_DrawInstancedIndirect;
+    t->pfnDrawIndexedInstancedIndirect = u_DrawIndexedInstancedIndirect;
+    t->pfnDispatch = u_Dispatch;
+    t->pfnDispatchIndirect = u_DispatchIndirect;
     t->pfnResourceCopy = u_ResourceCopy;
-    if constexpr (Same<Tbl, D3D11_1DDI_DEVICEFUNCS>::v || Same<Tbl, D3DWDDM1_3DDI_DEVICEFUNCS>::v) t->pfnFlush = u_Flush1;
-    else t->pfnFlush = u_Flush;
+    t->pfnResourceCopyRegion = u_ResourceCopyRegion;
+    t->pfnResourceUpdateSubresourceUP = u_ResourceUpdateSubresourceUP;
+    t->pfnDefaultConstantBufferUpdateSubresourceUP = u_ResourceUpdateSubresourceUP;
+    t->pfnResourceResolveSubresource = u_ResourceResolveSubresource;
+    t->pfnGenMips = u_GenMips;
+    t->pfnSetResourceMinLOD = u_SetResourceMinLOD;
+    t->pfnCopyStructureCount = u_CopyStructureCount;
+    t->pfnResourceIsStagingBusy = u_ResourceIsStagingBusy;
+    t->pfnFlush = u_Flush;
     t->pfnStagingResourceMap = u_StagingResourceMap;
     t->pfnStagingResourceUnmap = u_Unmap;
     t->pfnResourceMap = u_ResourceMap;
     t->pfnResourceUnmap = u_Unmap;
+    t->pfnDynamicIABufferMapDiscard = u_ResourceMap;
+    t->pfnDynamicIABufferMapNoOverwrite = u_ResourceMap;
+    t->pfnDynamicIABufferUnmap = u_Unmap;
+    t->pfnDynamicConstantBufferMapDiscard = u_ResourceMap;
+    t->pfnDynamicConstantBufferMapNoOverwrite = u_ResourceMap;
+    t->pfnDynamicConstantBufferUnmap = u_Unmap;
+    t->pfnDynamicResourceMapDiscard = u_ResourceMap;
+    t->pfnDynamicResourceUnmap = u_Unmap;
     t->pfnCheckFormatSupport = u_CheckFormatSupport;
-    if constexpr (Same<Tbl, D3DWDDM1_3DDI_DEVICEFUNCS>::v) t->pfnCheckMultisampleQualityLevels = u_CheckMultisampleQualityLevels1;
-    else t->pfnCheckMultisampleQualityLevels = u_CheckMultisampleQualityLevels;
+    t->pfnCheckMultisampleQualityLevels = u_CheckMultisampleQualityLevels;
     t->pfnCheckCounterInfo = u_CheckCounterInfo;
     t->pfnDestroyDevice = u_DestroyDevice;
 }
@@ -597,8 +1498,7 @@ static HRESULT __stdcall dxgi_stub(void *)
 static void fill_dxgi(DXGI_DDI_BASE_ARGS *a, UINT interface_version)
 {
     size_t n = sizeof(DXGI1_1_DDI_BASE_FUNCTIONS);
-    if (interface_version == D3D11_1_DDI_INTERFACE_VERSION) n = sizeof(DXGI1_2_DDI_BASE_FUNCTIONS);
-    else if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) n = sizeof(DXGI1_3_DDI_BASE_FUNCTIONS);
+    if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) n = sizeof(DXGI1_3_DDI_BASE_FUNCTIONS);
     void **f = reinterpret_cast<void **>(a->pDXGIDDIBaseFunctions2);
     for (size_t i = 0; i < n / sizeof(void *); i++) f[i] = reinterpret_cast<void *>(dxgi_stub);
 }
@@ -612,13 +1512,34 @@ static SIZE_T APIENTRY a_CalcPrivateDeviceSize(D3D10DDI_HADAPTER, const D3D10DDI
     return sizeof(Dev);
 }
 
+/* Until this adapter shows the desktop (wddm/README.md, phase 6), Windows' own programs (the shell, DWM,
+ * search, the start menu) are left to the software renderer as before. Each device here holds one of
+ * twenty channels to the phone, and there are dozens of them. A program in Windows' folder is one. */
+static bool windows_own_program()
+{
+    WCHAR exe[MAX_PATH], win[MAX_PATH];
+    char allow[8];
+    if (GetEnvironmentVariableA("HWD3D_SYSTEM", allow, sizeof allow)) return false;
+    UINT n = GetWindowsDirectoryW(win, MAX_PATH);
+    DWORD m = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    return n && m > n && !_wcsnicmp(exe, win, n);
+}
+
 static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVICE *a)
 {
     ulog("hwd3d_umd: CreateDevice, interface 0x%x, version %u, flags 0x%x\n", a->Interface, a->Version, a->Flags);
-    if (a->Interface != D3D11_0_DDI_INTERFACE_VERSION && a->Interface != D3D11_1_DDI_INTERFACE_VERSION &&
-        a->Interface != D3DWDDM1_3_DDI_INTERFACE_VERSION)
+    if (a->Interface != D3DWDDM1_3_DDI_INTERFACE_VERSION) {
+        ulog("hwd3d_umd: no table for that interface\n");
         return E_FAIL;
-    if (!ready()) return E_FAIL;
+    }
+    if (windows_own_program()) {
+        ulog("hwd3d_umd: a program of Windows' own is left to the software renderer\n");
+        return E_FAIL;
+    }
+    if (!ready()) {
+        ulog("hwd3d_umd: the phone has no HwD3D for this process\n");
+        return E_FAIL;
+    }
     Dev *d = new (a->hDrvDevice.pDrvPrivate) Dev();
     d->rt = a->hRTDevice;
     d->core = a->hRTCoreLayer;
@@ -647,9 +1568,7 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
         ulog("hwd3d_umd: kernel context 0x%08lx, handle %p\n", (unsigned long)kh, cc.hContext);
         if (SUCCEEDED(kh)) d->kctx = cc.hContext;
     }
-    if (a->Interface == D3DWDDM1_3_DDI_INTERFACE_VERSION) fill_device_funcs(a->pWDDM1_3DeviceFuncs);
-    else if (a->Interface == D3D11_1_DDI_INTERFACE_VERSION) fill_device_funcs(a->p11_1DeviceFuncs);
-    else fill_device_funcs(a->p11DeviceFuncs);
+    fill_device_funcs(a->pWDDM1_3DeviceFuncs);
     fill_dxgi(&a->DXGIBaseDDI, a->Interface);
     ulog("hwd3d_umd: device %u, context %u\n", d->hdev, d->hctx);
     return S_OK;
@@ -665,12 +1584,8 @@ static HRESULT APIENTRY a_GetSupportedVersions(D3D10DDI_HADAPTER, UINT32 *n, UIN
 {
     if (!n) return E_INVALIDARG;
     ulog("hwd3d_umd: GetSupportedVersions (room for %u)\n", *n);
-    if (v && *n >= 3) {
-        v[0] = D3DWDDM1_3_DDI_SUPPORTED;
-        v[1] = D3D11_1_DDI_SUPPORTED;
-        v[2] = D3D11_0_DDI_SUPPORTED;
-    }
-    *n = 3;
+    if (v && *n >= 1) v[0] = D3DWDDM1_3_DDI_SUPPORTED;
+    *n = 1;
     return S_OK;
 }
 
@@ -718,4 +1633,13 @@ extern "C" HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER *a)
     return S_OK;
 }
 
-extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD, void *) { return TRUE; }
+/* At exit the program's own submit counts go to the log (HWD3D_UMDLOG), for the baseline in wddm/README.md. */
+extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
+{
+    if (reason == DLL_PROCESS_DETACH && g_chan) {
+        const struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
+        ulog("hwd3d_umd: submits to the phone %llu, to Windows %llu\n", (unsigned long long)c->submits_to_phone,
+             (unsigned long long)c->submits_to_guest);
+    }
+    return TRUE;
+}

@@ -514,6 +514,35 @@ Rules, for the work in phase 4 and phase 6:
   five minute run of the same scene. Keep batching only if it wins on both power
   and frames. If it does not, take it out.
 
+### Submit baseline (2026-11-18, before any batching)
+
+A submit is one `hwgpu_write_all` call. The phone's replies go out as two (header,
+then body), so "to Windows" runs at about twice "to the phone" for HwD3D.
+Counters: the ring control block, `hwwtest counters` (totals and per open channel),
+and the driver's own line in `HWD3D_UMDLOG` at exit.
+
+| Program, through the adapter's driver | to the phone | to Windows |
+| --- | --- | --- |
+| `dxtest 11` (device, clear, copy, read back) | 1935 | 3849 |
+| `d3dfeat` (deferred context, MSAA, query; compute fails at level 10.1) | 1974 | 3885 |
+
+Almost all of both is device creation: the runtime asks for the support of every
+format and multisample count (about 1900 calls), which the driver answers from
+the phone once per format. Caching those on the guest side would remove most of
+them and is not batching. The numbers for the cube and the AIO scenes go here
+when they run, per frame and per second.
+
+Submit measurement, after the cube draws (phase 4). With the cube and the AIO
+scenes working through the driver, measure the time spent per submit crossing the
+Windows kernel driver, and what share of a frame it is on the phone. Batch only if
+that share matters for the phone's power and frame times. Record the numbers here
+whichever way it goes.
+
+Batching before display (phase 6). The decision from phase 4 is settled before
+this phase starts. If batching stays, flips use the batched submit path: a flip is
+a present, so it flushes the batch, and the flip rides the same path as the rest
+of the frame. Vsync and the cursor layer add no submits of their own beyond it.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

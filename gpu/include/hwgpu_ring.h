@@ -25,11 +25,11 @@
  * debug marks at HW_FRAME_END (0x7f00000). */
 #define HWGPU_RING_OFF      0x6000000u
 #define HWGPU_MAGIC         0x474e495255504748ull /* "HGPURING" little endian */
-#define HWGPU_VERSION       2u  /* 2: heap grants */
-#define HWGPU_CHANNELS      8u
+#define HWGPU_VERSION       3u  /* 3: twenty channels of 1.5 MiB; 2: heap grants */
+#define HWGPU_CHANNELS      20u
 #define HWGPU_CTL_BYTES     0x1000u
-#define HWGPU_TX_BYTES      (2u << 20)  /* guest -> phone */
-#define HWGPU_RX_BYTES      (1u << 20)  /* phone -> guest */
+#define HWGPU_TX_BYTES      (1u << 20)  /* guest -> phone */
+#define HWGPU_RX_BYTES      (512u << 10)  /* phone -> guest */
 #define HWGPU_CHAN_STRIDE   (HWGPU_CTL_BYTES + HWGPU_TX_BYTES + HWGPU_RX_BYTES)
 #define HWGPU_RING_BYTES    (0x1000u + HWGPU_CHANNELS * HWGPU_CHAN_STRIDE)
 #define HWGPU_FENCE_RINGS   64u
@@ -88,6 +88,10 @@ struct hwgpu_ctl {
     /* phone: HWGPU_SCANOUT_VSYNC when every scanout frame should wait for the phone's screen, as
      * if the program had asked for FIFO (the app's "Limit to screen refresh" setting). */
     uint32_t scanout_flags;
+    /* Both: one count per hwgpu_write_all, the unit of a submit across the ring (wddm/README.md,
+     * "Batching submits"). Zero when a process claims the channel. */
+    uint64_t submits_to_phone;
+    uint64_t submits_to_guest;
 };
 #define HWGPU_SCANOUT_VSYNC 1u
 
@@ -128,6 +132,7 @@ static inline int hwgpu_claim(void *window, uint32_t *generation)
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             continue;
         c->tx_head = c->tx_tail = c->rx_head = c->rx_tail = 0;
+        c->submits_to_phone = c->submits_to_guest = 0;
         c->slot = i;
         __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELAXED);
         *generation = __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELAXED);
@@ -232,6 +237,7 @@ static inline int hwgpu_write_all(void *chan, uint32_t generation, int to_phone,
         p += n;
         bytes -= n;
     }
+    __atomic_fetch_add(to_phone ? &c->submits_to_phone : &c->submits_to_guest, 1, __ATOMIC_RELAXED);
     return 1;
 }
 
