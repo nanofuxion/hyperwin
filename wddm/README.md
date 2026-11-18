@@ -580,6 +580,16 @@ shader's signatures must carry a component type (0 makes DXVK's converter assert
 renderer aborts); `CreateTexture2D`'s wire is the description, a count of first data, then the
 object wanted.
 
+## Re-check of the done-means items (2026-11-18, after phase 4's first work)
+
+- Renderer restart (what a driver swap does): the phone's `:gpu` process killed while Windows ran.
+  `hwwtest counters` read `resets 1`; the next programs worked: `dxtest 11` PASS, Vulkan (`vkpresent`,
+  Khronos key removed) 182 frames in 3 s.
+- Byte counters after Vulkan, Direct3D 11 and OpenGL (Zink beside the program) runs: 0 bytes copied into
+  or out of Windows by the phone, 0 by the kernel driver. The windowed Direct3D read-back (see "Present,
+  until the display phase") is a program's own Map and is not in these counters yet.
+- Done means still open: `gltest` as x86, `dxtest 12`, the AIO scenes through the driver, DWM on the GPU.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
