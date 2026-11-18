@@ -284,6 +284,14 @@ class HomeScreen(
             GamepadInput.PHONE_RUMBLE_MODES.indexOf(prefs.getString(GamepadInput.PHONE_RUMBLE, "auto")).coerceAtLeast(0)) { i ->
             prefs.edit().putString(GamepadInput.PHONE_RUMBLE, GamepadInput.PHONE_RUMBLE_MODES[i]).apply()
         },
+        Ui.row(ctx, "Player 1 controller",
+            "Xbox works with the most games. DualShock 4 adds gyro aiming: tilt the phone to aim in Steam, " +
+                "SDL games and emulators that read a DualShock 4's motion. Other players are always Xbox."),
+        Ui.segmented(ctx, listOf("Xbox", "DualShock 4"),
+            if (prefs.getString(GamepadInput.PLAYER1, "xbox") == "ds4") 1 else 0) { i ->
+            prefs.edit().putString(GamepadInput.PLAYER1, if (i == 1) "ds4" else "xbox").apply()
+            GamepadInput.player1Changed()
+        },
         Ui.row(ctx, "Mouse speed in games", "For high-resolution mice. 1x is the mouse's own counts."),
         Ui.slider(ctx, 0.25f, 4f, 0.25f, prefs.getFloat(MainActivity.GAME_SPEED, 1f), { "%.2fx".format(it) }) { v ->
             prefs.edit().putFloat(MainActivity.GAME_SPEED, v).apply()

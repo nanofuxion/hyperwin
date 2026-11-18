@@ -14,6 +14,8 @@ import java.io.IOException
  *   2, x (u16), y (u16), buttons, wheel, wheel (s16), hwheel (s16)   absolute pointer, 0..65535
  *   3, buttons (u16), lt, rt, lx ly rx ry (s16), connected   gamepad, XInput layout, player 1
  *   5, slot, then as 3                                       gamepad for players 1 to 4
+ *   8, slot, gyro x y z (s16), accel x y z (s16)           motion, DualShock 4 units
+ *   9, kind                                                  player 1 is 0 an Xbox 360 controller, 1 a DualShock 4
  * A second connection, to HW_VSOCK_PORT_INPUT_BACK, brings messages back from the driver:
  *   6, slot, left motor, right motor, n, n bytes              rumble
  *   4, dx (s16), dy (s16), buttons, wheel (s16), hwheel (s16)       relative pointer, mouse counts
@@ -121,6 +123,17 @@ object VsockInput {
         val sent = send(b.array())
         if (slot == 0) send(byteArrayOf(3) + b.array().copyOfRange(2, 15))
         return sent
+    }
+
+    /** What player 1 shows Windows: an Xbox 360 controller, or a DualShock 4 with motion. */
+    fun padKind(ds4: Boolean): Boolean = send(byteArrayOf(9, if (ds4) 1 else 0))
+
+    /** A player's motion: gyro in 1/16 degree a second, accel in 1/8192 g, DualShock 4 axes. */
+    fun motion(slot: Int, v: ShortArray): Boolean {
+        val b = java.nio.ByteBuffer.allocate(14).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        b.put(8).put(slot.toByte())
+        v.forEach { b.putShort(it) }
+        return send(b.array())
     }
 
     /** Reads what the driver sends back: rumble. Reconnects while the VM runs. */

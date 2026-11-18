@@ -12,15 +12,18 @@
  *   [len] [4] [dx s16] [dy s16] [buttons] [wheel s16] [hwheel s16]  relative pointer, mouse counts
  *   [len] [3] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  gamepad, XInput layout: player 1
  *   [len] [5] [slot] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  the same for players 1 to 4
+ *   [len] [8] [slot] [gyro x y z s16] [accel x y z s16]      motion, DualShock 4 units (hwhid.sys)
+ *   [len] [9] [kind]                                          player 1 is 0 an Xbox 360 controller, 1 a DualShock 4
  * A second port, HW_VSOCK_PORT_INPUT_BACK, carries messages the other way, to the app:
- *   [len] [6] [slot] [left motor] [right motor] [n] [n bytes XUSB_SET_STATE sent]   rumble
- * Each player is its own XUSB interface on the pad device (reference strings pad0 to pad3), on
- * only while that player's controller is connected, so XInput sees controllers come and go. */
+ *   [len] [6] [slot] [big motor] [small motor] [0]                  rumble
+ * The pad device is a small bus: each connected player is a USB Xbox 360 controller on it, which
+ * Windows' own xusb22.sys runs (usbpad.c). */
 #include <ntddk.h>
 #include <kbdmou.h>
 #include <ntddkbd.h>
 #include <ntddmou.h>
 #include "hw_abi.h"
+#include "usbpad.h"
 
 #define FILE_DEVICE_SOCKET 0x0801
 #define IOCTL_SOCKET_BIND CTL_CODE(FILE_DEVICE_SOCKET, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -50,7 +53,6 @@ typedef struct {
     BOOLEAN mouse;
     int kind;
     CONNECT_DATA connect;
-    UNICODE_STRING iface[PADS];   /* the pad device's XUSB interfaces, one a player */
 } PORT_EXT;
 
 /* One controller, in XInput's terms. */
@@ -68,24 +70,13 @@ static struct {
     UCHAR buttons;
     BOOLEAN thread;
     PAD pad[PADS];
-    PORT_EXT *pad_dev;
-    BOOLEAN pad_on[PADS];          /* interface state as last set, from the listener thread */
     HANDLE back;                   /* the connection back to the app; back_lock guards writes */
+    BOOLEAN ds4;                   /* player 1 as a DualShock 4 (message 9) */
+    volatile LONG rumble[PADS];    /* 0x10000 | big << 8 | small, waiting for rumble_sender */
+    KEVENT rumble_ready;
     PCALLBACK_OBJECT pads;         /* \Callback\HyperWinPad: hwhid.sys's gamepad twin listens */
     KEVENT back_lock;
 } g;
-
-/* XUSB, as xinput1_4.dll speaks it (interface class and calls; layouts are packed). */
-static const GUID XUSB_INTERFACE = { 0xEC87F1E3, 0xC13B, 0x4100, { 0xB5, 0xF7, 0x8B, 0x84, 0xD5, 0x42, 0x60, 0xCB } };
-#define XUSB_GET_INFORMATION   0x80006000u
-#define XUSB_GET_CAPABILITIES  0x8000E004u
-#define XUSB_GET_LED_STATE     0x8000E008u
-#define XUSB_GET_STATE         0x8000E00Cu
-#define XUSB_SET_STATE         0x8000A010u
-#define XUSB_GET_BATTERY       0x8000E018u
-#define XUSB_VERSION           0x0102
-#define PAD_VID 0x045E          /* an Xbox 360 controller, what games know best */
-#define PAD_PID 0x028E
 
 static void diag(ULONG index, ULONG value)
 {
@@ -158,6 +149,14 @@ static void on_message(const UCHAR *m, ULONG len)
         /* relative: dx, dy in mouse counts */
         pointer(MOUSE_MOVE_RELATIVE, (SHORT)(m[1] | m[2] << 8), (SHORT)(m[3] | m[4] << 8), m[5],
                 (SHORT)(m[6] | m[7] << 8), (SHORT)(m[8] | m[9] << 8));
+    } else if (m[0] == 9 && len >= 2) {
+        PAD *p = &g.pad[0];
+        g.ds4 = m[1] == 1;
+        usbpad_update(0, g.ds4, p->connected, p->buttons, p->lt, p->rt, p->lx, p->ly, p->rx, p->ry);
+    } else if (m[0] == 8 && len >= 14 && m[1] < PADS) {
+        SHORT motion[6];
+        for (int i = 0; i < 6; i++) motion[i] = (SHORT)(m[2 + 2 * i] | m[3 + 2 * i] << 8);
+        if (g.pads) ExNotifyCallback(g.pads, (PVOID)(ULONG_PTR)(0x100 | m[1]), motion);
     } else if ((m[0] == 3 && len >= 14) || (m[0] == 5 && len >= 15 && m[1] < PADS)) {
         ULONG slot = m[0] == 5 ? m[1] : 0;
         const UCHAR *q = m[0] == 5 ? m + 1 : m;
@@ -174,11 +173,7 @@ static void on_message(const UCHAR *m, ULONG len)
         p->packet++;
         KeReleaseSpinLock(&g.lock, irql);
         if (g.pads) ExNotifyCallback(g.pads, (PVOID)(ULONG_PTR)slot, (PVOID)(q + 1));
-        /* XInput finds a controller by its interface: on while connected. */
-        if (g.pad_dev && g.pad_dev->iface[slot].Buffer && g.pad_on[slot] != (q[13] != 0)) {
-            g.pad_on[slot] = q[13] != 0;
-            IoSetDeviceInterfaceState(&g.pad_dev->iface[slot], g.pad_on[slot]);
-        }
+        usbpad_update(slot, slot == 0 && g.ds4, q[13] != 0, p->buttons, p->lt, p->rt, p->lx, p->ly, p->rx, p->ry);
     }
 }
 
@@ -193,110 +188,36 @@ static void send_back(const UCHAR *msg, ULONG len)
 
 static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information);
 
-static void put16(UCHAR *p, USHORT v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); }
-static void put32(UCHAR *p, ULONG v) { put16(p, (USHORT)v); put16(p + 2, (USHORT)(v >> 16)); }
-
-/* The XUSB calls, answered from the state the phone last sent for the player whose interface the
- * caller opened. */
-static NTSTATUS pad_ioctl(PIRP irp, PIO_STACK_LOCATION st)
+/* \Callback\HyperWinPadOut: a game set the DualShock 4 twin's motors (player 1). */
+static void rumble_back(ULONG slot, UCHAR big, UCHAR small);
+static VOID twin_rumble(PVOID context, PVOID slot, PVOID motors)
 {
-    ULONG slot = st->FileObject ? (ULONG)(ULONG_PTR)st->FileObject->FsContext2 : 0;
-    ULONG code = st->Parameters.DeviceIoControl.IoControlCode;
-    ULONG in = st->Parameters.DeviceIoControl.InputBufferLength;
-    ULONG out = st->Parameters.DeviceIoControl.OutputBufferLength;
-    UCHAR *b = irp->AssociatedIrp.SystemBuffer;
-    USHORT version = in >= 2 ? (USHORT)(b[0] | b[1] << 8) : 0x0100;
-    PAD p;
-    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
-    p = g.pad[slot < PADS ? slot : 0];
-    KeReleaseSpinLock(&g.lock, irql);
-    switch (code) {
-    case XUSB_GET_INFORMATION:   /* version, controllers, flags (0x80: none), ..., vid, pid */
-        if (out < 12) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-        RtlZeroMemory(b, 12);
-        put16(b, XUSB_VERSION);
-        b[2] = 1;
-        put16(b + 8, PAD_VID);
-        put16(b + 10, PAD_PID);
-        return complete(irp, STATUS_SUCCESS, 12);
-    case XUSB_GET_STATE:
-        if (version == 0x0100) {   /* status, -, input id, packet, -, buttons, lt, rt, sticks */
-            if (out < 20) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-            RtlZeroMemory(b, 20);
-            b[0] = p.connected ? 1 : 0;
-            put32(b + 3, p.packet);
-            put16(b + 8, p.buttons);
-            b[10] = p.lt; b[11] = p.rt;
-            put16(b + 12, (USHORT)p.lx); put16(b + 14, (USHORT)p.ly);
-            put16(b + 16, (USHORT)p.rx); put16(b + 18, (USHORT)p.ry);
-            return complete(irp, STATUS_SUCCESS, 20);
+    (void)context;
+    rumble_back((ULONG)(ULONG_PTR)slot, ((UCHAR *)motors)[0], ((UCHAR *)motors)[1]);
+}
+
+/* usbpad.c: a game set a player's motors. xusb22 can send that at DISPATCH_LEVEL, where writing
+ * to the socket may not wait, so a thread at PASSIVE_LEVEL sends it on. */
+static void rumble_back(ULONG slot, UCHAR big, UCHAR small)
+{
+    if (slot >= PADS) return;
+    __atomic_store_n(&g.rumble[slot], 0x10000 | big << 8 | small, __ATOMIC_SEQ_CST);
+    KeSetEvent(&g.rumble_ready, IO_NO_INCREMENT, FALSE);
+}
+
+static void rumble_sender(PVOID context)
+{
+    (void)context;
+    for (;;) {
+        KeWaitForSingleObject(&g.rumble_ready, Executive, KernelMode, FALSE, NULL);
+        for (ULONG i = 0; i < PADS; i++) {
+            LONG v = __atomic_exchange_n(&g.rumble[i], 0, __ATOMIC_SEQ_CST);
+            UCHAR m[6] = { 5, 6, (UCHAR)i, (UCHAR)(v >> 8), (UCHAR)v, 0 };
+            if (v) send_back(m, sizeof m);
         }
-        /* version, status, -, input id, packet, -, -, buttons, lt, rt, sticks, 5 x -, extra buttons */
-        if (out < 29) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-        RtlZeroMemory(b, 29);
-        put16(b, XUSB_VERSION);
-        b[2] = p.connected ? 1 : 0;
-        put32(b + 5, p.packet);
-        put16(b + 11, p.buttons);
-        b[13] = p.lt; b[14] = p.rt;
-        put16(b + 15, (USHORT)p.lx); put16(b + 17, (USHORT)p.ly);
-        put16(b + 19, (USHORT)p.rx); put16(b + 21, (USHORT)p.ry);
-        return complete(irp, STATUS_SUCCESS, 29);
-    case XUSB_GET_CAPABILITIES:
-        if (version == 0x0101) {   /* what XInput asks for here: version, type, subtype, buttons, ..., motors */
-            if (out < 24) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-            RtlZeroMemory(b, 24);
-            put16(b, 0x0101);
-            b[2] = 1;                   /* gamepad */
-            b[3] = 1;                   /* XINPUT_DEVSUBTYPE_GAMEPAD */
-            put16(b + 4, 0xF7FF);
-            b[6] = 0xFF; b[7] = 0xFF;
-            put16(b + 8, 0xFFC0); put16(b + 10, 0xFFC0); put16(b + 12, 0xFFC0); put16(b + 14, 0xFFC0);
-            b[22] = 0xFF; b[23] = 0xFF;
-            return complete(irp, STATUS_SUCCESS, 24);
-        }
-        /* version, type, subtype, flags, vid, pid, product version, -, then what each control reports. */
-        if (out < 36) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-        RtlZeroMemory(b, 36);
-        put16(b, XUSB_VERSION);
-        b[2] = 1;                       /* gamepad */
-        b[3] = 1;                       /* XINPUT_DEVSUBTYPE_GAMEPAD */
-        put16(b + 6, PAD_VID);
-        put16(b + 8, PAD_PID);
-        put16(b + 16, 0xF7FF);          /* every button, guide included */
-        b[18] = 0xFF; b[19] = 0xFF;     /* triggers */
-        put16(b + 20, 0xFFC0); put16(b + 22, 0xFFC0); put16(b + 24, 0xFFC0); put16(b + 26, 0xFFC0);
-        b[34] = 0xFF; b[35] = 0xFF;     /* motors: reported, though rumble does not reach the phone yet */
-        return complete(irp, STATUS_SUCCESS, 36);
-    case XUSB_GET_LED_STATE:            /* version, LED: 6 to 9 light player 1 to 4 */
-        if (out < 3) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-        put16(b, XUSB_VERSION);
-        b[2] = (UCHAR)(6 + slot);
-        return complete(irp, STATUS_SUCCESS, 3);
-    case XUSB_GET_BATTERY:              /* version, type wired, level full */
-        if (out < 4) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
-        put16(b, XUSB_VERSION);
-        b[2] = 1;
-        b[3] = 3;
-        return complete(irp, STATUS_SUCCESS, 4);
-    case XUSB_SET_STATE: {              /* 0, LED, left motor, right motor, flags: 1 LED, 2 rumble */
-        UCHAR msg[16] = {0};
-        ULONG n = in < 8 ? in : 8;
-        if (in < 5 || !(b[4] & 2)) return complete(irp, STATUS_SUCCESS, 0);   /* the LED only */
-        msg[0] = (UCHAR)(5 + n);
-        msg[1] = 6;
-        msg[2] = (UCHAR)slot;
-        msg[3] = in >= 4 ? b[2] : 0;
-        msg[4] = in >= 4 ? b[3] : 0;
-        msg[5] = (UCHAR)n;
-        RtlCopyMemory(msg + 6, b, n);
-        send_back(msg, 6 + n);
-        return complete(irp, STATUS_SUCCESS, 0);
-    }
-    default:
-        return complete(irp, STATUS_NOT_SUPPORTED, 0);
     }
 }
+
 
 static NTSTATUS open_socket(HANDLE parent, HANDLE *out)
 {
@@ -421,6 +342,7 @@ static NTSTATUS complete(PIRP irp, NTSTATUS status, ULONG_PTR information)
 
 static NTSTATUS internal_ioctl(PDEVICE_OBJECT device, PIRP irp)
 {
+    if (usbpad_is_child(device)) return usbpad_dispatch(device, irp);
     PORT_EXT *e = device->DeviceExtension;
     PIO_STACK_LOCATION st = IoGetCurrentIrpStackLocation(irp);
     ULONG in = st->Parameters.DeviceIoControl.InputBufferLength;
@@ -506,6 +428,7 @@ static NTSTATUS start_done(PDEVICE_OBJECT device, PIRP irp, PVOID event)
 
 static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
 {
+    if (usbpad_is_child(device)) return usbpad_dispatch(device, irp);
     PORT_EXT *e = device->DeviceExtension;
     PIO_STACK_LOCATION st = IoGetCurrentIrpStackLocation(irp);
     PDEVICE_OBJECT lower = e->lower;
@@ -527,22 +450,26 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
                 g.thread = TRUE;
             }
             if (NT_SUCCESS(PsCreateSystemThread(&t, THREAD_ALL_ACCESS, NULL, NULL, NULL, back_listener, NULL))) ZwClose(t);
+            if (NT_SUCCESS(PsCreateSystemThread(&t, THREAD_ALL_ACCESS, NULL, NULL, NULL, rumble_sender, NULL))) ZwClose(t);
         }
         diag(e->kind == KIND_PAD ? 51 : e->mouse ? 48 : 47, NT_SUCCESS(status) ? 1 : 0x100 | ((ULONG)status & 0xff));
         return complete(irp, status, irp->IoStatus.Information);
+    }
+    if (e->kind == KIND_PAD && st->MinorFunction == IRP_MN_QUERY_DEVICE_RELATIONS &&
+        st->Parameters.QueryDeviceRelations.Type == BusRelations) {
+        PDEVICE_RELATIONS r = usbpad_relations();
+        if (r) {
+            irp->IoStatus.Information = (ULONG_PTR)r;
+            irp->IoStatus.Status = STATUS_SUCCESS;
+        }
+        IoSkipCurrentIrpStackLocation(irp);
+        return IoCallDriver(lower, irp);
     }
     if (st->MinorFunction == IRP_MN_REMOVE_DEVICE) {
         KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
         if (g.kbd == e) g.kbd = NULL;
         if (g.mou == e) g.mou = NULL;
         KeReleaseSpinLock(&g.lock, irql);
-        if (g.pad_dev == e) g.pad_dev = NULL;
-        for (int i = 0; i < PADS; i++) {
-            if (!e->iface[i].Buffer) continue;
-            IoSetDeviceInterfaceState(&e->iface[i], FALSE);
-            RtlFreeUnicodeString(&e->iface[i]);
-            g.pad_on[i] = FALSE;
-        }
         irp->IoStatus.Status = STATUS_SUCCESS;
         IoSkipCurrentIrpStackLocation(irp);
         status = IoCallDriver(lower, irp);
@@ -560,6 +487,7 @@ static NTSTATUS pnp(PDEVICE_OBJECT device, PIRP irp)
 
 static NTSTATUS power(PDEVICE_OBJECT device, PIRP irp)
 {
+    if (usbpad_is_child(device)) return usbpad_dispatch(device, irp);
     PORT_EXT *e = device->DeviceExtension;
     IoSkipCurrentIrpStackLocation(irp);
     return PoCallDriver(e->lower, irp);
@@ -567,33 +495,22 @@ static NTSTATUS power(PDEVICE_OBJECT device, PIRP irp)
 
 static NTSTATUS pass_down(PDEVICE_OBJECT device, PIRP irp)
 {
+    if (usbpad_is_child(device)) return usbpad_dispatch(device, irp);
     PORT_EXT *e = device->DeviceExtension;
     IoSkipCurrentIrpStackLocation(irp);
     return IoCallDriver(e->lower, irp);
 }
 
-/* Opening a pad interface: its reference string, \pad0 to \pad3, says which player. */
 static NTSTATUS create_close(PDEVICE_OBJECT device, PIRP irp)
 {
-    PIO_STACK_LOCATION st = IoGetCurrentIrpStackLocation(irp);
-    (void)device;
-    if (st->MajorFunction == IRP_MJ_CREATE && st->FileObject) {
-        UNICODE_STRING *n = &st->FileObject->FileName;
-        ULONG slot = 0;
-        if (n->Length >= 2 * sizeof(WCHAR)) {
-            WCHAR c = n->Buffer[n->Length / sizeof(WCHAR) - 1];
-            if (c >= L'0' && c < L'0' + PADS) slot = (ULONG)(c - L'0');
-        }
-        st->FileObject->FsContext2 = (PVOID)(ULONG_PTR)slot;
-    }
+    if (usbpad_is_child(device)) return usbpad_dispatch(device, irp);
     return complete(irp, STATUS_SUCCESS, 0);
 }
 
-/* Programs talk to the pad; the keyboard and mouse only take their class drivers' internal calls. */
 static NTSTATUS device_control(PDEVICE_OBJECT device, PIRP irp)
 {
     PORT_EXT *e = device->DeviceExtension;
-    if (e->kind == KIND_PAD) return pad_ioctl(irp, IoGetCurrentIrpStackLocation(irp));
+    if (usbpad_is_child(device)) return usbpad_dispatch(device, irp);
     IoSkipCurrentIrpStackLocation(irp);
     return IoCallDriver(e->lower, irp);
 }
@@ -642,22 +559,7 @@ static NTSTATUS add_device(PDRIVER_OBJECT driver, PDEVICE_OBJECT pdo)
         IoDeleteDevice(d);
         return STATUS_NO_SUCH_DEVICE;
     }
-    if (kind == KIND_PAD) {
-        /* An interface a player. Each goes on when the phone says that player's controller is
-         * connected (on_message). A device the driver reported itself may never get a start
-         * request, so nothing here waits for one. */
-        for (int i = 0; i < PADS; i++) {
-            WCHAR ref[] = L"pad0";
-            UNICODE_STRING r;
-            ref[3] = (WCHAR)(L'0' + i);
-            RtlInitUnicodeString(&r, ref);
-            if (!NT_SUCCESS(IoRegisterDeviceInterface(pdo, &XUSB_INTERFACE, &r, &e->iface[i])))
-                RtlZeroMemory(&e->iface[i], sizeof e->iface[i]);
-            else if (g.pad[i].connected)
-                IoSetDeviceInterfaceState(&e->iface[i], g.pad_on[i] = TRUE);
-        }
-        g.pad_dev = e;
-    }
+    if (kind == KIND_PAD) usbpad_set_bus(pdo);   /* the players hang off this device */
     d->Flags |= DO_BUFFERED_IO | DO_POWER_PAGABLE;
     d->Flags &= ~DO_DEVICE_INITIALIZING;
     if (kind != KIND_PAD) {
@@ -695,12 +597,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 {
     KeInitializeSpinLock(&g.lock);
     KeInitializeEvent(&g.back_lock, SynchronizationEvent, TRUE);
+    KeInitializeEvent(&g.rumble_ready, SynchronizationEvent, FALSE);
+    usbpad_init(driver, rumble_back);
     {
         UNICODE_STRING name;
         OBJECT_ATTRIBUTES oa;
         RtlInitUnicodeString(&name, L"\\Callback\\HyperWinPad");
         InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
         if (!NT_SUCCESS(ExCreateCallback(&g.pads, &oa, TRUE, TRUE))) g.pads = NULL;
+        PCALLBACK_OBJECT out;
+        RtlInitUnicodeString(&name, L"\\Callback\\HyperWinPadOut");
+        if (NT_SUCCESS(ExCreateCallback(&out, &oa, TRUE, TRUE))) ExRegisterCallback(out, twin_rumble, NULL);
     }
     diag(43, 1);
     driver->MajorFunction[IRP_MJ_CREATE] = create_close;
@@ -714,3 +621,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     report_pad(driver, registry);
     return STATUS_SUCCESS;
 }
+
+/* The players' USB bus, built as part of this file: both use the same inline helpers. */
+#include "usbpad.c"

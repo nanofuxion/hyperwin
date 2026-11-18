@@ -1,6 +1,10 @@
 package dev.hyperwin.app
 
 import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.input.InputManager
 import android.os.CombinedVibration
 import android.os.Handler
@@ -90,8 +94,74 @@ object GamepadInput : InputManager.InputDeviceListener {
         InputDevice.getDeviceIds().forEach { onInputDeviceAdded(it) }
     }
 
+    // ---- motion: the phone's gyroscope and accelerometer as player 1's DualShock 4 twin's ----
+
+    /** Player 1 as "xbox" (an Xbox 360 controller, for the most games) or "ds4" (a DualShock 4, with gyro). */
+    const val PLAYER1 = "player1Pad"
+
+    private fun ds4(ctx: Context) = ctx.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).getString(PLAYER1, "xbox") == "ds4"
+    private var sensing = false
+    private var paused = false
+    private val accel = FloatArray(3)
+    @Volatile private var rotation = android.view.Surface.ROTATION_90
+    /** Sensor events arrive here, off the main thread: 250 a second. */
+    private val sensorThread by lazy { android.os.HandlerThread("hw-motion").apply { start() } }
+
+    private val motionListener = object : SensorEventListener {
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        override fun onSensorChanged(e: SensorEvent) {
+            if (e.sensor.type == Sensor.TYPE_ACCELEROMETER) { System.arraycopy(e.values, 0, accel, 0, 3); return }
+            // The phone held sideways like a controller, screen to the player: the DualShock 4's X is
+            // the screen's right, Y the screen's normal, Z the screen's down.
+            val turned = rotation == android.view.Surface.ROTATION_270
+            val s = if (turned) 1f else -1f
+            val g = 180f / Math.PI.toFloat() * 16f
+            val a = 8192f / SensorManager.GRAVITY_EARTH
+            fun clamp(v: Float) = v.coerceIn(-32767f, 32767f).toInt().toShort()
+            VsockInput.motion(0, shortArrayOf(
+                clamp(s * e.values[1] * g), clamp(e.values[2] * g), clamp(s * e.values[0] * g),
+                clamp(s * accel[1] * a), clamp(accel[2] * a), clamp(s * accel[0] * a),
+            ))
+        }
+    }
+
+    /** Streams the phone's motion while player 1 is connected, the setting is on and the app is in front. */
+    private fun updateSensing() {
+        val ctx = appContext ?: return
+        val want = pads[0].connected && !paused && ds4(ctx)
+        if (want == sensing) return
+        val sm = ctx.getSystemService(SensorManager::class.java)
+        if (want) {
+            val gyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) ?: return
+            runCatching {
+                rotation = ctx.getSystemService(android.hardware.display.DisplayManager::class.java)
+                    .getDisplay(android.view.Display.DEFAULT_DISPLAY)?.rotation ?: rotation
+                val h = Handler(sensorThread.looper)
+                sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let { sm.registerListener(motionListener, it, 4000, h) }
+                sm.registerListener(motionListener, gyro, 4000, h)
+            }.onFailure { Log.w(TAG, "phone motion unavailable", it); return }
+        } else {
+            sm.unregisterListener(motionListener)
+        }
+        sensing = want
+        Log.i(TAG, "phone motion for player 1 ${if (want) "on" else "off"}")
+    }
+
+    fun pause() { paused = true; updateSensing(); stopAllRumble() }
+    fun resume() { paused = false; updateSensing() }
+    /** After the Player 1 setting changed: Windows swaps the controller, then gets the state again. */
+    fun player1Changed() {
+        val ctx = appContext ?: return
+        VsockInput.padKind(ds4(ctx))
+        updateSensing()
+        main.postDelayed({ resend() }, 1500)
+    }
+
     /** Sends every player again, for a link that just came up. */
-    fun resend() = pads.forEach { send(it) }
+    fun resend() {
+        appContext?.let { VsockInput.padKind(ds4(it)) }
+        pads.forEach { send(it) }
+    }
 
     fun isGamepad(source: Int): Boolean =
         (source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
@@ -165,6 +235,7 @@ object GamepadInput : InputManager.InputDeviceListener {
     }
 
     private fun send(pad: Pad) {
+        if (pad.slot == 0) updateSensing()
         VsockInput.pad(pad.slot, pad.connected, pad.keyButtons or pad.hatButtons, maxOf(pad.axisLt, pad.keyLt),
             maxOf(pad.axisRt, pad.keyRt), pad.lx, pad.ly, pad.rx, pad.ry)
     }

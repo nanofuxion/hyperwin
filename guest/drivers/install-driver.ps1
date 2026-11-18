@@ -1,6 +1,7 @@
 # Installs or updates one HyperWin driver package on its root devices:
 #   install-driver.ps1 hwaudio Root\HwAudio      (files in .\hwaudio\: hwaudio.inf, hwaudio.sys)
-#   install-driver.ps1 hwhid "Root\HwHid,Root\VID_045E&PID_028E&IG_00"   (several devices)
+#   install-driver.ps1 hwhid Root\HwHid    (the package also serves devices that come later, such
+#                                           as hwvsinput.sys's DualShock 4, HWPAD\VID_054C&PID_09CC)
 # Run as SYSTEM or administrator, by gpu-install.cmd. Windows wants a signed catalog for a driver
 # package, and nothing on the build side can make one, so it is made here and signed with the
 # hyperwin-pkg key (audio/README.md). Writes .\<name>\install.log.
@@ -38,6 +39,12 @@ $inuse = if ($dev) { (Get-PnpDeviceProperty -InstanceId $dev.InstanceId DEVPKEY_
 pnputil /enum-drivers | Out-String | Select-String -Pattern "Published Name:\s+(oem\d+\.inf)\s+Original Name:\s+$Name\.inf" -AllMatches |
     ForEach-Object { $_.Matches } | Where-Object { $_.Groups[1].Value -ne $inuse } |
     ForEach-Object { pnputil /delete-driver $_.Groups[1].Value } | Out-File $log -Append
+
+# The Xbox 360 HID twin of an earlier build; players are USB Xbox 360 controllers now, and player 1
+# can be a DualShock 4 instead.
+if ($Name -eq 'hwhid' -and (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\VID_045E&PID_028E&IG_00' })) {
+    & "$d\devcon.exe" remove 'Root\VID_045E&PID_028E&IG_00' 2>&1 | Out-File $log -Append
+}
 
 # Scream sent sound over the network; hwaudio replaces it.
 if ($Name -eq 'hwaudio' -and (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains '*Scream' })) {

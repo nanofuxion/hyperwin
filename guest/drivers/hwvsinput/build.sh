@@ -15,6 +15,14 @@ LIBRARY ntoskrnl.exe
 EXPORTS
 ExCreateCallback
 ExNotifyCallback
+ExRegisterCallback
+ExAllocatePoolWithTag
+IoInvalidateDeviceRelations
+MmMapLockedPagesSpecifyCache
+ObfReferenceObject
+IoReleaseCancelSpinLock
+PoStartNextPowerIrp
+RtlCompareMemory
 IoAttachDeviceToDeviceStack
 IoCreateDevice
 IoDeleteDevice

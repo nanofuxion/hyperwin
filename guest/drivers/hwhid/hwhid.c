@@ -382,58 +382,121 @@ static NTSTATUS get_feature(PIRP irp)
     return complete(irp, STATUS_SUCCESS, need);
 }
 
-/* ---- The gamepad twin ----
- * A wired Xbox 360 controller also shows Windows a HID game controller, with IG_00 in its IDs, for
- * DirectInput, joy.cpl, SDL and Steam; programs that know XInput skip anything with IG_. This is
- * that for player 1: device Root\VID_045E&PID_028E&IG_00, whose HID IDs take the IG_00 from it.
- * hwvsinput.sys hands each pad update over through the \Callback\HyperWinPad callback object. */
+/* ---- The DualShock 4 twin ----
+ * Player 1 is also a wired DualShock 4 (054C:09CC), with the phone's gyroscope and accelerometer
+ * in it (gamepad/README.md). Steam Input and SDL's HIDAPI driver read a DualShock 4's motion
+ * sensors straight from its HID reports, and browsers know its button layout (the "standard"
+ * Gamepad API mapping). Device Root\VID_054C&PID_09CC; hidclass builds its HID IDs from that.
+ * hwvsinput.sys hands each pad and motion update over through the \Callback\HyperWinPad callback
+ * object, and this hands the game's rumble back through \Callback\HyperWinPadOut. */
 static const UCHAR pad_descriptor[] = {
-    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01,                               /* Gamepad */
-    0xa1, 0x00, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00,
-    0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xc0,                         /* left stick X, Y */
-    0xa1, 0x00, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00,
-    0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xc0,                         /* right stick Rx, Ry */
-    0x09, 0x32, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02,   /* triggers, Z */
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x0a, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0a, 0x81, 0x02,
-    0x75, 0x06, 0x95, 0x01, 0x81, 0x03,                               /* buttons 1 to 10 */
-    0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x66, 0x14, 0x00,
-    0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03, 0x65, 0x00,   /* hat */
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01,
+    0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+    0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+    0x65, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0e, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0e, 0x81, 0x02,
+    0x06, 0x00, 0xff, 0x09, 0x20, 0x75, 0x06, 0x95, 0x01, 0x15, 0x00, 0x25, 0x7f, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0x06, 0x00, 0xff, 0x09, 0x21, 0x95, 0x36, 0x81, 0x02,           /* timestamp, motion, battery, touch: 54 bytes */
+    0x85, 0x05, 0x09, 0x22, 0x95, 0x1f, 0x91, 0x02,                 /* output 0x05: rumble and light bar */
+    0x85, 0x02, 0x09, 0x24, 0x95, 0x24, 0xb1, 0x02,                 /* feature 0x02: motion calibration */
+    0x85, 0x12, 0x09, 0x25, 0x95, 0x0f, 0xb1, 0x02,                 /* feature 0x12: serial */
+    0x85, 0xa3, 0x09, 0x26, 0x95, 0x30, 0xb1, 0x02,                 /* feature 0xA3: firmware */
     0xc0,
 };
-#define PAD_HID_REPORT 13
+#define DS4_REPORT 64
 
-/* The callback: Argument1 the player (0 to 3), Argument2 the 13 bytes of message 3 after its type. */
-static VOID pad_update(PVOID context, PVOID slot, PVOID state)
+static struct {
+    KSPIN_LOCK lock;
+    UCHAR state[13];      /* message 3's bytes after its type */
+    SHORT motion[6];      /* gyro x y z (16 a degree a second), accel x y z (8192 a g) */
+    UCHAR counter;
+    USHORT stamp;
+    PCALLBACK_OBJECT out; /* \Callback\HyperWinPadOut */
+} ds4;
+
+static void ds4_send(void)
 {
-    static const USHORT map[10] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, 0x0020, 0x0010, 0x0040, 0x0080 };
-    static const UCHAR hats[16] = { 0, 1, 5, 0, 7, 8, 6, 7, 3, 2, 4, 3, 0, 1, 5, 0 };   /* by up, down, left, right */
-    const UCHAR *q = state;
-    UCHAR r[PAD_HID_REPORT] = {0};
-    USHORT b = (USHORT)(q[0] | q[1] << 8), buttons = 0;
+    static const UCHAR hats[16] = { 8, 0, 4, 8, 6, 7, 5, 6, 2, 1, 3, 2, 8, 0, 4, 8 };   /* by up, down, left, right */
+    UCHAR r[DS4_REPORT] = {0};
+    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&ds4.lock);
+    const UCHAR *q = ds4.state;
+    USHORT b = q[12] ? (USHORT)(q[0] | q[1] << 8) : 0;
     LONG lx = (SHORT)(q[4] | q[5] << 8), ly = (SHORT)(q[6] | q[7] << 8);
     LONG rx = (SHORT)(q[8] | q[9] << 8), ry = (SHORT)(q[10] | q[11] << 8);
-    LONG z = 32768 + ((LONG)q[2] - (LONG)q[3]) * 128;
-    (void)context;
-    if ((ULONG_PTR)slot != 0 || !g.pad) return;
-    if (!q[12]) { lx = ly = rx = ry = 0; z = 32768; b = 0; }   /* disconnected: at rest */
-    put16(r + 0, (USHORT)(lx + 32768));
-    put16(r + 2, (USHORT)(32767 - ly));
-    put16(r + 4, (USHORT)(rx + 32768));
-    put16(r + 6, (USHORT)(32767 - ry));
-    put16(r + 8, (USHORT)(z < 0 ? 0 : z > 65535 ? 65535 : z));
-    for (int i = 0; i < 10; i++)
-        if (b & map[i]) buttons |= (USHORT)(1 << i);
-    put16(r + 10, buttons);
-    r[12] = hats[b & 0xf];
+    UCHAR lt = q[12] ? q[2] : 0, rt = q[12] ? q[3] : 0;
+    if (!q[12]) lx = ly = rx = ry = 0;
+    r[0] = 0x01;
+    r[1] = (UCHAR)((lx + 32768) >> 8);
+    r[2] = (UCHAR)((32767 - ly) >> 8);
+    r[3] = (UCHAR)((rx + 32768) >> 8);
+    r[4] = (UCHAR)((32767 - ry) >> 8);
+    r[5] = hats[b & 0xf] | (b & 0x4000 ? 0x10 : 0) | (b & 0x1000 ? 0x20 : 0) | (b & 0x2000 ? 0x40 : 0) | (b & 0x8000 ? 0x80 : 0);
+    r[6] = (b & 0x0100 ? 0x01 : 0) | (b & 0x0200 ? 0x02 : 0) | (lt > 30 ? 0x04 : 0) | (rt > 30 ? 0x08 : 0) |
+           (b & 0x0020 ? 0x10 : 0) | (b & 0x0010 ? 0x20 : 0) | (b & 0x0040 ? 0x40 : 0) | (b & 0x0080 ? 0x80 : 0);
+    r[7] = (UCHAR)((b & 0x0400 ? 0x01 : 0) | (ds4.counter++ << 2));
+    r[8] = lt;
+    r[9] = rt;
+    ds4.stamp += 188;                                    /* about 1 ms, in 5.33 us units */
+    put16(r + 10, ds4.stamp);
+    for (int i = 0; i < 6; i++) put16(r + 13 + 2 * i, (USHORT)ds4.motion[i]);
+    r[30] = 0x1b;                                        /* cable in, battery full */
+    r[33] = r[37] = 0x80;                                /* no fingers on the touchpad */
+    KeReleaseSpinLock(&ds4.lock, irql);
     post(g.pad, r, sizeof r);
+}
+
+/* The callback: Argument1 the player (0 to 3), plus 0x100 for motion; Argument2 the bytes. */
+static VOID pad_update(PVOID context, PVOID arg1, PVOID data)
+{
+    ULONG_PTR a = (ULONG_PTR)arg1;
+    (void)context;
+    if ((a & 0xff) != 0 || !g.pad) return;
+    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&ds4.lock);
+    if (a & 0x100) RtlCopyMemory(ds4.motion, data, sizeof ds4.motion);
+    else RtlCopyMemory(ds4.state, data, sizeof ds4.state);
+    KeReleaseSpinLock(&ds4.lock, irql);
+    ds4_send();
+}
+
+/* Feature reports SDL and Steam ask a DualShock 4 for. The calibration says: no bias, 16 a degree
+ * a second, 8192 a g, which are the units the phone sends. */
+static NTSTATUS ds4_feature(PIRP irp)
+{
+    HID_XFER_PACKET *p = irp->UserBuffer;
+    ULONG n;
+    if (!p || !p->reportBuffer) return complete(irp, STATUS_INVALID_PARAMETER, 0);
+    n = p->reportId == 0x02 ? 37 : p->reportId == 0x12 ? 16 : p->reportId == 0xa3 ? 49 : 0;
+    if (!n) return complete(irp, STATUS_INVALID_PARAMETER, 0);
+    if (p->reportBufferLen < n) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+    RtlZeroMemory(p->reportBuffer, n);
+    p->reportBuffer[0] = p->reportId;
+    if (p->reportId == 0x02) {
+        UCHAR *c = p->reportBuffer;
+        static const SHORT cal[17] = { 0, 0, 0, 8640, -8640, 8640, -8640, 8640, -8640, 540, 540,
+                                       8192, -8192, 8192, -8192, 8192, -8192 };
+        for (int i = 0; i < 17; i++) put16(c + 1 + 2 * i, (USHORT)cal[i]);
+    } else if (p->reportId == 0x12) {
+        static const UCHAR mac[6] = { 0x48, 0x57, 0x01, 0x02, 0x03, 0x04 };
+        RtlCopyMemory(p->reportBuffer + 1, mac, 6);
+    }
+    return complete(irp, STATUS_SUCCESS, n);
+}
+
+/* Output report 0x05 from a game: byte 4 the light (right) motor, 5 the heavy (left) one. */
+static void ds4_output(const UCHAR *r, ULONG len)
+{
+    if (len < 6 || r[0] != 0x05 || !(r[1] & 0x01) || !ds4.out) return;
+    UCHAR motors[2] = { r[5], r[4] };
+    ExNotifyCallback(ds4.out, (PVOID)0, motors);
 }
 
 static NTSTATUS get_string(PIRP irp, PIO_STACK_LOCATION st, BOOLEAN pad)
 {
-    static const WCHAR maker[] = L"HyperWin", product[] = L"HyperWin Touch", pad_name[] = L"Controller (HyperWin)",
+    static const WCHAR maker[] = L"Sony Interactive Entertainment", product[] = L"HyperWin Touch",
+                       pad_name[] = L"Wireless Controller",
                        serial[] = L"1";
     ULONG id = (ULONG)(ULONG_PTR)st->Parameters.DeviceIoControl.Type3InputBuffer & 0xffff;
-    const WCHAR *s = id == 14 ? maker : id == 15 ? (pad ? pad_name : product) : id == 16 ? serial : NULL;
+    const WCHAR *s = id == 14 ? (pad ? maker : L"HyperWin") : id == 15 ? (pad ? pad_name : product) : id == 16 ? serial : NULL;
     ULONG bytes;
     if (!s) return complete(irp, STATUS_INVALID_PARAMETER, 0);
     bytes = (ULONG)(wcslen(s) + 1) * sizeof(WCHAR);
@@ -465,15 +528,15 @@ static NTSTATUS internal_ioctl(PDEVICE_OBJECT device, PIRP irp)
         if (out < sizeof *a) return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
         RtlZeroMemory(a, sizeof *a);
         a->Size = sizeof *a;
-        a->VendorID = dev->pad ? 0x045E : 0x1209;    /* the pad: an Xbox 360 controller; else pid.codes */
-        a->ProductID = dev->pad ? 0x028E : 0x4857;
+        a->VendorID = dev->pad ? 0x054C : 0x1209;    /* the pad: a DualShock 4; else pid.codes */
+        a->ProductID = dev->pad ? 0x09CC : 0x4857;
         a->VersionNumber = 0x0100;
         return complete(irp, STATUS_SUCCESS, sizeof *a);
     }
     case IOCTL_HID_READ_REPORT:
         return read_report(dev, irp);
     case IOCTL_HID_GET_FEATURE:
-        return dev->pad ? complete(irp, STATUS_NOT_SUPPORTED, 0) : get_feature(irp);
+        return dev->pad ? ds4_feature(irp) : get_feature(irp);
     case IOCTL_HID_SET_FEATURE: {
         HID_XFER_PACKET *p = irp->UserBuffer;
         if (!dev->pad && p && p->reportBuffer && p->reportId == ID_MODE && p->reportBufferLen >= 2) g.input_mode = p->reportBuffer[1];
@@ -481,9 +544,13 @@ static NTSTATUS internal_ioctl(PDEVICE_OBJECT device, PIRP irp)
     }
     case IOCTL_HID_GET_STRING:
         return get_string(irp, st, dev->pad);
+    case IOCTL_HID_WRITE_REPORT: {
+        HID_XFER_PACKET *p = irp->UserBuffer;
+        if (dev->pad && p && p->reportBuffer) ds4_output(p->reportBuffer, p->reportBufferLen);
+        return complete(irp, STATUS_SUCCESS, 0);
+    }
     case IOCTL_HID_ACTIVATE_DEVICE:
     case IOCTL_HID_DEACTIVATE_DEVICE:
-    case IOCTL_HID_WRITE_REPORT:
         return complete(irp, STATUS_SUCCESS, 0);
     default:
         return complete(irp, STATUS_NOT_SUPPORTED, 0);
@@ -513,14 +580,14 @@ static NTSTATUS power(PDEVICE_OBJECT device, PIRP irp)
     return PoCallDriver(lower(device), irp);
 }
 
-/* Which device this is: the gamepad twin's hardware ID carries IG_. */
+/* Which device this is: the DualShock 4 twin's hardware ID names its product, 09CC. */
 static BOOLEAN is_pad(PDEVICE_OBJECT pdo)
 {
     WCHAR ids[256];
     ULONG len = 0, i;
     if (!NT_SUCCESS(IoGetDeviceProperty(pdo, DevicePropertyHardwareID, sizeof ids - sizeof(WCHAR), ids, &len))) return FALSE;
     for (i = 0; i + 3 <= len / sizeof(WCHAR); i++)
-        if (ids[i] == L'I' && ids[i + 1] == L'G' && ids[i + 2] == L'_') return TRUE;
+        if (ids[i] == L'9' && ids[i + 1] == L'C' && ids[i + 2] == L'C') return TRUE;
     return FALSE;
 }
 
@@ -558,6 +625,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     RtlInitUnicodeString(&name, L"\\Callback\\HyperWinPad");
     InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
     if (NT_SUCCESS(ExCreateCallback(&pads, &oa, TRUE, TRUE))) ExRegisterCallback(pads, pad_update, NULL);
+    KeInitializeSpinLock(&ds4.lock);
+    ds4.motion[4] = 8192;                                /* at rest, flat: 1 g up */
+    RtlInitUnicodeString(&name, L"\\Callback\\HyperWinPadOut");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
+    if (!NT_SUCCESS(ExCreateCallback(&ds4.out, &oa, TRUE, TRUE))) ds4.out = NULL;
     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = internal_ioctl;
     driver->MajorFunction[IRP_MJ_PNP] = pnp;
     driver->MajorFunction[IRP_MJ_POWER] = power;

@@ -41,7 +41,7 @@ object GuestAgent {
     const val ACTION_PUSH = "dev.hyperwin.app.PUSH"
     /** Debug builds: --ei dx, dy, buttons, wheel, n (repeats, 2 ms apart) as relative mouse input. */
     const val ACTION_MOUSE = "dev.hyperwin.app.MOUSE"
-    /** Debug builds: --ei slot, buttons, lx, --ez connected: a made-up controller. */
+    /** Debug builds: --ei slot, buttons, lx, --ez connected: a made-up controller; --es kind xbox|ds4: player 1's kind. */
     const val ACTION_PAD = "dev.hyperwin.app.PAD"
 
     private val writeLock = Any()
@@ -279,7 +279,11 @@ object GuestAgent {
                         ACTION_PUSH -> runCatching {
                             push(File(intent.getStringExtra("src")!!), intent.getStringExtra("dst")!!)
                         }.onFailure { Log.e(TAG, "push failed", it) }
-                        ACTION_PAD -> GamepadInput.fake(intent.getIntExtra("slot", 0), intent.getBooleanExtra("connected", true),
+                        ACTION_PAD -> if (intent.hasExtra("kind")) {
+                            c.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).edit()
+                                .putString(GamepadInput.PLAYER1, intent.getStringExtra("kind")).apply()
+                            GamepadInput.player1Changed()
+                        } else GamepadInput.fake(intent.getIntExtra("slot", 0), intent.getBooleanExtra("connected", true),
                             intent.getIntExtra("buttons", 0), intent.getIntExtra("lx", 0))
                         ACTION_MOUSE -> repeat(intent.getIntExtra("n", 1)) {
                             VsockInput.relative(intent.getIntExtra("dx", 0), intent.getIntExtra("dy", 0),

@@ -15,6 +15,7 @@ cat > "$OUT/ntoskrnl.def" <<'DEF'
 LIBRARY ntoskrnl.exe
 EXPORTS
 ExCreateCallback
+ExNotifyCallback
 ExRegisterCallback
 IoGetDeviceProperty
 IofCallDriver

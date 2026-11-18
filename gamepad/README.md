@@ -168,6 +168,48 @@ D-pad up.
 Not checked yet, needing real controllers: replugging keeps the slot, rumble
 on a controller's own motors, an SDL game, Steam and a DirectInput game.
 
+## Second round (2026-11-18): Windows' own Xbox driver, and a DualShock 4 with gyro
+
+Chrome and Edge did not see the pads. Both read controllers through
+Windows.Gaming.Input, and it ignored the XUSB interfaces `hwvsinput.sys`
+answered itself. So the design changed:
+
+- **Players are USB Xbox 360 controllers.** The pad device is now a small bus
+  (`guest/drivers/hwvsinput/usbpad.c`). Each connected player is a child
+  device with `USB\VID_045E&PID_028E`, and Windows' own `xusb22.sys` runs it.
+  The descriptors, start-up replies and control answers follow ViGEmBus's
+  `XusbPdo.cpp` (BSD-3). Input goes up as interrupt IN transfers. Rumble comes
+  back as interrupt OUT transfers, and a thread sends it on, since xusb22 can
+  send it at `DISPATCH_LEVEL`. The XUSB interfaces, `XUSB_*` answers and the
+  Xbox HID twin are gone. `install-driver.ps1` removes the old twin.
+- **Windows.Gaming.Input still ignores them.** Even run by xusb22, the pads
+  show up in XInput and `joy.cpl` but not in WGI's `Gamepad` list, and Edge
+  does not list them. The cause is not known yet. A pad that is a
+  `GUID_DEVINTERFACE_USB_DEVICE` did not change it.
+- **Player 1 can be a DualShock 4 instead.** A setting, "Player 1
+  controller: Xbox or DualShock 4", switches it live, with no restart. The bus
+  unplugs one child and plugs in the other. The DualShock 4 child,
+  `HWPAD\VID_054C&PID_09CC`, runs on `hwhid.sys`, which sends its 64-byte USB
+  report 0x01 and answers features 0x02 (calibration: no bias, 16 per °/s,
+  8192 per g), 0x12 and 0xA3. Output report 0x05 carries rumble back. Other
+  players are always Xbox.
+- **Gyro aiming.** In DualShock 4 mode the app streams the phone's gyroscope
+  and accelerometer at 250 Hz (message 8, needs `HIGH_SAMPLING_RATE_SENSORS`),
+  mapped for a phone held sideways like a controller. Steam Input and SDL's
+  HIDAPI driver read a DualShock 4's motion straight from its HID report, at
+  report bytes 13 to 24. Emulators get it through SDL. Browsers see the
+  DualShock 4 as a "standard" gamepad, so web games work in this mode.
+- **Researched, not built:** a DualSense (054C:0CE6, report 0x01 gyro at bytes
+  16 to 27) works the same way for SDL. The cemuhook/DSU UDP protocol would
+  serve Cemu and Yuzu directly, but Steam does not read it. A controller's own
+  sensors, such as a DualSense on the phone, could replace the phone's.
+
+Measured on the Pixel with the debug broadcast: XInput read the xusb22 pad,
+and rumble 200/100 came back. Switching to the DualShock 4 and back worked
+live. Raw reports carried the stick, B and the phone's gravity, about 8143 on Y
+flat. Edge showed "Wireless Controller (STANDARD GAMEPAD Vendor: 054c)", with B
+as button 1 and the stick at -0.62.
+
 ## Phases
 
 1. Four slots in the app and driver, with message 5. Test with

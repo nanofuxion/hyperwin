@@ -237,6 +237,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         GuestAudio.micChanged(this)   // so may the microphone
         GuestAudio.askMic = { runOnUiThread { askMic() } }
         if (GuestAudio.micWanted) askMic()
+        GamepadInput.resume()
         if (AvfLaunch.machine != null) guestDisplay.vmStarted(AvfLaunch.sharedWindow)
         if (screen == Screen.WINDOWS) immersive(true)
     }
@@ -244,7 +245,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     override fun onPause() {
         super.onPause()
         GuestAudio.askMic = null
-        GamepadInput.stopAllRumble()
+        GamepadInput.pause()
     }
 
     // ---- game mouse: pointer capture for mouse-look (mouse/README.md) ----

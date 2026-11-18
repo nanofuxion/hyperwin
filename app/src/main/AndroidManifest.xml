@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Rumble on controllers and on the phone (GamepadInput.kt). -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Phone motion at 250 Hz for player 1's DualShock 4 (GamepadInput.kt); above 200 Hz needs this. -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />

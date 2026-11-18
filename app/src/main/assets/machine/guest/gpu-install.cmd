@@ -35,7 +35,7 @@ rem Speakers and microphone over the shared window (audio/README.md), and the to
 rem touchpad (mouse/README.md), each installed again when its driver changes. The script makes and
 rem signs the package's catalog; for sound it also takes out the older Scream card.
 fc /b %G%\hwaudio\hwaudio.sys %SystemRoot%\System32\drivers\hwaudio.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwaudio Root\HwAudio
-fc /b %G%\hwhid\hwhid.sys %SystemRoot%\System32\drivers\hwhid.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwhid "Root\HwHid,Root\VID_045E&PID_028E&IG_00"
+fc /b %G%\hwhid\hwhid.sys %SystemRoot%\System32\drivers\hwhid.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwhid Root\HwHid
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
 rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).
