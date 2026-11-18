@@ -8,6 +8,8 @@
  * through the stock viosock driver; the Android app connects and sends framed messages:
  *   [len] [1] [make lo] [make hi] [flags: 1 break, 2 E0]          keyboard scan code (set 1)
  *   [len] [2] [x lo] [x hi] [y lo] [y hi] [buttons] [wheel]       absolute pointer, 0..65535
+ *       optionally then [wheel s16] [hwheel s16] in 1/120 steps, which replace [wheel]
+ *   [len] [4] [dx s16] [dy s16] [buttons] [wheel s16] [hwheel s16]  relative pointer, mouse counts
  *   [len] [3] [buttons u16] [lt] [rt] [lx ly rx ry s16] [connected]  gamepad, XInput layout */
 #include <ntddk.h>
 #include <kbdmou.h>
@@ -97,6 +99,36 @@ static void deliver(BOOLEAN mouse, PVOID data)
     KeReleaseSpinLock(&g.lock, irql);
 }
 
+/* One pointer report. Buttons: bit 0 left, 1 right, 2 middle, 3 back, 4 forward. Wheels in
+ * 1/120 steps. The vertical and horizontal wheel share ButtonData, so a report with both is two. */
+static void pointer(USHORT flags, LONG x, LONG y, UCHAR b, SHORT wheel, SHORT hwheel)
+{
+    static const USHORT down[5] = { MOUSE_LEFT_BUTTON_DOWN, MOUSE_RIGHT_BUTTON_DOWN, MOUSE_MIDDLE_BUTTON_DOWN,
+                                    MOUSE_BUTTON_4_DOWN, MOUSE_BUTTON_5_DOWN };
+    MOUSE_INPUT_DATA d;
+    UCHAR changed = (UCHAR)(b ^ g.buttons);
+    RtlZeroMemory(&d, sizeof d);
+    d.Flags = flags;
+    d.LastX = x;
+    d.LastY = y;
+    for (int i = 0; i < 5; i++)
+        if (changed & 1 << i) d.ButtonFlags |= b & 1 << i ? down[i] : (USHORT)(down[i] << 1);
+    if (wheel) {
+        d.ButtonFlags |= MOUSE_WHEEL;
+        d.ButtonData = (USHORT)wheel;
+    }
+    g.buttons = b;
+    deliver(TRUE, &d);
+    if (hwheel) {
+        RtlZeroMemory(&d, sizeof d);
+        d.Flags = flags;
+        if (flags == MOUSE_MOVE_ABSOLUTE) d.LastX = x, d.LastY = y;
+        d.ButtonFlags = MOUSE_HWHEEL;
+        d.ButtonData = (USHORT)hwheel;
+        deliver(TRUE, &d);
+    }
+}
+
 static void on_message(const UCHAR *m, ULONG len)
 {
     if (m[0] == 1 && len >= 4) {
@@ -106,21 +138,15 @@ static void on_message(const UCHAR *m, ULONG len)
         k.Flags = (m[3] & 1 ? KEY_BREAK : KEY_MAKE) | (m[3] & 2 ? KEY_E0 : 0);
         deliver(FALSE, &k);
     } else if (m[0] == 2 && len >= 7) {
-        MOUSE_INPUT_DATA d;
-        UCHAR b = m[5], changed = (UCHAR)(b ^ g.buttons);
-        RtlZeroMemory(&d, sizeof d);
-        d.Flags = MOUSE_MOVE_ABSOLUTE;
-        d.LastX = m[1] | m[2] << 8;
-        d.LastY = m[3] | m[4] << 8;
-        if (changed & 1) d.ButtonFlags |= b & 1 ? MOUSE_LEFT_BUTTON_DOWN : MOUSE_LEFT_BUTTON_UP;
-        if (changed & 2) d.ButtonFlags |= b & 2 ? MOUSE_RIGHT_BUTTON_DOWN : MOUSE_RIGHT_BUTTON_UP;
-        if (changed & 4) d.ButtonFlags |= b & 4 ? MOUSE_MIDDLE_BUTTON_DOWN : MOUSE_MIDDLE_BUTTON_UP;
-        if (len >= 7 && m[6]) {
-            d.ButtonFlags |= MOUSE_WHEEL;
-            d.ButtonData = (USHORT)(SHORT)((CHAR)m[6] * WHEEL_DELTA);
-        }
-        g.buttons = b;
-        deliver(TRUE, &d);
+        /* absolute; extended with a 1/120 wheel and a horizontal wheel, which replace m[6] */
+        BOOLEAN fine = len >= 11;
+        pointer(MOUSE_MOVE_ABSOLUTE, m[1] | m[2] << 8, m[3] | m[4] << 8, m[5],
+                fine ? (SHORT)(m[7] | m[8] << 8) : (SHORT)((CHAR)m[6] * WHEEL_DELTA),
+                fine ? (SHORT)(m[9] | m[10] << 8) : 0);
+    } else if (m[0] == 4 && len >= 10) {
+        /* relative: dx, dy in mouse counts */
+        pointer(MOUSE_MOVE_RELATIVE, (SHORT)(m[1] | m[2] << 8), (SHORT)(m[3] | m[4] << 8), m[5],
+                (SHORT)(m[6] | m[7] << 8), (SHORT)(m[8] | m[9] << 8));
     } else if (m[0] == 3 && len >= 14) {
         KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g.lock);
         g.pad.buttons = (USHORT)(m[1] | m[2] << 8);

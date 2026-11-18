@@ -86,6 +86,56 @@ alone by default. Add a "Mouse speed in games" slider (0.25× to 4×) for
 high-DPI mice. Touch trackpad mode can use message 4 too, which fixes
 trackpad-look in games for people without a mouse.
 
+## Touch screen and touchpad (added 2026-11-18)
+
+Asked for in the same phase: true multi-touch, and a touchpad with proper
+gestures. Both come from a new driver instead of the app imitating them.
+
+- **`hwhid.sys`**, a HID minidriver (`guest/drivers/hwhid/hwhid.c`) on a root
+  device `Root\HwHid`. Windows sees two inbox devices on it: a 10-finger
+  "HID-compliant touch screen" and a Windows Precision Touchpad (5 fingers,
+  click-pad), plus the configuration and mouse collections a touchpad must
+  have. The certification blob is Microsoft's sample, which Windows accepts
+  from a device without a signed one.
+- **Its own vsock port**, `HW_VSOCK_PORT_HID` (5652). `HidInput.kt` sends every
+  finger with its id and whether it still touches.
+- **Touch mode** sends the fingers to the touch screen. Windows then does press
+  and hold, edge swipes and pinch itself, and touch works on the sign-in and
+  UAC screens too. The agent's injected touch stays as the fallback until the
+  driver answers.
+- **Trackpad mode** makes the phone's screen the touchpad. Windows does tap to
+  click, tap and drag, two-finger scroll, pinch and the three and four finger
+  swipes, with its own touchpad settings. The app's hand-made trackpad stays
+  as the fallback.
+- **Install** goes the same way as sound: `install-driver.ps1 hwhid
+  Root\HwHid` from `gpu-install.cmd`, which now serves both drivers. The driver
+  keeps itself loaded, so an update to it takes effect at the next restart.
+
+## As built (2026-11-18)
+
+- Message 4 and the longer message 2 are as planned. Wheels are 1/120 steps
+  from `AXIS_VSCROLL` and `AXIS_HSCROLL`, history included, remainders carried.
+- Agent version 5: the touch helper checks the cursor every 100 ms and reports
+  `HW_AGENT_CURSOR` through a pipe back to the service. "Not showing" counts
+  both hidden and suppressed: after any touch input Windows reports the cursor
+  as suppressed, not hidden. A mouse that moves shows it again, and then the
+  app lets go.
+- The toolbar has a "Game mouse" button. Settings has Automatic, Always, Never
+  and the speed slider. Ctrl + Alt lets go, until Windows shows the cursor again.
+- Debug builds take `am broadcast -a dev.hyperwin.app.MOUSE --ei dx --ei dy
+  --ei buttons --ei wheel --ei hwheel --ei n`, and `guest/tools/inputtest.exe
+  [seconds] [look]` shows what Windows receives.
+
+Measured on the Pixel: 96 relative packets of (-5, 3) arrived as exactly
+-480, 288 in raw input. Wheel 4 x 60 gave 240, hwheel -120, back button seen.
+A touch swipe gave 41 touch updates. A touchpad drag moved the cursor, and a
+90 ms tap clicked. Auto capture took the mouse 1 s after a hidden, clipped,
+full-screen window opened, and let go when it closed.
+
+Not checked yet, needing a physical mouse or two hands: captured movement from
+a real mouse, a shooter turning 360°, two-finger gestures, capture in split
+screen, and how fast a high-rate mouse goes.
+
 ## Phases
 
 1. Message 4 in the app and driver, with a manual toggle. Test: a raw-input

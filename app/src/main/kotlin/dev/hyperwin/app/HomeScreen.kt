@@ -260,12 +260,23 @@ class HomeScreen(
         }
     }
 
-    private fun input() = Ui.section(ctx, "Touch",
+    private fun input() = Ui.section(ctx, "Touch and mouse",
         Ui.switchRow(ctx, "Trackpad mode",
-            "Your finger moves the pointer. Tap to click, two fingers to scroll or right-click. Off: the screen is a touch screen.",
+            "The screen works as a laptop touchpad: tap to click, tap and drag, two fingers to scroll, pinch to zoom. " +
+                "Off: it is a touch screen.",
             prefs.getBoolean(MainActivity.TRACKPAD, false)) { on ->
             prefs.edit().putBoolean(MainActivity.TRACKPAD, on).apply()
             VsockInput.touchMode = if (on) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
+        },
+        Ui.row(ctx, "Game mouse", "Games that hide the pointer get raw mouse movement. Ctrl + Alt lets the mouse go."),
+        Ui.segmented(ctx, listOf("Automatic", "Always", "Never"),
+            MainActivity.GAME_MOUSE_MODES.indexOf(prefs.getString(MainActivity.GAME_MOUSE, "auto")).coerceAtLeast(0)) { i ->
+            prefs.edit().putString(MainActivity.GAME_MOUSE, MainActivity.GAME_MOUSE_MODES[i]).apply()
+        },
+        Ui.row(ctx, "Mouse speed in games", "For high-resolution mice. 1x is the mouse's own counts."),
+        Ui.slider(ctx, 0.25f, 4f, 0.25f, prefs.getFloat(MainActivity.GAME_SPEED, 1f), { "%.2fx".format(it) }) { v ->
+            prefs.edit().putFloat(MainActivity.GAME_SPEED, v).apply()
+            VsockInput.gameSpeed = v
         })
 
     private fun network(machine: Machine) = Ui.section(ctx, "Network",

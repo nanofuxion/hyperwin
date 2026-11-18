@@ -11,14 +11,18 @@ import java.io.IOException
  * Keyboard and absolute pointer for the guest over virtio-vsock. The guest's hwvsinput.sys listens
  * on HW_VSOCK_PORT_INPUT. Each message is one length byte, then:
  *   1, make code (u16), flags (1 break, 2 E0)           a set 1 scan code
- *   2, x (u16), y (u16), buttons, wheel                  absolute pointer, 0..65535
+ *   2, x (u16), y (u16), buttons, wheel, wheel (s16), hwheel (s16)   absolute pointer, 0..65535
  *   3, buttons (u16), lt, rt, lx ly rx ry (s16), connected   gamepad, XInput layout
+ *   4, dx (s16), dy (s16), buttons, wheel (s16), hwheel (s16)       relative pointer, mouse counts
+ * Buttons: 1 left, 2 right, 4 middle, 8 back, 16 forward. Wheels in 1/120 steps; the u8 wheel in
+ * message 2 is whole steps, for drivers from before the s16 ones.
  */
 object VsockInput {
     private const val TAG = "HyperWin"
     private const val PORT = 5650L
     private const val KEYBOARD = 1
     private const val POINTER = 2
+    private const val RELATIVE = 4
     private const val AXIS_MAX = 65535
 
     private val lock = Any()
@@ -147,12 +151,17 @@ object VsockInput {
     fun touch(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) gesture = when {
             touchMode == TouchMode.TRACKPAD -> 2
-            GuestAgent.touchReady -> 1
+            HidInput.connected || GuestAgent.touchReady -> 1
             else -> 0
         }
         return when (gesture) {
-            1 -> contacts(event, viewWidth, viewHeight)
-            2 -> trackpad(event, viewWidth, viewHeight)
+            // Windows' own touch screen and Precision Touchpad when hwhid.sys is there (HidInput).
+            1 -> {
+                guestPosition(event.getX(0), event.getY(0), viewWidth, viewHeight, clamp = true)?.let { focusY = it.second / AXIS_MAX.toFloat() }
+                HidInput.screen(event) { x, y -> guestPosition(x, y, viewWidth, viewHeight, clamp = true) } ||
+                    contacts(event, viewWidth, viewHeight)
+            }
+            2 -> HidInput.pad(event, viewWidth, viewHeight) || trackpad(event, viewWidth, viewHeight)
             else -> finger(event, viewWidth, viewHeight)
         }
     }
@@ -198,7 +207,7 @@ object VsockInput {
                 if (event.pointerCount >= 2) {
                     padScroll += dy
                     val steps = (padScroll / SCROLL_STEP_PX).toInt()
-                    if (steps != 0) { padScroll -= steps * SCROLL_STEP_PX; pointer(here, buttons, steps) }
+                    if (steps != 0) { padScroll -= steps * SCROLL_STEP_PX; pointer(here, buttons, steps * 120) }
                 } else if (padTravel > TAP_SLOP_PX) {
                     val scale = minOf(viewWidth.toFloat() / AvfPlan.frameWidth, viewHeight.toFloat() / AvfPlan.frameHeight)
                     val nx = lastX + dx * PAD_SPEED * AXIS_MAX / (AvfPlan.frameWidth * scale)
@@ -240,22 +249,99 @@ object VsockInput {
         }
     }
 
-    /** Hardware mouse: hover moves, buttons follow the Android button state, wheel scrolls. */
+    /** Hardware mouse: hover moves, buttons follow the Android button state, wheels scroll. */
     fun mouse(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
         val pos = guestPosition(event.x, event.y, viewWidth, viewHeight)
         if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
-            val wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL).toInt().coerceIn(-127, 127)
-            return wheel == 0 || pointer(pos ?: (lastX to lastY), buttons, wheel)
+            val (v, h) = wheels(event)
+            return (v == 0 && h == 0) || pointer(pos ?: (lastX to lastY), buttons, v, h)
         }
         pos ?: return true
+        return pointer(pos, mouseButtons(event))
+    }
+
+    private fun mouseButtons(event: MotionEvent): Int {
         var state = 0
         if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0) state = state or 1
         if (event.buttonState and MotionEvent.BUTTON_SECONDARY != 0) state = state or 2
         if (event.buttonState and MotionEvent.BUTTON_TERTIARY != 0) state = state or 4
-        return pointer(pos, state)
+        if (event.buttonState and MotionEvent.BUTTON_BACK != 0) state = state or 8
+        if (event.buttonState and MotionEvent.BUTTON_FORWARD != 0) state = state or 16
+        return state
     }
 
-    private fun pointer(pos: Pair<Int, Int>, state: Int, wheel: Int = 0): Boolean = synchronized(lock) {
+    // Wheel fractions left over from rounding to 1/120 steps, carried into the next event.
+    private var wheelRest = 0f
+    private var hwheelRest = 0f
+
+    /** The event's wheels in 1/120 steps, history included: a smooth wheel or touchpad keeps its fractions. */
+    private fun wheels(event: MotionEvent): Pair<Int, Int> {
+        var v = wheelRest
+        var h = hwheelRest
+        for (i in 0 until event.historySize) {
+            v += event.getHistoricalAxisValue(MotionEvent.AXIS_VSCROLL, i) * 120
+            h += event.getHistoricalAxisValue(MotionEvent.AXIS_HSCROLL, i) * 120
+        }
+        v += event.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120
+        h += event.getAxisValue(MotionEvent.AXIS_HSCROLL) * 120
+        val vi = v.toInt().coerceIn(-32767, 32767)
+        val hi = h.toInt().coerceIn(-32767, 32767)
+        wheelRest = v - vi
+        hwheelRest = h - hi
+        return vi to hi
+    }
+
+    /** "Mouse speed in games", 0.25 to 4. */
+    @Volatile var gameSpeed = 1f
+    private var restX = 0f
+    private var restY = 0f
+
+    /**
+     * A captured mouse (View.requestPointerCapture): movement since the last event, every sample in
+     * the event's history added up, fractions carried over, and sent as relative mouse counts.
+     */
+    fun captured(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            val (v, h) = wheels(event)
+            return relative(0, 0, buttons, v, h)
+        }
+        var dx = restX
+        var dy = restY
+        for (i in 0 until event.historySize) {
+            dx += event.getHistoricalAxisValue(MotionEvent.AXIS_X, i) * gameSpeed
+            dy += event.getHistoricalAxisValue(MotionEvent.AXIS_Y, i) * gameSpeed
+        }
+        dx += event.getAxisValue(MotionEvent.AXIS_X) * gameSpeed
+        dy += event.getAxisValue(MotionEvent.AXIS_Y) * gameSpeed
+        val ix = dx.toInt()
+        val iy = dy.toInt()
+        restX = dx - ix
+        restY = dy - iy
+        return relative(ix, iy, mouseButtons(event))
+    }
+
+    /** Relative movement in mouse counts, split into messages that fit 16 bits. */
+    fun relative(dx: Int, dy: Int, state: Int, wheel: Int = 0, hwheel: Int = 0): Boolean = synchronized(lock) {
+        if (!connected) return false
+        if (dx == 0 && dy == 0 && wheel == 0 && hwheel == 0 && state == buttons) return true
+        buttons = state
+        var x = dx
+        var y = dy
+        do {
+            val sx = x.coerceIn(-32767, 32767)
+            val sy = y.coerceIn(-32767, 32767)
+            x -= sx
+            y -= sy
+            val last = x == 0 && y == 0
+            val w = if (last) wheel else 0
+            val h = if (last) hwheel else 0
+            if (!send(byteArrayOf(RELATIVE.toByte(), sx.toByte(), (sx shr 8).toByte(), sy.toByte(), (sy shr 8).toByte(),
+                    state.toByte(), w.toByte(), (w shr 8).toByte(), h.toByte(), (h shr 8).toByte()))) return false
+        } while (!last)
+        true
+    }
+
+    private fun pointer(pos: Pair<Int, Int>, state: Int, wheel: Int = 0, hwheel: Int = 0): Boolean = synchronized(lock) {
         if (!connected) return false
         buttons = state
         lastX = pos.first
@@ -265,7 +351,8 @@ object VsockInput {
             POINTER.toByte(),
             (lastX and 0xff).toByte(), (lastX shr 8).toByte(),
             (lastY and 0xff).toByte(), (lastY shr 8).toByte(),
-            state.toByte(), wheel.toByte(),
+            state.toByte(), (wheel / 120).coerceIn(-127, 127).toByte(),
+            wheel.toByte(), (wheel shr 8).toByte(), hwheel.toByte(), (hwheel shr 8).toByte(),
         ))
     }
 

@@ -46,7 +46,9 @@
 /* Guest agent (guest/agent/hwagent.c): the app connects to this port. Frames are
  * u32 payload length, u8 type, payload. */
 #define HW_VSOCK_PORT_AGENT 5651
-#define HW_AGENT_VERSION 4
+/* Touch screen and Precision Touchpad contacts for hwhid.sys (guest/drivers/hwhid/hwhid.c). */
+#define HW_VSOCK_PORT_HID 5652
+#define HW_AGENT_VERSION 5
 #define HW_AGENT_PACKET 1       /* both ways: one IPv4 packet */
 #define HW_AGENT_EXEC 2         /* app -> guest: u32 id, u8 mode, UTF-8 command line */
 #define HW_AGENT_EXEC_OUT 3     /* guest -> app: u32 id, output bytes */
@@ -65,6 +67,9 @@
 /* app -> guest: u32 clock of the phone's processor in MHz, for Windows to show. Windows measures
  * the clock with the cycle counter, which this VM lacks, and would report the timer's 25 MHz. */
 #define HW_AGENT_CPU_MHZ 13
+/* guest -> app: u8 1 when the foreground program hides the cursor and holds it in (clipped, or a
+ * fullscreen window): a game wants mouse-look, and the app captures the phone's mouse. */
+#define HW_AGENT_CURSOR 14
 #define HW_AGENT_EXEC_SYSTEM 0  /* run as SYSTEM, output captured */
 #define HW_AGENT_EXEC_DESKTOP 1 /* start on the signed-in user's desktop */
 #define HW_AGENT_EXEC_HIDDEN 2  /* the same, with no console window (helpers such as "hwagent.exe keyboard") */

@@ -1,0 +1,48 @@
+; HyperWin touch screen and Precision Touchpad (guest/drivers/hwhid/hwhid.c).
+; Installed as a root device: devcon install hwhid.inf Root\HwHid
+; The catalog is made and signed inside Windows at install time (install-driver.ps1).
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGUID={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%HyperWin%
+; build.sh sets the version from the driver's hash
+DriverVer=11/18/2026,1.0.2666.2091
+CatalogFile=hwhid.cat
+PnpLockdown=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[SourceDisksFiles]
+hwhid.sys=1
+
+[DestinationDirs]
+HwHid.CopyList=12
+
+[Manufacturer]
+%HyperWin%=HyperWin,NTARM64
+
+[HyperWin.NTARM64]
+%HwHid.DeviceDesc%=HwHid,Root\HwHid
+
+[HwHid.CopyList]
+hwhid.sys
+
+[HwHid.NT]
+CopyFiles=HwHid.CopyList
+
+[HwHid.NT.Services]
+AddService=hwhid,0x00000002,HwHid.Service
+
+[HwHid.Service]
+DisplayName=%HwHid.DeviceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\hwhid.sys
+
+[Strings]
+HyperWin="HyperWin"
+DiskName="HyperWin touch"
+HwHid.DeviceDesc="HyperWin Touch"

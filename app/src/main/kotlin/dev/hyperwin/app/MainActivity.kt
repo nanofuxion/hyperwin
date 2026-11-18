@@ -95,6 +95,14 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (screen == Screen.WINDOWS && GamepadInput.onKey(event)) return true
+        // Ctrl + Alt always lets a captured mouse go, so a game can never trap it. Windows gets the keys too.
+        if (guest.hasPointerCapture() && event.action == KeyEvent.ACTION_DOWN &&
+            ((KeyEvent.isModifierKey(event.keyCode) && event.isCtrlPressed && event.isAltPressed))
+        ) {
+            manualLook = false
+            lookHeldOff = true
+            updateCapture()
+        }
         if (screen == Screen.WINDOWS && event.keyCode !in HOST_KEYS &&
             (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) && AvfLaunch.key(event)
         ) return true
@@ -106,6 +114,14 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         VsockInput.touchMode = if (prefs.getBoolean(TRACKPAD, false)) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
+        VsockInput.gameSpeed = prefs.getFloat(GAME_SPEED, 1f)
+        GuestAgent.onCursor = { look ->
+            runOnUiThread {
+                guestLook = look
+                if (!look) lookHeldOff = false
+                updateCapture()
+            }
+        }
         GamepadInput.register(this)
 
         guest = GuestView(this).apply {
@@ -124,6 +140,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                 }
                 true
             }
+            setOnCapturedPointerListener { _, event -> VsockInput.captured(event) }
             setOnGenericMotionListener { view, event ->
                 if (GamepadInput.isGamepad(event.source)) GamepadInput.onMotion(event)
                 else if ((event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) VsockInput.mouse(event, view.width, view.height)
@@ -229,6 +246,44 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         GuestAudio.askMic = null
     }
 
+    // ---- game mouse: pointer capture for mouse-look (mouse/README.md) ----
+
+    private var guestLook = false     // the program in front in Windows hides the cursor and holds it in
+    private var lookHeldOff = false   // let go by Ctrl + Alt or the toolbar, until Windows shows the cursor again
+    private var manualLook = false    // turned on from the toolbar
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        updateCapture()
+    }
+
+    private fun updateCapture() {
+        val want = screen == Screen.WINDOWS && hasWindowFocus() && (manualLook || when (prefs.getString(GAME_MOUSE, "auto")) {
+            "always" -> !lookHeldOff
+            "never" -> false
+            else -> guestLook && !lookHeldOff
+        })
+        if (want && !guest.hasPointerCapture()) {
+            guest.requestFocus()
+            guest.requestPointerCapture()
+            Log.i("HyperWin", "game mouse captured")
+        } else if (!want && guest.hasPointerCapture()) {
+            guest.releasePointerCapture()
+            Log.i("HyperWin", "game mouse released")
+        }
+    }
+
+    private fun toggleGameMouse() {
+        if (guest.hasPointerCapture()) {
+            manualLook = false
+            lookHeldOff = true
+        } else {
+            manualLook = true
+            lookHeldOff = false
+        }
+        updateCapture()
+    }
+
     /** Once per launch, when Windows has opened the microphone. */
     private fun askMic() {
         if (micAsked || GuestAudio.micPermitted(this)) return
@@ -255,6 +310,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         immersive(next == Screen.WINDOWS)
+        updateCapture()
     }
 
     private fun immersive(on: Boolean) {
@@ -295,6 +351,9 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                 })
                 addView(action("Windows keyboard", R.drawable.ic_keyboard) { showWindowsKeyboard() }.apply {
                     contentDescription = "Open the on-screen keyboard inside Windows"
+                })
+                addView(action("Game mouse", R.drawable.ic_drag) { toggleGameMouse() }.apply {
+                    contentDescription = "Capture the mouse for games that turn the view with it, or let it go"
                 })
                 addView(action("Settings", R.drawable.ic_settings) { show(Screen.HOME) })
                 addView(Ui.iconButton(this@MainActivity, R.drawable.ic_close, "Hide controls") { showBar(false) })
@@ -508,6 +567,9 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     companion object {
         const val BOOT_ON_LAUNCH = "bootOnLaunch"
         const val TRACKPAD = "trackpadMode"
+        const val GAME_MOUSE = "gameMouse"
+        val GAME_MOUSE_MODES = listOf("auto", "always", "never")
+        const val GAME_SPEED = "gameMouseSpeed"
         private const val EXTRA_PREPARE_ISO = "prepareIso"
         private val HOST_KEYS = setOf(
             KeyEvent.KEYCODE_BACK,

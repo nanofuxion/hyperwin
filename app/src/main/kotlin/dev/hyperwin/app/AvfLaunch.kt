@@ -287,6 +287,7 @@ object AvfLaunch {
             vm.javaClass.getMethod("stop").invoke(vm)
             machine = null
             VsockInput.stop()
+            HidInput.stop()
             GuestAgent.stop()
             HwGpu.stop()
             WindowsService.stop()
@@ -496,6 +497,7 @@ object AvfLaunch {
             } else {
                 machine = vm
                 VsockInput.start(vm)
+                HidInput.start(vm)
                 GuestAgent.start(ctx, vm, Machine.active(ctx)?.lanMode == true)
             }
             val result = done.get()?.let { "$it\n$tail" }
@@ -519,6 +521,7 @@ object AvfLaunch {
     private fun handleVmStopped(window: AvfPlan.SharedWindow?, onVmStopped: () -> Unit) {
         machine = null
         VsockInput.stop()
+        HidInput.stop()
         GuestAgent.stop()
         HwGpu.stop()
         WindowsService.stop()

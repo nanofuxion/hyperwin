@@ -35,9 +35,12 @@ object GuestAgent {
     private const val PORTS = 11
     private const val TOUCH = 12
     private const val CPU_MHZ = 13
-    private const val VERSION = 4
+    private const val CURSOR = 14
+    private const val VERSION = 5
     const val ACTION_EXEC = "dev.hyperwin.app.EXEC"
     const val ACTION_PUSH = "dev.hyperwin.app.PUSH"
+    /** Debug builds: --ei dx, dy, buttons, wheel, n (repeats, 2 ms apart) as relative mouse input. */
+    const val ACTION_MOUSE = "dev.hyperwin.app.MOUSE"
 
     private val writeLock = Any()
     @Volatile private var vm: Any? = null
@@ -50,6 +53,8 @@ object GuestAgent {
 
     @Volatile var connected = false
         private set
+    /** Told when a game in Windows starts or stops wanting mouse-look (HW_AGENT_CURSOR). */
+    @Volatile var onCursor: ((Boolean) -> Unit)? = null
     @Volatile var agentVersion = 0
         private set
     private var updateSent = false
@@ -171,6 +176,7 @@ object GuestAgent {
                 if (agentVersion >= VERSION) gpuCheck = exec("cmd /c (for %d in (. $dirs) do @mkdir C:\\HyperWin\\gpu\\%d 2>nul) & " +
                     "findstr /x /c:${MachinePrep.gpuStamp(c)} C:\\HyperWin\\gpu\\stamp.txt")
             }
+            CURSOR -> if (len >= 1) onCursor?.invoke(buf[0].toInt() != 0)
             PORTS -> {
                 val b = ByteBuffer.wrap(buf, 0, len).order(ByteOrder.LITTLE_ENDIAN)
                 val tcp = (0 until (b.short.toInt() and 0xffff)).map { b.short.toInt() and 0xffff }.toSet()
@@ -271,10 +277,15 @@ object GuestAgent {
                         ACTION_PUSH -> runCatching {
                             push(File(intent.getStringExtra("src")!!), intent.getStringExtra("dst")!!)
                         }.onFailure { Log.e(TAG, "push failed", it) }
+                        ACTION_MOUSE -> repeat(intent.getIntExtra("n", 1)) {
+                            VsockInput.relative(intent.getIntExtra("dx", 0), intent.getIntExtra("dy", 0),
+                                intent.getIntExtra("buttons", 0), intent.getIntExtra("wheel", 0), intent.getIntExtra("hwheel", 0))
+                            Thread.sleep(2)
+                        }
                     }
                 }.start()
             }
         }
-        ctx.registerReceiver(receiver, IntentFilter().apply { addAction(ACTION_EXEC); addAction(ACTION_PUSH) }, Context.RECEIVER_EXPORTED)
+        ctx.registerReceiver(receiver, IntentFilter().apply { addAction(ACTION_EXEC); addAction(ACTION_PUSH); addAction(ACTION_MOUSE) }, Context.RECEIVER_EXPORTED)
     }
 }

@@ -307,6 +307,17 @@ static DWORD WINAPI port_watcher(void *arg)
 
 static CRITICAL_SECTION touch_lock;
 static HANDLE touch_pipe, touch_proc;
+
+/* The helper's reports back: one byte each, HW_AGENT_CURSOR's payload. */
+static DWORD WINAPI helper_reports(void *arg)
+{
+    HANDLE rd = arg;
+    BYTE b;
+    DWORD got;
+    while (ReadFile(rd, &b, 1, &got, NULL) && got) send_frame(HW_AGENT_CURSOR, &b, 1, NULL, 0);
+    CloseHandle(rd);
+    return 0;
+}
 static DWORD touch_session = 0xffffffff;
 
 static void start_touch_helper(void)
@@ -315,7 +326,7 @@ static void start_touch_helper(void)
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    HANDLE self = NULL, token = NULL, rd = NULL, wr = NULL;
+    HANDLE self = NULL, token = NULL, rd = NULL, wr = NULL, back_rd = NULL, back_wr = NULL;
     WCHAR cmd[MAX_PATH + 32];
     DWORD session = WTSGetActiveConsoleSessionId();
     if (session == 0xffffffff) return;
@@ -330,10 +341,12 @@ static void start_touch_helper(void)
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &self) &&
         DuplicateTokenEx(self, MAXIMUM_ALLOWED, NULL, SecurityIdentification, TokenPrimary, &token) &&
         SetTokenInformation(token, TokenSessionId, &session, sizeof session) &&
-        CreatePipe(&rd, &wr, &sa, 0)) {
+        CreatePipe(&rd, &wr, &sa, 0) && CreatePipe(&back_rd, &back_wr, &sa, 0)) {
         SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(back_rd, HANDLE_FLAG_INHERIT, 0);
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = rd;
+        si.hStdOutput = back_wr;
         si.lpDesktop = desktop;
         if (CreateProcessAsUserW(token, NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
             CloseHandle(pi.hThread);
@@ -343,6 +356,8 @@ static void start_touch_helper(void)
             touch_pipe = wr;
             LeaveCriticalSection(&touch_lock);
             wr = NULL;
+            CloseHandle(CreateThread(NULL, 0, helper_reports, back_rd, 0, NULL));
+            back_rd = NULL;
             logf("touch helper started in session %lu", session);
         } else {
             logf("touch helper failed %lu", GetLastError());
@@ -352,6 +367,8 @@ static void start_touch_helper(void)
     }
     if (rd) CloseHandle(rd);
     if (wr) CloseHandle(wr);
+    if (back_rd) CloseHandle(back_rd);
+    if (back_wr) CloseHandle(back_wr);
     if (token) CloseHandle(token);
     if (self) CloseHandle(self);
 }
@@ -469,11 +486,48 @@ static void inject(const Contacts *was, const Contacts *now, BOOL touch)
     }
 }
 
+/* Mouse-look: the foreground program hides the cursor and holds it in, by clipping it or by filling
+ * the screen. Checked ten times a second; a change goes to the service on standard output. */
+static DWORD WINAPI cursor_watch(void *arg)
+{
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    HDESK current = NULL;
+    BYTE was = 0xff;
+    (void)arg;
+    for (;; Sleep(100)) {
+        CURSORINFO ci = {sizeof ci};
+        RECT clip, win;
+        HWND fg;
+        int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+        BYTE look;
+        DWORD wrote;
+        HDESK d = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+        if (d && SetThreadDesktop(d)) {
+            if (current) CloseDesktop(current);
+            current = d;
+        } else if (d) {
+            CloseDesktop(d);
+        }
+        if (!GetCursorInfo(&ci)) continue;
+        fg = GetForegroundWindow();
+        /* Not showing: hidden by the program, or suppressed after touch input (then a mouse moving
+         * shows it again if the program does, and the app lets go). */
+        look = !(ci.flags & CURSOR_SHOWING) && fg &&
+               ((GetClipCursor(&clip) && (clip.left > 0 || clip.top > 0 || clip.right < w || clip.bottom < h)) ||
+                (GetWindowRect(fg, &win) && win.left <= 0 && win.top <= 0 && win.right >= w && win.bottom >= h &&
+                 fg != GetShellWindow() && fg != GetDesktopWindow()));
+        if (look == was) continue;
+        was = look;
+        if (!WriteFile(out, &look, 1, &wrote, NULL)) return 0;
+    }
+}
+
 static int touch_helper(void)
 {
     Contacts was = {0};
     BOOL touch = TRUE;
     SetProcessDPIAware();
+    CloseHandle(CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL));
     if (!InitializeTouchInjection(HW_AGENT_TOUCH_MAX, TOUCH_FEEDBACK_DEFAULT)) logf("touch init failed %lu", GetLastError());
     touch_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 0, touch_reader, NULL, 0, NULL));
