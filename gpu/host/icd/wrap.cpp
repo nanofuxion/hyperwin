@@ -4,12 +4,19 @@
 #include <vulkan/vk_layer.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -49,6 +56,7 @@ namespace {
 
 PFN_vkGetInstanceProcAddr g_gipa;  // the driver
 std::mutex g_lock;
+bool g_bottom;                     // this wrapper opens the real driver (the last of a stack)
 
 // Layers between the wrapper and the driver, top first (HWGPU_VK_LAYERS). The core links them the
 // way a loader does, so stock layers such as bcn_layer run unchanged.
@@ -113,6 +121,7 @@ bool load() {
             for (size_t i = 0; i + 1 < links.size(); i++)
                 if (links[i] == me) next = links[i + 1];
         }
+        g_bottom = next.empty();
         const char* path = !next.empty() ? next.c_str() : getenv("HWGPU_VK_DRIVER");
         void* lib = dlopen(path && *path ? path : "libvulkan.so", RTLD_NOW | RTLD_LOCAL);
         if (!lib) {
@@ -267,11 +276,242 @@ VKAPI_ATTR VkResult VKAPI_CALL enumerate_physical_device_groups(VkInstance inst,
     return r;
 }
 
+// ---- The shader cache (shader-cache/README.md) ----
+// Every pipeline the program creates goes through one VkPipelineCache per device, which starts from
+// a file and is saved back: then a shader compiled once loads from disk the next time the renderer
+// runs. Only in the bottom wrapper, the one that opens the real driver, so a stack caches once. The
+// file is $HWGPU_VK_CACHE_DIR/<pipelineCacheUUID>-<driverVersion>.bin, one a driver.
+
+constexpr size_t kCacheCap = 256u << 20;   // past this the file starts over
+constexpr auto kSaveEvery = std::chrono::seconds(30);
+
+struct PipeCache {
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    std::string path;
+    bool feedback = false;                 // VK_EXT_pipeline_creation_feedback is on
+    std::atomic<bool> dirty{false};
+    std::atomic<uint64_t> made{0}, hits{0}, ns{0};
+};
+std::unordered_map<VkDevice, PipeCache*> g_caches;   // under g_lock
+std::atomic<uint64_t> g_made{0}, g_hits{0}, g_ns{0};  // this renderer run, every device
+std::mutex g_save_lock;                    // one save at a time in the process, and none during a destroy
+std::once_flag g_saver_once;
+
+const char* cache_dir() {
+    const char* d = getenv("HWGPU_VK_CACHE_DIR");
+    return d && *d ? d : nullptr;
+}
+
+std::vector<char> read_file(const std::string& path) {
+    std::vector<char> data;
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        char buf[1 << 16];
+        for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
+        fclose(f);
+    }
+    return data;
+}
+
+// Writes the file whole or not at all: a temp file, fsync, rename.
+bool write_file(const std::string& path, const void* data, size_t size) {
+    std::string tmp = path + ".tmp";
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    const char* p = static_cast<const char*>(data);
+    for (size_t left = size; left;) {
+        ssize_t n = write(fd, p, left);
+        if (n <= 0) { close(fd); unlink(tmp.c_str()); return false; }
+        p += n;
+        left -= n;
+    }
+    fsync(fd);
+    close(fd);
+    return rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+VkPipelineCache make_cache(VkDevice dev, const std::vector<char>& data) {
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, data.size(), data.data()};
+    VkPipelineCache c = VK_NULL_HANDLE;
+    if (NEXT_D(dev, vkCreatePipelineCache)(dev, &ci, nullptr, &c) == VK_SUCCESS) return c;
+    return VK_NULL_HANDLE;
+}
+
+// Saves a device's cache: merged into what the file has now (other devices, other programs), so one
+// program's save never drops another's pipelines. Called with g_save_lock held.
+void save_cache(VkDevice dev, PipeCache* c) {
+    if (!c->dirty.exchange(false)) return;
+    VkPipelineCache merged = make_cache(dev, read_file(c->path));
+    if (!merged) merged = make_cache(dev, {});
+    if (!merged) return;
+    NEXT_D(dev, vkMergePipelineCaches)(dev, merged, 1, &c->cache);
+    size_t size = 0;
+    auto get = NEXT_D(dev, vkGetPipelineCacheData);
+    VkPipelineCache from = merged;
+    if (get(dev, merged, &size, nullptr) == VK_SUCCESS && size > kCacheCap) {
+        from = c->cache;                    // too big: start over with this device's own pipelines
+        get(dev, from, &size, nullptr);
+    }
+    std::vector<char> data(size);
+    if (size && get(dev, from, &size, data.data()) == VK_SUCCESS && write_file(c->path, data.data(), size)) {
+        // For the app's settings: pipelines this renderer run made, and how many came from the cache.
+        std::string stats = c->path.substr(0, c->path.rfind('/') + 1) + "stats.txt";
+        char line[96];
+        int n = snprintf(line, sizeof line, "%llu %llu\n", (unsigned long long)g_made.load(), (unsigned long long)g_hits.load());
+        write_file(stats, line, n);
+        LOG("shader cache saved: %zu KiB, %s", size >> 10, c->path.c_str());
+    }
+    NEXT_D(dev, vkDestroyPipelineCache)(dev, merged, nullptr);
+}
+
+// Every 30 s: save what changed; and a line a minute while pipelines are being made.
+void saver() {
+    uint64_t logged = 0;
+    for (int tick = 0;; tick++) {
+        std::this_thread::sleep_for(kSaveEvery);
+        std::lock_guard<std::mutex> s(g_save_lock);
+        std::vector<std::pair<VkDevice, PipeCache*>> all;
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            all.assign(g_caches.begin(), g_caches.end());
+        }
+        for (auto& [dev, c] : all) save_cache(dev, c);
+        uint64_t made = g_made, hits = g_hits, ns = g_ns;
+        if (tick % 2 && made != logged) {
+            logged = made;
+            LOG("shader cache: %llu pipelines, %llu from the cache, %llu ms compiling", (unsigned long long)made,
+                (unsigned long long)hits, (unsigned long long)(ns / 1000000));
+        }
+    }
+}
+
+bool has_extension(VkPhysicalDevice pd, const char* name) {
+    VkInstance inst = instance_of(pd);
+    uint32_t n = 0;
+    auto enumerate = NEXT_I(inst, vkEnumerateDeviceExtensionProperties);
+    if (enumerate(pd, nullptr, &n, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> ext(n);
+    if (enumerate(pd, nullptr, &n, ext.data()) != VK_SUCCESS) return false;
+    for (auto& e : ext)
+        if (!strcmp(e.extensionName, name)) return true;
+    return false;
+}
+
+void open_cache(VkPhysicalDevice pd, VkDevice dev, bool feedback) {
+    const char* dir = cache_dir();
+    if (!g_bottom || !dir) return;
+    VkPhysicalDeviceProperties props{};
+    NEXT_I(instance_of(pd), vkGetPhysicalDeviceProperties)(pd, &props);
+    char name[96];
+    char* o = name;
+    for (uint32_t i = 0; i < VK_UUID_SIZE; i++) o += snprintf(o, 3, "%02x", props.pipelineCacheUUID[i]);
+    snprintf(o, name + sizeof name - o, "-%08x.bin", props.driverVersion);
+    mkdir(dir, 0700);
+    auto* c = new PipeCache;
+    c->path = std::string(dir) + "/" + name;
+    c->feedback = feedback;
+    std::vector<char> data = read_file(c->path);
+    c->cache = make_cache(dev, data);
+    if (!c->cache && !data.empty()) {       // the driver refused the file: start over
+        unlink(c->path.c_str());
+        c->cache = make_cache(dev, {});
+    }
+    if (!c->cache) { delete c; return; }
+    LOG("shader cache: %zu KiB from %s", data.size() >> 10, c->path.c_str());
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        g_caches[dev] = c;
+    }
+    std::call_once(g_saver_once, [] { std::thread(saver).detach(); });
+}
+
+void close_cache(VkDevice dev) {
+    PipeCache* c = nullptr;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        auto it = g_caches.find(dev);
+        if (it == g_caches.end()) return;
+        c = it->second;
+        g_caches.erase(it);
+    }
+    std::lock_guard<std::mutex> s(g_save_lock);
+    save_cache(dev, c);
+    NEXT_D(dev, vkDestroyPipelineCache)(dev, c->cache, nullptr);
+    delete c;
+}
+
+PipeCache* cache_of(VkDevice dev) {
+    std::lock_guard<std::mutex> l(g_lock);
+    auto it = g_caches.find(dev);
+    return it == g_caches.end() ? nullptr : it->second;
+}
+
+// The program's pipelines, made with our cache in place of its own, and counted. Each create info
+// gets creation feedback chained on, unless it has its own, to count cache hits.
+template <typename Info, typename Fn>
+VkResult cached_pipelines(VkDevice dev, VkPipelineCache cache, uint32_t n, const Info* infos,
+                          const VkAllocationCallbacks* alloc, VkPipeline* out, Fn next) {
+    PipeCache* c = cache_of(dev);
+    if (!c) return next(dev, cache, n, infos, alloc, out);
+    std::vector<Info> copy(infos, infos + n);
+    std::vector<VkPipelineCreationFeedback> fb(n);
+    std::vector<VkPipelineCreationFeedbackCreateInfo> fbi(n);
+    std::vector<bool> ours(n, false);
+    for (uint32_t i = 0; c->feedback && i < n; i++) {
+        bool has = false;
+        for (auto* s = static_cast<const VkBaseInStructure*>(copy[i].pNext); s; s = s->pNext)
+            has |= s->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;
+        if (has) continue;
+        fbi[i] = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, copy[i].pNext, &fb[i], 0, nullptr};
+        copy[i].pNext = &fbi[i];
+        ours[i] = true;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    VkResult r = next(dev, c->cache, n, copy.data(), alloc, out);
+    uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    c->ns += ns;
+    g_ns += ns;
+    c->made += n;
+    g_made += n;
+    for (uint32_t i = 0; i < n; i++)
+        if (ours[i] && (fb[i].flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)) c->hits++, g_hits++;
+    c->dirty = true;
+    return r;
+}
+
+PFN_vkCreateGraphicsPipelines g_module_graphics;  // a fix module's own hook, which ours calls
+PFN_vkCreateComputePipelines g_module_compute;
+
+VKAPI_ATTR VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dev, VkPipelineCache cache, uint32_t n,
+                                                         const VkGraphicsPipelineCreateInfo* infos,
+                                                         const VkAllocationCallbacks* alloc, VkPipeline* out) {
+    return cached_pipelines(dev, cache, n, infos, alloc, out,
+                            g_module_graphics ? g_module_graphics : NEXT_D(dev, vkCreateGraphicsPipelines));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_compute_pipelines(VkDevice dev, VkPipelineCache cache, uint32_t n,
+                                                        const VkComputePipelineCreateInfo* infos,
+                                                        const VkAllocationCallbacks* alloc, VkPipeline* out) {
+    return cached_pipelines(dev, cache, n, infos, alloc, out,
+                            g_module_compute ? g_module_compute : NEXT_D(dev, vkCreateComputePipelines));
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo* info,
                                              const VkAllocationCallbacks* alloc, VkDevice* out) {
     VkInstance inst = instance_of(pd);
     VkDeviceCreateInfo chained = *info;
     patch_device_create(pd, &chained);
+    // Creation feedback, to count shader cache hits: turned on when the driver has it.
+    std::vector<const char*> exts(chained.ppEnabledExtensionNames, chained.ppEnabledExtensionNames + chained.enabledExtensionCount);
+    bool feedback = false;
+    if (g_bottom && cache_dir()) {
+        for (const char* e : exts) feedback |= !strcmp(e, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+        if (!feedback && has_extension(pd, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)) {
+            exts.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+            chained.ppEnabledExtensionNames = exts.data();
+            chained.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+            feedback = true;
+        }
+    }
     std::vector<VkLayerDeviceLink> links(g_layers.size());
     VkLayerDeviceCreateInfo link_info{VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO, chained.pNext, VK_LAYER_LINK_INFO, {}};
     VkLayerDeviceCreateInfo data_info{VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO, &link_info, VK_LOADER_DATA_CALLBACK, {}};
@@ -304,10 +544,12 @@ VKAPI_ATTR VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDevice
         g_gdpa[*out] = gdpa;
     }
     on_device(pd, *out, info);
+    open_cache(pd, *out, feedback);
     return r;
 }
 
 VKAPI_ATTR void VKAPI_CALL destroy_device(VkDevice dev, const VkAllocationCallbacks* alloc) {
+    close_cache(dev);
     on_device_destroy(dev);
     auto real = NEXT_D(dev, vkDestroyDevice);
     {
@@ -377,6 +619,17 @@ const Hook kCore[] = {
 PFN_vkVoidFunction wrapped(PFN_vkVoidFunction real, const char* name) {
     if (!real) return nullptr;
     if (const Hook* h = find_hook(kCore, name)) return h->fn;
+    // The shader cache goes in front of the module's own pipeline hooks, which it then calls.
+    if (g_bottom && cache_dir()) {
+        if (!strcmp(name, "vkCreateGraphicsPipelines")) {
+            if (const Hook* h = find_hook(hooks(), name)) g_module_graphics = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(h->fn);
+            return reinterpret_cast<PFN_vkVoidFunction>(create_graphics_pipelines);
+        }
+        if (!strcmp(name, "vkCreateComputePipelines")) {
+            if (const Hook* h = find_hook(hooks(), name)) g_module_compute = reinterpret_cast<PFN_vkCreateComputePipelines>(h->fn);
+            return reinterpret_cast<PFN_vkVoidFunction>(create_compute_pipelines);
+        }
+    }
     if (const Hook* h = find_hook(hooks(), name)) return h->fn;
     return real;
 }

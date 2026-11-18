@@ -212,11 +212,30 @@ class HomeScreen(
             Ui.row(ctx, "Add a driver file", "A Vulkan driver as a .so, or a .zip that holds one, such as Turnip or PanVK.", Ui.chevron(ctx)) {
                 actions.importDriver()
             },
+            shaderCacheRow(),
             Ui.text(ctx, M.attr.textAppearanceBodySmall, M.attr.colorOnSurfaceVariant,
                 "Fixes that are on run top first, over the one driver that is on. Drag to reorder. " +
                     "Changes apply at once. Programs using the GPU need to start again.").apply {
                 setPadding(ctx.dp(20), ctx.dp(4), ctx.dp(20), ctx.dp(12))
             })
+    }
+
+    /** Compiled shaders kept between runs, with a Clear button for when Windows is off. */
+    private fun shaderCacheRow(): View {
+        fun summary() = HwGpu.shaderCacheSummary(ctx) ?: "Empty. Shaders games compile are kept here, so they load fast next time."
+        lateinit var row: LinearLayout
+        val clear = Ui.button(ctx, "Clear", M.attr.borderlessButtonStyle) {
+            if (AvfLaunch.machine != null) {
+                MaterialAlertDialogBuilder(ctx).setTitle("Windows is running")
+                    .setMessage("Shut Windows down first. The graphics driver has the cache open while it runs.")
+                    .setPositiveButton("OK", null).show()
+                return@button
+            }
+            HwGpu.clearShaderCache(ctx)
+            row.setSummary(summary())
+        }
+        row = Ui.row(ctx, "Shader cache", summary(), clear)
+        return row
     }
 
     /**

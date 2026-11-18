@@ -251,6 +251,22 @@ object HwGpu {
         return if (fixes.isEmpty()) driver else "$fixes over $driver"
     }
 
+    /** Where the driver wrapper keeps compiled shaders, one file a driver, and stats.txt. */
+    fun shaderCacheDir(ctx: Context) = File(ctx.cacheDir, "shaders")
+
+    /** "312 MB, 4,120 pipelines made, 97% from the cache", or null when there is no cache yet. */
+    fun shaderCacheSummary(ctx: Context): String? {
+        val files = shaderCacheDir(ctx).listFiles { f -> f.name.endsWith(".bin") }?.takeIf { it.isNotEmpty() } ?: return null
+        val mb = files.sumOf { it.length() } / (1 shl 20)
+        val stats = runCatching { File(shaderCacheDir(ctx), "stats.txt").readText().trim().split(" ").map { it.toLong() } }.getOrNull()
+        val size = if (mb > 0) "$mb MB" else "under 1 MB"
+        if (stats == null || stats.size < 2 || stats[0] == 0L) return size
+        return "$size. Last run: %,d pipelines, %d%% from the cache".format(stats[0], stats[1] * 100 / stats[0])
+    }
+
+    /** Deletes the cache. Only while the renderer is stopped: it has the files open. */
+    fun clearShaderCache(ctx: Context) = shaderCacheDir(ctx).deleteRecursively()
+
     /** What the renderer process sets before gfxstream loads its driver. */
     private fun env(ctx: Context): Bundle {
         val on = stack(ctx).filter { it.on }
@@ -259,13 +275,15 @@ object HwGpu {
         return Bundle().apply {
             // gfxstream opens the top wrapper as its Vulkan loader. Each wrapper opens the next one
             // in HWGPU_VK_CHAIN, and the last opens HWGPU_VK_DRIVER, or the phone's libvulkan.so.
-            when {
-                fixes.isNotEmpty() -> {
-                    putString("ANDROID_EMU_VK_LOADER_PATH", fixes.first())
-                    putString("HWGPU_VK_CHAIN", fixes.joinToString(":"))
-                }
-                driver != null -> putString("ANDROID_EMU_VK_LOADER_PATH", "libvulkan_passthrough.so")
+            // With no fixes the plain wrapper still goes in, for the shader cache it keeps.
+            if (fixes.isNotEmpty()) {
+                putString("ANDROID_EMU_VK_LOADER_PATH", fixes.first())
+                putString("HWGPU_VK_CHAIN", fixes.joinToString(":"))
+            } else {
+                putString("ANDROID_EMU_VK_LOADER_PATH", "libvulkan_passthrough.so")
             }
+            // Compiled shaders, kept between runs by the bottom wrapper (shader-cache/README.md).
+            putString("HWGPU_VK_CACHE_DIR", shaderCacheDir(ctx).absolutePath)
             if (driver != null) putString("HWGPU_VK_DRIVER", driver.absolutePath)
             // adb shell setprop log.tag.hwgpu DEBUG: the server logs every guest request.
             if (Log.isLoggable("hwgpu", Log.DEBUG)) putString("HWGPU_TRACE", "1")

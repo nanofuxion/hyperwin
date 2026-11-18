@@ -20,6 +20,18 @@ does:
   (`host/icd/vortek.cpp:105`). So DXVK can't compile parts of a pipeline ahead
   of time, and everything happens at draw time.
 
+## Scope: the wrapper only
+
+HwD3D (`d3d/README.md`) will move DXVK from Windows to the phone. So this
+phase stays in one place, `gpu/host/icd/wrap.cpp`, which every renderer uses,
+now and after that move. Don't:
+
+- add caching inside gfxstream's decoder,
+- add a state cache or other tuning to DXVK or Sarek in Windows,
+- change how DXVK in Windows builds its pipelines.
+
+That work would be thrown away when DXVK moves.
+
 ## What to build: an implicit cache in the driver wrapper
 
 Every Vulkan call passes through the wrapper in `gpu/host/icd/wrap.cpp` before
@@ -45,6 +57,12 @@ Zink and plain Vulkan alike.
    warning.
 4. **Size cap:** over 256 MiB, start a fresh file. That's simple, and the next
    few runs refill it with what's actually used.
+5. **Several devices, one file.** gfxstream already makes a device per Windows
+   program, and HwD3D will too. A pipeline cache can't be shared between
+   devices, so each device has its own. To save, a device makes a fresh cache
+   from the file, merges its own into it with `vkMergePipelineCaches`, and
+   writes that. One lock in the process keeps saves one at a time. Then one
+   program's save doesn't wipe out another's pipelines.
 
 ### Where it runs
 
@@ -58,6 +76,9 @@ Zink and plain Vulkan alike.
   call.
 - Each driver gets its own file, because `pipelineCacheUUID` differs. Swapping
   between Mali and a custom driver keeps both caches.
+- The planned phone-side renderers sit on the same wrapper: DXVK for HwD3D
+  (`d3d/README.md`) and Zink for OpenGL (`opengl/README.md`). So this one cache
+  covers them too, with no extra work.
 
 ### The folder
 
@@ -80,11 +101,10 @@ may clear it when storage runs low, and that's fine for a cache.
 
 This cache only helps from the second time on. For the first run:
 
-- Try DXVK with graphics pipeline library left visible on drivers that handle it
-  well. Vortek hides it for Mali workarounds, so make that a per-driver choice
-  and measure it.
-- vkd3d-proton keeps its own cache (`VKD3D_SHADER_CACHE_PATH`). Point it at a
-  folder that persists in the guest, so its shader translation is cached too.
+- vkd3d-proton keeps its own cache (`VKD3D_SHADER_CACHE_PATH`). Not in this
+  phase: no shader-cache work for DXVK or Direct3D 12 (user, 2026-11-18).
+- Graphics pipeline library for DXVK waits for HwD3D. Vortek hides it on Mali,
+  and whether to show it is a question for DXVK on the phone, not in Windows.
 
 ## Phases
 
@@ -94,8 +114,37 @@ This cache only helps from the second time on. For the first run:
 2. Always load the passthrough wrapper. Test the phone's own driver with no
    fixes on.
 3. Settings line, Clear button, and the size cap.
-4. The first-run experiments: graphics pipeline library per driver, and the
-   vkd3d-proton cache path.
+4. ~~The vkd3d-proton cache path~~ dropped: no shader-cache work for DXVK or
+   Direct3D 12. The graphics pipeline library question moves to HwD3D.
+
+## As built (2026-11-18)
+
+- All in `gpu/host/icd/wrap.cpp`, in the bottom wrapper only (`g_bottom`). The
+  pipeline hooks go in front of a fix module's own (Vortek's), and call it.
+- `VK_EXT_pipeline_creation_feedback` is turned on at `vkCreateDevice` when the
+  driver has it, to count hits.
+- Saves merge into what the file holds now, under `g_save_lock`, which also
+  keeps a device from being destroyed mid-save. The 256 MiB cap writes the
+  device's own cache in place of the merged one.
+- `stats.txt` beside the cache files: pipelines this renderer run made, and
+  how many hit. Settings, Graphics shows "Shader cache: N MB. Last run: N
+  pipelines, N% from the cache" with a Clear button that waits for Windows to
+  be off.
+- `libvulkan_passthrough.so` now always loads under the phone's own driver.
+- Test tool: `guest/tools/pipetest.c` makes distinct compute pipelines
+  (`pipetest.comp`, one specialisation value each) and times them.
+
+Measured on the Pixel 6 Pro (Mali, phone driver, no fixes):
+
+| Run | 300 pipelines |
+|---|---|
+| First, empty cache | 3327 ms, 11.1 ms each, worst 60 ms |
+| Renderer restarted | 26 ms, 0.09 ms each |
+| Windows restarted, app reinstalled | 211 ms, all 329 from the cache |
+
+Mali returns real cache data, about 1.2 KiB a pipeline. gfxstream's own 28
+pipelines also hit the cache. Not measured: a real game, and the cache under
+Vortek.
 
 ## Things to check early
 

@@ -1,0 +1,9 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint K = 1;
+layout(std430, binding = 0) buffer B { uint v[]; };
+void main() {
+    uint x = v[gl_GlobalInvocationID.x];
+    for (uint i = 0; i < 16; i++) x = x * (K | 1u) + (x >> 7) ^ (K << (i & 7));
+    v[gl_GlobalInvocationID.x] = x;
+}
