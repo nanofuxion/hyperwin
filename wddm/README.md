@@ -474,6 +474,9 @@ What the work found, for whoever picks it up:
   the same driver version as Direct3D 11, so no new interface is needed: `d3d10test` (device,
   target, clear, copy, read-back) passes on the HyperWin adapter. A 10.1 table is written in
   `umd.cpp` (argument shapes converted to the 11 ones) but is not offered, since no runtime asks.
+- **32-bit (`hwd3d_umd_x86.dll`).** The same `umd.cpp` built as plain i686, with the stdcall names
+  undecorated (`--kill-at`), in the package and named in `UserModeDriverNameWow`. `dxtest 11` built for
+  x86 passes through Windows' 32-bit `d3d11.dll` on the HyperWin adapter.
 - **Result.** `dxtest 11` passes with nothing beside it, through Windows' own
   `d3d11.dll`: the device is made on the HyperWin GPU (feature level 10.1), a
   target is cleared on the phone, copied to a staging resource and read back

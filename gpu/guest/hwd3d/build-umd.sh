@@ -22,3 +22,11 @@ python3 "$ROOT/gpu/host/hwd3d/gen_thunks.py" "$INC" "$ROOT/gpu/work/hwd3d-gen" >
   -shared -static -o "$OUT/hwd3d_umd.dll" "$HERE/umd.cpp" "$HERE/umd.def" -Wl,--entry,DllMain -lgdi32 -luser32
 "$ROOT/build/third_party/win/llvm-mingw/bin/llvm-strip" "$OUT/hwd3d_umd.dll"
 ls -la "$OUT"
+# The 32-bit driver, for x86 programs under Windows' emulator (UserModeDriverNameWow). Plain i686, stdcall names undecorated.
+W=$ROOT/gpu/work/umd-out
+"$ROOT/build/third_party/win/llvm-mingw/bin/i686-w64-mingw32-clang++" -std=c++17 -O2 -Wall -Wno-unused-function -Wno-microsoft-anon-tag -Wno-missing-field-initializers \
+  -Wno-ignored-attributes -D_WIN32_WINNT=0x0A00 -DUNICODE -I"$GEN" -I"$ROOT/gpu/work/hwd3d-gen" -I"$ROOT/include" -I"$ROOT/gpu/include" -I"$HERE" \
+  -idirafter "$K/um" -idirafter "$K/shared" -idirafter "$S/um" -idirafter "$S/shared" \
+  -shared -static -o "$W/hwd3d_umd_x86.dll" "$HERE/umd.cpp" "$HERE/umd.def" -Wl,--entry,DllMain@12 -Wl,--kill-at -lgdi32 -luser32
+"$ROOT/build/third_party/win/llvm-mingw/bin/llvm-strip" "$W/hwd3d_umd_x86.dll"
+ls -la "$W"
