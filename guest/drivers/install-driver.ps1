@@ -9,6 +9,8 @@ param([string]$Name, [string]$Ids)
 $Id = $Ids -split ','
 $ErrorActionPreference = 'Stop'
 $d = $PSScriptRoot
+# Older builds shipped Microsoft's devcon.exe here; hwdev.exe replaces it (its license forbids passing it on).
+Remove-Item "$d\devcon.exe" -Force -ErrorAction SilentlyContinue
 $src = "$d\$Name"
 $w = "$env:SystemRoot\Temp\$Name"
 $log = "$src\install.log"
@@ -28,8 +30,8 @@ foreach ($one in $Id) {
     # The audio service keeps the sound device open, and an update would then wait for a restart.
     $audio = $Name -eq 'hwaudio' -and $have
     if ($audio) { Stop-Service Audiosrv, AudioEndpointBuilder -Force -ErrorAction SilentlyContinue }
-    & "$d\devcon.exe" $verb "$w\$Name.inf" $one 2>&1 | Out-File $log -Append
-    "devcon $verb $one exit $LASTEXITCODE (1: takes effect at the next restart)" | Out-File $log -Append
+    & "$d\hwdev.exe" $verb "$w\$Name.inf" $one 2>&1 | Out-File $log -Append
+    "hwdev $verb $one exit $LASTEXITCODE (1: takes effect at the next restart)" | Out-File $log -Append
     if ($audio) { Start-Service AudioEndpointBuilder, Audiosrv -ErrorAction SilentlyContinue }
 }
 
@@ -43,12 +45,12 @@ pnputil /enum-drivers | Out-String | Select-String -Pattern "Published Name:\s+(
 # The Xbox 360 HID twin of an earlier build; players are USB Xbox 360 controllers now, and player 1
 # can be a DualShock 4 instead.
 if ($Name -eq 'hwhid' -and (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\VID_045E&PID_028E&IG_00' })) {
-    & "$d\devcon.exe" remove 'Root\VID_045E&PID_028E&IG_00' 2>&1 | Out-File $log -Append
+    & "$d\hwdev.exe" remove 'Root\VID_045E&PID_028E&IG_00' 2>&1 | Out-File $log -Append
 }
 
 # Scream sent sound over the network; hwaudio replaces it.
 if ($Name -eq 'hwaudio' -and (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains '*Scream' })) {
-    & "$d\devcon.exe" remove '*Scream' 2>&1 | Out-File $log -Append
+    & "$d\hwdev.exe" remove '*Scream' 2>&1 | Out-File $log -Append
     pnputil /enum-drivers | Out-String | Select-String -Pattern 'Published Name:\s+(oem\d+\.inf)\s+Original Name:\s+scream\.inf' -AllMatches |
         ForEach-Object { $_.Matches } | ForEach-Object { pnputil /delete-driver $_.Groups[1].Value /uninstall /force } |
         Out-File $log -Append

@@ -34,15 +34,16 @@ cp "$ROOT/gpu/work/direct/hwgpu.sys" "$ROOT/gpu/work/out/vulkan_hwgpu.dll" "$ROO
 cp "$ROOT/build/hwvsinput/hwvsinput.sys" "$OUT/guest/gpu/"
 # Speakers and microphone (audio/README.md), and the touch screen and touchpad (mouse/README.md).
 # Windows only installs these from a package with a signed catalog, which nothing here can make, so
-# install-driver.ps1 makes one in Windows and signs it with the package key. devcon.exe comes from
-# the Scream download. Each driver is built only when its sources changed: the signature carries a
+# install-driver.ps1 makes one in Windows and signs it with the package key. hwdev.exe adds the root
+# devices (Microsoft's devcon.exe may not be passed on). Each driver is built only when its sources changed: the signature carries a
 # time, and a new file means every Windows reinstalls it.
 PFX=$ROOT/build/testcert/hyperwin-pkg.pfx
 [ -f "$PFX" ] || openssl pkcs12 -export -inkey "$ROOT/build/testcert/hyperwin-pkg.key" -in "$ROOT/build/testcert/hyperwin-pkg.crt" \
   -certfile "$ROOT/build/testcert/hyperwin-ca.crt" -passout pass:hyperwin -out "$PFX"
 mkdir -p "$OUT/guest/gpu"
 cp "$ROOT/guest/drivers/install-driver.ps1" "$PFX" "$OUT/guest/gpu/"
-cp "$WIN/scream/Install/helpers/devcon-arm64.exe" "$OUT/guest/gpu/devcon.exe"
+[ "$ROOT/build/hwdev/hwdev.exe" -nt "$ROOT/guest/drivers/hwdev/hwdev.c" ] || sh "$ROOT/guest/drivers/hwdev/build.sh" >/dev/null
+cp "$ROOT/build/hwdev/hwdev.exe" "$OUT/guest/gpu/"
 for d in hwaudio hwhid; do
   for f in "$ROOT/guest/drivers/$d/$d.c" "$ROOT/guest/drivers/$d/$d.inf" "$ROOT/include/hw_audio.h" "$ROOT/include/hw_abi.h"; do
     [ "$ROOT/build/$d/$d.sys" -nt "$f" ] || { sh "$ROOT/guest/drivers/$d/build.sh" >/dev/null; break; }
