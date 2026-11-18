@@ -470,6 +470,10 @@ What the work found, for whoever picks it up:
   (deferred context, MSAA resolve, compute with a UAV read-back, occlusion query).
   DXVK checks the container checksum (the driver builds the container, MD5 with the
   format's own padding), which was the compute shader's last blocker.
+- **Direct3D 10 (`d3d10core`).** Windows 11 runs Direct3D 10 programs on the same runtime and
+  the same driver version as Direct3D 11, so no new interface is needed: `d3d10test` (device,
+  target, clear, copy, read-back) passes on the HyperWin adapter. A 10.1 table is written in
+  `umd.cpp` (argument shapes converted to the 11 ones) but is not offered, since no runtime asks.
 - **Result.** `dxtest 11` passes with nothing beside it, through Windows' own
   `d3d11.dll`: the device is made on the HyperWin GPU (feature level 10.1), a
   target is cleared on the phone, copied to a staging resource and read back

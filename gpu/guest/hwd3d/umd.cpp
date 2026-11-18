@@ -882,16 +882,12 @@ static std::vector<Sig> sigs_of(const D3D11_1DDIARG_SIGNATURE_ENTRY2 *e, UINT n)
     return v;
 }
 
-static void make_shader(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, D3D10DDI_HSHADER hs, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *sg)
+static void make_shader_sigs(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, D3D10DDI_HSHADER hs, const std::vector<Sig> *sin,
+                             const std::vector<Sig> *sout)
 {
     Dev *d = DV(hd);
     Obj *o = new (hs.pDrvPrivate) Obj();
-    std::vector<Sig> in, out;
-    if (sg) {
-        in = sigs_of(sg->pInputSignature, sg->NumInputSignatureEntries);
-        out = sigs_of(sg->pOutputSignature, sg->NumOutputSignatureEntries);
-    }
-    std::vector<uint8_t> bc = dxbc(code, sg ? &in : nullptr, sg ? &out : nullptr);
+    std::vector<uint8_t> bc = dxbc(code, sin, sout);
     char dump[MAX_PATH];
     if (GetEnvironmentVariableA("HWD3D_DUMPSHADER", dump, sizeof dump)) {  /* the container built, for reading it */
         HANDLE f = CreateFileA(dump, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
@@ -915,6 +911,16 @@ static void make_shader(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, 
         ulog("hwd3d_umd: the phone refused a shader (0x%08lx)\n", (unsigned long)hr);
         fail(d, FAILED(hr) ? hr : E_FAIL);
     }
+}
+
+static void make_shader(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, D3D10DDI_HSHADER hs, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *sg)
+{
+    std::vector<Sig> in, out;
+    if (sg) {
+        in = sigs_of(sg->pInputSignature, sg->NumInputSignatureEntries);
+        out = sigs_of(sg->pOutputSignature, sg->NumOutputSignatureEntries);
+    }
+    make_shader_sigs(hd, method, code, hs, sg ? &in : nullptr, sg ? &out : nullptr);
 }
 
 #define SHADER_CREATE(Name, Method, Hs) \
@@ -1500,6 +1506,135 @@ static void APIENTRY u_SetPredication(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, BO
     call_async(b);
 }
 
+/* ---- the Direct3D 10.1 table: the same work with the older argument shapes ---- */
+
+static void APIENTRY u10_CreateResource(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATERESOURCE *a, D3D10DDI_HRESOURCE hr, D3D10DDI_HRTRESOURCE rt)
+{
+    D3D11DDIARG_CREATERESOURCE b;
+    memset(&b, 0, sizeof b);
+    b.pMipInfoList = a->pMipInfoList;
+    b.pInitialDataUP = a->pInitialDataUP;
+    b.ResourceDimension = a->ResourceDimension;
+    b.Usage = a->Usage;
+    b.BindFlags = a->BindFlags;
+    b.MapFlags = a->MapFlags;
+    b.MiscFlags = a->MiscFlags;
+    b.Format = a->Format;
+    b.SampleDesc = a->SampleDesc;
+    b.MipLevels = a->MipLevels;
+    b.ArraySize = a->ArraySize;
+    b.pPrimaryDesc = a->pPrimaryDesc;
+    u_CreateResource(hd, &b, hr, rt);
+}
+
+static void APIENTRY u10_CreateShaderResourceView(D3D10DDI_HDEVICE hd, const D3D10_1DDIARG_CREATESHADERRESOURCEVIEW *a, D3D10DDI_HSHADERRESOURCEVIEW hv,
+                                                  D3D10DDI_HRTSHADERRESOURCEVIEW rt)
+{
+    D3D11DDIARG_CREATESHADERRESOURCEVIEW b;
+    memset(&b, 0, sizeof b);
+    memcpy(&b, a, sizeof *a);  /* the 11 form is this one with a raw flag after a buffer's range */
+    u_CreateShaderResourceView(hd, &b, hv, rt);
+}
+
+static void APIENTRY u10_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATEDEPTHSTENCILVIEW *a, D3D10DDI_HDEPTHSTENCILVIEW hv,
+                                                D3D10DDI_HRTDEPTHSTENCILVIEW rt)
+{
+    D3D11DDIARG_CREATEDEPTHSTENCILVIEW b;
+    memset(&b, 0, sizeof b);
+    b.hDrvResource = a->hDrvResource;
+    b.Format = a->Format;
+    b.ResourceDimension = a->ResourceDimension;
+    b.Tex2D = {a->Tex2D.MipSlice, a->Tex2D.FirstArraySlice, a->Tex2D.ArraySize};
+    u_CreateDepthStencilView(hd, &b, hv, rt);
+}
+
+static void APIENTRY u10_CreateBlendState(D3D10DDI_HDEVICE hd, const D3D10_1_DDI_BLEND_DESC *a, D3D10DDI_HBLENDSTATE hs, D3D10DDI_HRTBLENDSTATE rt)
+{
+    D3D11_1_DDI_BLEND_DESC b;
+    memset(&b, 0, sizeof b);
+    b.AlphaToCoverageEnable = a->AlphaToCoverageEnable;
+    b.IndependentBlendEnable = a->IndependentBlendEnable;
+    for (int i = 0; i < 8; i++) {
+        const D3D10_DDI_RENDER_TARGET_BLEND_DESC1 &s = a->RenderTarget[i];
+        D3D11_1_DDI_RENDER_TARGET_BLEND_DESC &t = b.RenderTarget[i];
+        t.BlendEnable = s.BlendEnable;
+        t.SrcBlend = s.SrcBlend;
+        t.DestBlend = s.DestBlend;
+        t.BlendOp = s.BlendOp;
+        t.SrcBlendAlpha = s.SrcBlendAlpha;
+        t.DestBlendAlpha = s.DestBlendAlpha;
+        t.BlendOpAlpha = s.BlendOpAlpha;
+        t.RenderTargetWriteMask = s.RenderTargetWriteMask;
+    }
+    u_CreateBlendState(hd, &b, hs, rt);
+}
+
+static void APIENTRY u10_CreateRasterizerState(D3D10DDI_HDEVICE hd, const D3D10_DDI_RASTERIZER_DESC *a, D3D10DDI_HRASTERIZERSTATE hs, D3D10DDI_HRTRASTERIZERSTATE rt)
+{
+    D3D11_1_DDI_RASTERIZER_DESC b = {a->FillMode, a->CullMode, a->FrontCounterClockwise, a->DepthBias, a->DepthBiasClamp, a->SlopeScaledDepthBias,
+                                     a->DepthClipEnable, a->ScissorEnable, a->MultisampleEnable, a->AntialiasedLineEnable, 0};
+    u_CreateRasterizerState(hd, &b, hs, rt);
+}
+
+static std::vector<Sig> sigs10_of(const D3D10DDIARG_SIGNATURE_ENTRY *e, UINT n)
+{
+    std::vector<Sig> v;
+    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, 3u});
+    return v;
+}
+
+static void make_shader10(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, D3D10DDI_HSHADER hs, const D3D10DDIARG_STAGE_IO_SIGNATURES *sg)
+{
+    std::vector<Sig> in, out;
+    if (sg) {
+        in = sigs10_of(sg->pInputSignature, sg->NumInputSignatureEntries);
+        out = sigs10_of(sg->pOutputSignature, sg->NumOutputSignatureEntries);
+    }
+    make_shader_sigs(hd, method, code, hs, sg ? &in : nullptr, sg ? &out : nullptr);
+}
+
+#define SHADER10(Name, Method) \
+    static void APIENTRY u10_Create##Name##Shader(D3D10DDI_HDEVICE hd, const UINT *code, D3D10DDI_HSHADER hs, D3D10DDI_HRTSHADER, \
+                                                  const D3D10DDIARG_STAGE_IO_SIGNATURES *sg) \
+    { \
+        make_shader10(hd, HMX_ID3D11Device_Create##Method, code, hs, sg); \
+    }
+SHADER10(Vertex, VertexShader)
+SHADER10(Geometry, GeometryShader)
+SHADER10(Pixel, PixelShader)
+
+#define CB10(Stage) \
+    static void APIENTRY u10_##Stage##SetConstantBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HRESOURCE *v) \
+    { \
+        u_##Stage##SetConstantBuffers(hd, start, n, v, nullptr, nullptr); \
+    }
+CB10(Vs)
+CB10(Ps)
+CB10(Gs)
+
+static void APIENTRY u10_SetRenderTargets(D3D10DDI_HDEVICE hd, const D3D10DDI_HRENDERTARGETVIEW *rtv, UINT n, UINT clear, D3D10DDI_HDEPTHSTENCILVIEW dsv)
+{
+    u_SetRenderTargets(hd, rtv, n, clear, dsv, nullptr, nullptr, 0, 0, 0, 0);
+}
+
+static void APIENTRY u10_ResourceCopyRegion(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE dst, UINT dsub, UINT x, UINT y, UINT z, D3D10DDI_HRESOURCE src, UINT ssub,
+                                            const D3D10_DDI_BOX *box)
+{
+    u_ResourceCopyRegion(hd, dst, dsub, x, y, z, src, ssub, box, 0);
+}
+
+static void APIENTRY u10_ResourceUpdateSubresourceUP(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT p, UINT sp)
+{
+    update_subresource(hd, r, sub, box, src, p, sp);
+}
+
+static void APIENTRY u10_Flush(D3D10DDI_HDEVICE hd) { u_Flush(hd, 0); }
+
+static void APIENTRY u10_CheckMultisampleQualityLevels(D3D10DDI_HDEVICE hd, DXGI_FORMAT f, UINT samples, UINT *out)
+{
+    u_CheckMultisampleQualityLevels(hd, f, samples, 0, out);
+}
+
 template <class A, class B> struct Same { static constexpr bool v = false; };
 template <class A> struct Same<A, A> { static constexpr bool v = true; };
 
@@ -1513,32 +1648,20 @@ template <class A> struct Same<A, A> { static constexpr bool v = true; };
 template <class Tbl> static void fill_device_funcs(Tbl *t)
 {
 #include "umd_tables.inc"
-    t->pfnCalcPrivateResourceSize = u_CalcPrivateResourceSize;
-    t->pfnCreateResource = u_CreateResource;
     t->pfnDestroyResource = u_DestroyResource;
     t->pfnCalcPrivateRenderTargetViewSize = u_CalcPrivateRenderTargetViewSize;
     t->pfnCreateRenderTargetView = u_CreateRenderTargetView;
     t->pfnDestroyRenderTargetView = u_DestroyRenderTargetView;
-    t->pfnCreateShaderResourceView = u_CreateShaderResourceView;
     t->pfnDestroyShaderResourceView = u_destroy<D3D10DDI_HSHADERRESOURCEVIEW>;
-    t->pfnCreateDepthStencilView = u_CreateDepthStencilView;
     t->pfnDestroyDepthStencilView = u_destroy<D3D10DDI_HDEPTHSTENCILVIEW>;
-    t->pfnCreateUnorderedAccessView = u_CreateUnorderedAccessView;
-    t->pfnDestroyUnorderedAccessView = u_destroy<D3D11DDI_HUNORDEREDACCESSVIEW>;
     t->pfnCreateElementLayout = u_CreateElementLayout;
     t->pfnDestroyElementLayout = u_destroy<D3D10DDI_HELEMENTLAYOUT>;
-    t->pfnCreateBlendState = u_CreateBlendState;
     t->pfnDestroyBlendState = u_destroy<D3D10DDI_HBLENDSTATE>;
     t->pfnCreateDepthStencilState = u_CreateDepthStencilState;
     t->pfnDestroyDepthStencilState = u_destroy<D3D10DDI_HDEPTHSTENCILSTATE>;
-    t->pfnCreateRasterizerState = u_CreateRasterizerState;
     t->pfnDestroyRasterizerState = u_destroy<D3D10DDI_HRASTERIZERSTATE>;
     t->pfnCreateSampler = u_CreateSampler;
     t->pfnDestroySampler = u_destroy<D3D10DDI_HSAMPLER>;
-    t->pfnCreateVertexShader = u_CreateVertexShader;
-    t->pfnCreateGeometryShader = u_CreateGeometryShader;
-    t->pfnCreatePixelShader = u_CreatePixelShader;
-    t->pfnCreateComputeShader = u_CreateComputeShader;
     t->pfnDestroyShader = u_destroy<D3D10DDI_HSHADER>;
     t->pfnCreateQuery = u_CreateQuery;
     t->pfnCalcPrivateQuerySize = u_CalcPrivateQuerySize;
@@ -1559,51 +1682,22 @@ template <class Tbl> static void fill_device_funcs(Tbl *t)
     t->pfnVsSetShader = u_VsSetShader;
     t->pfnVsSetShaderResources = u_VsSetShaderResources;
     t->pfnVsSetSamplers = u_VsSetSamplers;
-    t->pfnVsSetConstantBuffers = u_VsSetConstantBuffers;
     t->pfnPsSetShader = u_PsSetShader;
     t->pfnPsSetShaderResources = u_PsSetShaderResources;
     t->pfnPsSetSamplers = u_PsSetSamplers;
-    t->pfnPsSetConstantBuffers = u_PsSetConstantBuffers;
     t->pfnGsSetShader = u_GsSetShader;
     t->pfnGsSetShaderResources = u_GsSetShaderResources;
     t->pfnGsSetSamplers = u_GsSetSamplers;
-    t->pfnGsSetConstantBuffers = u_GsSetConstantBuffers;
-    t->pfnHsSetShader = u_HsSetShader;
-    t->pfnHsSetShaderResources = u_HsSetShaderResources;
-    t->pfnHsSetSamplers = u_HsSetSamplers;
-    t->pfnHsSetConstantBuffers = u_HsSetConstantBuffers;
-    t->pfnDsSetShader = u_DsSetShader;
-    t->pfnDsSetShaderResources = u_DsSetShaderResources;
-    t->pfnDsSetSamplers = u_DsSetSamplers;
-    t->pfnDsSetConstantBuffers = u_DsSetConstantBuffers;
-    t->pfnCsSetShader = u_CsSetShader;
-    t->pfnCsSetShaderResources = u_CsSetShaderResources;
-    t->pfnCsSetSamplers = u_CsSetSamplers;
-    t->pfnCsSetConstantBuffers = u_CsSetConstantBuffers;
-    t->pfnCsSetUnorderedAccessViews = u_CsSetUnorderedAccessViews;
-    t->pfnSetRenderTargets = u_SetRenderTargets;
     t->pfnClearRenderTargetView = u_ClearRenderTargetView;
     t->pfnClearDepthStencilView = u_ClearDepthStencilView;
-    t->pfnClearUnorderedAccessViewUint = u_ClearUnorderedAccessViewUint;
-    t->pfnClearUnorderedAccessViewFloat = u_ClearUnorderedAccessViewFloat;
     t->pfnDraw = u_Draw;
     t->pfnDrawIndexed = u_DrawIndexed;
     t->pfnDrawInstanced = u_DrawInstanced;
     t->pfnDrawIndexedInstanced = u_DrawIndexedInstanced;
-    t->pfnDrawInstancedIndirect = u_DrawInstancedIndirect;
-    t->pfnDrawIndexedInstancedIndirect = u_DrawIndexedInstancedIndirect;
-    t->pfnDispatch = u_Dispatch;
-    t->pfnDispatchIndirect = u_DispatchIndirect;
     t->pfnResourceCopy = u_ResourceCopy;
-    t->pfnResourceCopyRegion = u_ResourceCopyRegion;
-    t->pfnResourceUpdateSubresourceUP = u_ResourceUpdateSubresourceUP;
-    t->pfnDefaultConstantBufferUpdateSubresourceUP = u_ResourceUpdateSubresourceUP;
     t->pfnResourceResolveSubresource = u_ResourceResolveSubresource;
     t->pfnGenMips = u_GenMips;
-    t->pfnSetResourceMinLOD = u_SetResourceMinLOD;
-    t->pfnCopyStructureCount = u_CopyStructureCount;
     t->pfnResourceIsStagingBusy = u_ResourceIsStagingBusy;
-    t->pfnFlush = u_Flush;
     t->pfnStagingResourceMap = u_StagingResourceMap;
     t->pfnStagingResourceUnmap = u_Unmap;
     t->pfnResourceMap = u_ResourceMap;
@@ -1612,16 +1706,98 @@ template <class Tbl> static void fill_device_funcs(Tbl *t)
     t->pfnDynamicIABufferMapNoOverwrite = u_ResourceMap;
     t->pfnDynamicIABufferUnmap = u_Unmap;
     t->pfnDynamicConstantBufferMapDiscard = u_ResourceMap;
-    t->pfnDynamicConstantBufferMapNoOverwrite = u_ResourceMap;
     t->pfnDynamicConstantBufferUnmap = u_Unmap;
     t->pfnDynamicResourceMapDiscard = u_ResourceMap;
     t->pfnDynamicResourceUnmap = u_Unmap;
     t->pfnCheckFormatSupport = u_CheckFormatSupport;
-    t->pfnCheckMultisampleQualityLevels = u_CheckMultisampleQualityLevels;
     t->pfnCheckCounterInfo = u_CheckCounterInfo;
     t->pfnDestroyDevice = u_DestroyDevice;
+    if constexpr (Same<Tbl, D3DWDDM1_3DDI_DEVICEFUNCS>::v) {
+        t->pfnCalcPrivateResourceSize = u_CalcPrivateResourceSize;
+        t->pfnCreateResource = u_CreateResource;
+        t->pfnCreateShaderResourceView = u_CreateShaderResourceView;
+        t->pfnCreateDepthStencilView = u_CreateDepthStencilView;
+        t->pfnCreateUnorderedAccessView = u_CreateUnorderedAccessView;
+        t->pfnDestroyUnorderedAccessView = u_destroy<D3D11DDI_HUNORDEREDACCESSVIEW>;
+        t->pfnCreateBlendState = u_CreateBlendState;
+        t->pfnCreateRasterizerState = u_CreateRasterizerState;
+        t->pfnCreateVertexShader = u_CreateVertexShader;
+        t->pfnCreateGeometryShader = u_CreateGeometryShader;
+        t->pfnCreatePixelShader = u_CreatePixelShader;
+        t->pfnCreateComputeShader = u_CreateComputeShader;
+        t->pfnVsSetConstantBuffers = u_VsSetConstantBuffers;
+        t->pfnPsSetConstantBuffers = u_PsSetConstantBuffers;
+        t->pfnGsSetConstantBuffers = u_GsSetConstantBuffers;
+        t->pfnHsSetShader = u_HsSetShader;
+        t->pfnHsSetShaderResources = u_HsSetShaderResources;
+        t->pfnHsSetSamplers = u_HsSetSamplers;
+        t->pfnHsSetConstantBuffers = u_HsSetConstantBuffers;
+        t->pfnDsSetShader = u_DsSetShader;
+        t->pfnDsSetShaderResources = u_DsSetShaderResources;
+        t->pfnDsSetSamplers = u_DsSetSamplers;
+        t->pfnDsSetConstantBuffers = u_DsSetConstantBuffers;
+        t->pfnCsSetShader = u_CsSetShader;
+        t->pfnCsSetShaderResources = u_CsSetShaderResources;
+        t->pfnCsSetSamplers = u_CsSetSamplers;
+        t->pfnCsSetConstantBuffers = u_CsSetConstantBuffers;
+        t->pfnCsSetUnorderedAccessViews = u_CsSetUnorderedAccessViews;
+        t->pfnSetRenderTargets = u_SetRenderTargets;
+        t->pfnClearUnorderedAccessViewUint = u_ClearUnorderedAccessViewUint;
+        t->pfnClearUnorderedAccessViewFloat = u_ClearUnorderedAccessViewFloat;
+        t->pfnDrawInstancedIndirect = u_DrawInstancedIndirect;
+        t->pfnDrawIndexedInstancedIndirect = u_DrawIndexedInstancedIndirect;
+        t->pfnDispatch = u_Dispatch;
+        t->pfnDispatchIndirect = u_DispatchIndirect;
+        t->pfnResourceCopyRegion = u_ResourceCopyRegion;
+        t->pfnResourceUpdateSubresourceUP = u_ResourceUpdateSubresourceUP;
+        t->pfnDefaultConstantBufferUpdateSubresourceUP = u_ResourceUpdateSubresourceUP;
+        t->pfnSetResourceMinLOD = u_SetResourceMinLOD;
+        t->pfnCopyStructureCount = u_CopyStructureCount;
+        t->pfnFlush = u_Flush;
+        t->pfnDynamicConstantBufferMapNoOverwrite = u_ResourceMap;
+        t->pfnCheckMultisampleQualityLevels = u_CheckMultisampleQualityLevels;
+    }
 }
 #undef UMD_FILL
+
+/* The 10.1 table has no compute, no unordered views and no tessellation: what it has is these. */
+static void fill_device_funcs_10_1(D3D10_1DDI_DEVICEFUNCS *t)
+{
+    fill_device_funcs(t);
+    t->pfnCreateResource = u10_CreateResource;
+    t->pfnDestroyResource = u_DestroyResource;
+    t->pfnCreateRenderTargetView = u_CreateRenderTargetView;
+    t->pfnDestroyRenderTargetView = u_DestroyRenderTargetView;
+    t->pfnCreateShaderResourceView = u10_CreateShaderResourceView;
+    t->pfnDestroyShaderResourceView = u_destroy<D3D10DDI_HSHADERRESOURCEVIEW>;
+    t->pfnCreateDepthStencilView = u10_CreateDepthStencilView;
+    t->pfnDestroyDepthStencilView = u_destroy<D3D10DDI_HDEPTHSTENCILVIEW>;
+    t->pfnCreateElementLayout = u_CreateElementLayout;
+    t->pfnDestroyElementLayout = u_destroy<D3D10DDI_HELEMENTLAYOUT>;
+    t->pfnCreateBlendState = u10_CreateBlendState;
+    t->pfnDestroyBlendState = u_destroy<D3D10DDI_HBLENDSTATE>;
+    t->pfnCreateDepthStencilState = u_CreateDepthStencilState;
+    t->pfnDestroyDepthStencilState = u_destroy<D3D10DDI_HDEPTHSTENCILSTATE>;
+    t->pfnCreateRasterizerState = u10_CreateRasterizerState;
+    t->pfnDestroyRasterizerState = u_destroy<D3D10DDI_HRASTERIZERSTATE>;
+    t->pfnCreateSampler = u_CreateSampler;
+    t->pfnDestroySampler = u_destroy<D3D10DDI_HSAMPLER>;
+    t->pfnCreateVertexShader = u10_CreateVertexShader;
+    t->pfnCreateGeometryShader = u10_CreateGeometryShader;
+    t->pfnCreatePixelShader = u10_CreatePixelShader;
+    t->pfnDestroyShader = u_destroy<D3D10DDI_HSHADER>;
+    t->pfnCreateQuery = u_CreateQuery;
+    t->pfnDestroyQuery = u_destroy<D3D10DDI_HQUERY>;
+    t->pfnVsSetConstantBuffers = u10_VsSetConstantBuffers;
+    t->pfnPsSetConstantBuffers = u10_PsSetConstantBuffers;
+    t->pfnGsSetConstantBuffers = u10_GsSetConstantBuffers;
+    t->pfnSetRenderTargets = u10_SetRenderTargets;
+    t->pfnResourceCopyRegion = u10_ResourceCopyRegion;
+    t->pfnResourceUpdateSubresourceUP = u10_ResourceUpdateSubresourceUP;
+    t->pfnDefaultConstantBufferUpdateSubresourceUP = u10_ResourceUpdateSubresourceUP;
+    t->pfnFlush = u10_Flush;
+    t->pfnCheckMultisampleQualityLevels = u10_CheckMultisampleQualityLevels;
+}
 
 /* ---- the DXGI entries the runtime asks of the driver ---- */
 
@@ -1787,12 +1963,12 @@ static void fill_dxgi(DXGI_DDI_BASE_ARGS *a, UINT interface_version)
 #undef X
     };
     for (size_t i = 0; i < n / sizeof(void *) && i < sizeof stubs / sizeof *stubs; i++) f[i] = stubs[i];
-    DXGI1_3_DDI_BASE_FUNCTIONS *t = a->pDXGIDDIBaseFunctions4;
-    t->pfnPresent = u_dxgi_present;
-    t->pfnRotateResourceIdentities = u_dxgi_rotate;
-    t->pfnPresent1 = u_dxgi_present1;
-    t->pfnQueryResourceResidency = u_dxgi_residency;
-    t->pfnSetResourcePriority = u_dxgi_priority;
+    DXGI1_1_DDI_BASE_FUNCTIONS *t1 = a->pDXGIDDIBaseFunctions2;  /* the shared first entries */
+    t1->pfnPresent = u_dxgi_present;
+    t1->pfnRotateResourceIdentities = u_dxgi_rotate;
+    t1->pfnQueryResourceResidency = u_dxgi_residency;
+    t1->pfnSetResourcePriority = u_dxgi_priority;
+    if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) a->pDXGIDDIBaseFunctions4->pfnPresent1 = u_dxgi_present1;
 }
 
 /* ---- the adapter ---- */
@@ -1824,7 +2000,7 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
 {
     ulog_call("RetrieveSubObject");
     ulog("hwd3d_umd: CreateDevice, interface 0x%x, version %u, flags 0x%x\n", a->Interface, a->Version, a->Flags);
-    if (a->Interface != D3DWDDM1_3_DDI_INTERFACE_VERSION) {
+    if (a->Interface != D3DWDDM1_3_DDI_INTERFACE_VERSION && a->Interface != D3D10_1_DDI_INTERFACE_VERSION) {
         ulog("hwd3d_umd: no table for that interface\n");
         return E_FAIL;
     }
@@ -1864,11 +2040,13 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
         ulog("hwd3d_umd: kernel context 0x%08lx, handle %p\n", (unsigned long)kh, cc.hContext);
         if (SUCCEEDED(kh)) d->kctx = cc.hContext;
     }
-    fill_device_funcs(a->pWDDM1_3DeviceFuncs);
+    if (a->Interface == D3D10_1_DDI_INTERFACE_VERSION) fill_device_funcs_10_1(a->p10_1DeviceFuncs);
+    else fill_device_funcs(a->pWDDM1_3DeviceFuncs);
     if (a->ppfnRetrieveSubObject) *a->ppfnRetrieveSubObject = u_RetrieveSubObject;
     {   /* a table entry left empty is a call to zero when the runtime uses it */
         void **t = reinterpret_cast<void **>(a->pWDDM1_3DeviceFuncs);
-        for (size_t i = 0; i < sizeof(D3DWDDM1_3DDI_DEVICEFUNCS) / sizeof(void *); i++)
+        size_t n = a->Interface == D3D10_1_DDI_INTERFACE_VERSION ? sizeof(D3D10_1DDI_DEVICEFUNCS) : sizeof(D3DWDDM1_3DDI_DEVICEFUNCS);
+        for (size_t i = 0; i < n / sizeof(void *); i++)
             if (!t[i]) ulog("hwd3d_umd: device table entry %u is empty\n", (unsigned)i);
     }
     fill_dxgi(&a->DXGIBaseDDI, a->Interface);
@@ -1886,6 +2064,8 @@ static HRESULT APIENTRY a_GetSupportedVersions(D3D10DDI_HADAPTER, UINT32 *n, UIN
 {
     if (!n) return E_INVALIDARG;
     ulog("hwd3d_umd: GetSupportedVersions (room for %u)\n", *n);
+    /* Windows 11's d3d10core sits on the same runtime as d3d11 and takes this version too (d3d10test). The 10.1 table
+     * below is written and builds, but no runtime asks for it, so it is not offered: add D3D10_1_DDI_SUPPORTED here to try it. */
     if (v && *n >= 1) v[0] = D3DWDDM1_3_DDI_SUPPORTED;
     *n = 1;
     return S_OK;
