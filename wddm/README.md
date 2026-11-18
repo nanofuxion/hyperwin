@@ -592,7 +592,9 @@ object wanted.
   The INF's `VulkanDriverNameWow` names the 32-bit manifest.
 - The start guard (`Attempts` in the service's Parameters key) counted two fast restarts in a row as two
   crashes and kept the adapter off (problem 0x19, status 0xC0000001). A clean stop now clears the count.
-- Done means still open: `gltest` as x86 (needs a 32-bit Zink), `dxtest 12`, the AIO scenes through the driver, DWM on the GPU.
+- `gltest` as x86 passes with a 32-bit Zink beside it (renderer Zink on Mali, pixel 00 ff 00 ff). `use.cmd zink`
+  reads the program's PE header and copies the 32-bit build for i686 programs.
+- Done means still open: `dxtest 12`, the AIO scenes through the driver, DWM on the GPU.
 
 ## Things to check early
 

@@ -72,6 +72,19 @@ zink)
   mkdir -p "$OUT/zink"
   for d in opengl32 libgallium_wgl; do
     "$T/llvm-strip" -o "$OUT/zink/$d.dll" "$(find "$WORK/zink-build/src" -name "$d.dll" | head -1)"
+  done
+  # The same for 32-bit programs: a plain i686 build (gpu/work/x86.ini is written by mesa/build.sh),
+  # with the undecorated export names Windows' own DLLs have.
+  [ -d "$WORK/zink-build-x86" ] || meson setup "$WORK/zink-build-x86" "$WORK/mesa" --cross-file "$WORK/x86.ini" \
+    -Dvulkan-drivers= -Dgallium-drivers=zink -Dplatforms=windows -Dglx=disabled -Degl=disabled \
+    -Dgles1=disabled -Dgles2=disabled -Dopengl=true -Dllvm=disabled -Dvalgrind=disabled \
+    -Dlibunwind=disabled -Dzstd=disabled -Dmicrosoft-clc=disabled -Dspirv-to-dxil=false \
+    -Dbuildtype=release -Db_ndebug=true -Dzlib:default_library=static \
+    "-Dc_link_args=['-static','-Wl,--kill-at']" "-Dcpp_link_args=['-static','-Wl,--kill-at']"
+  ninja -C "$WORK/zink-build-x86"
+  mkdir -p "$OUT/zink-x86"
+  for d in opengl32 libgallium_wgl; do
+    "$T/llvm-strip" -o "$OUT/zink-x86/$d.dll" "$(find "$WORK/zink-build-x86/src" -name "$d.dll" | head -1)"
   done ;;
 esac; done
 ls -laR "$OUT"

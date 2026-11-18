@@ -8,7 +8,8 @@ rem   hwd3d  Direct3D 11 drawn by DXVK on the phone itself (HwD3D, d3d/README.md
 rem   off    takes ours away again, so the program uses Windows' own
 rem   use.cmd <layer> <program.exe or its folder> ...
 rem Explorer has these under Send To. Layers add up: dxvk then vkd3d gives both. Windows' own files
-rem are never touched. The DLLs are ARM64X: ARM64 and x64 programs both work, 32-bit ones do not.
+rem are never touched. The DLLs are ARM64X: ARM64 and x64 programs both work. A 32-bit program given by
+rem its file name gets the 32-bit Zink (OpenGL); the Direct3D layers are not built for 32-bit yet.
 setlocal EnableExtensions
 set "LAYERS=%~dp0"
 set "MODE=%~1"
@@ -21,6 +22,13 @@ shift
 if "%~1"=="" exit /b 0
 if exist "%~1\*" (set "DEST=%~f1") else set "DEST=%~dp1."
 for %%d in ("%DEST%") do set "DEST=%%~fd"
+set "ZK=zink"
+if not exist "%~1\*" if exist "%~1" for /f %%m in ('powershell -NoProfile -Command "$f=[IO.File]::OpenRead('%~f1');$b=New-Object byte[] 4096;[void]$f.Read($b,0,4096);$f.Close();[BitConverter]::ToUInt16($b,[BitConverter]::ToInt32($b,60)+4)"') do if "%%m"=="332" set "ZK=zink-x86"
+if "%ZK%"=="zink-x86" if not "%MODE%"=="zink" if not "%MODE%"=="off" (
+  echo %~1 is a 32-bit program: only zink and off are built for it.
+  shift
+  goto each
+)
 call :%MODE% "%DEST%" 2>nul || (
   echo Unknown layer "%MODE%". Use dxvk, sarek, vkd3d, zink, hwd3d or off.
   exit /b 1
@@ -45,7 +53,7 @@ echo vkd3d-proton: Direct3D 12 in %~1
 exit /b 0
 
 :zink
-for %%f in (opengl32 libgallium_wgl) do copy /y "%LAYERS%zink\%%f.dll" "%~1\" >nul
+for %%f in (opengl32 libgallium_wgl) do copy /y "%LAYERS%%ZK%\%%f.dll" "%~1\" >nul
 echo Zink: OpenGL in %~1
 exit /b 0
 
@@ -56,7 +64,7 @@ exit /b 0
 
 :off
 rem Only our own copies go. A program's own file with one of these names stays.
-for %%l in (dxvk sarek vkd3d zink hwd3d) do for %%f in ("%LAYERS%%%l\*.dll") do (
+for %%l in (dxvk sarek vkd3d zink zink-x86 hwd3d) do for %%f in ("%LAYERS%%%l\*.dll") do (
   if exist "%~1\%%~nxf" fc /b "%%~f" "%~1\%%~nxf" >nul && del "%~1\%%~nxf"
 )
 echo Windows' own graphics in %~1

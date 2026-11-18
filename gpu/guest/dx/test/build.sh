@@ -10,4 +10,7 @@ for a in aarch64:arm64 x86_64:x64; do
   "$T/${a%%:*}-w64-mingw32-clang++" -O1 -static -o "$OUT/dxtest-${a##*:}.exe" "$HERE/dxtest.cpp" -ld3d11 -ld3d12 -ldxgi
   "$T/${a%%:*}-w64-mingw32-clang" -O1 -o "$OUT/gltest-${a##*:}.exe" "$HERE/gltest.c" -lopengl32 -lgdi32
 done
+# 32-bit programs: Direct3D 11 and OpenGL checks as i686 (Direct3D 12 needs a 64-bit Windows 10 runtime).
+"$T/i686-w64-mingw32-clang++" -O1 -static -o "$OUT/dxtest-x86.exe" "$HERE/dxtest.cpp" -ld3d11 -ld3d12 -ldxgi
+"$T/i686-w64-mingw32-clang" -O1 -o "$OUT/gltest-x86.exe" "$HERE/gltest.c" -lopengl32 -lgdi32
 ls -la "$OUT"

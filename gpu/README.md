@@ -206,7 +206,7 @@ with `--kill-at`, or the loader cannot find `vk_icdGetInstanceProcAddr`) found t
 keeps Mesa off its x86 paths there, and gives Mesa's optional entry points `/alternatename`
 fallbacks in the ARM64EC half, since lld resolves weak symbols there to NULL.
 
-Direct3D and OpenGL go over Vulkan, per program (`guest/dx/build.sh`, in `C:\HyperWin\gpu\dx`):
+Direct3D and OpenGL go over Vulkan, per program (`guest/dx/build.sh`, in `C:\HyperWin\gpu\dx`; Zink also as `zink-x86` for 32-bit programs):
 DXVK 3.1.1 (Direct3D 8 to 11), DXVK-Sarek 1.14.1 (the same, DXVK 1.10 carried on for Vulkan 1.1 and
 mobile GPUs; it runs on Mali without Vortek, though slower here: the D3D11 cube at 26 FPS bare, 34 with
 Vortek, against DXVK's 50), vkd3d-proton 3.1 (Direct3D 12, with DXVK's `dxgi.dll`) and Mesa Zink
