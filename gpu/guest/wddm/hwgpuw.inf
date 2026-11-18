@@ -1,0 +1,63 @@
+; HyperWin GPU: a render-only WDDM adapter (wddm/README.md). One root device, ROOT\HwGpuAdapter. Like Windows'
+; own Basic Render Driver it is in the System class: the Display class expects screens.
+; The Vulkan driver is registered on the adapter (VulkanDriverName) instead of in Khronos' global key.
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %Mfg%
+CatalogFile = hwgpuw.cat
+DriverVer   = 11/18/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+Hw.Miniport = 13
+Hw.Vulkan   = 13
+
+[SourceDisksNames]
+1 = %Disk%,,,
+
+[SourceDisksFiles]
+hwgpuw.sys        = 1
+vulkan_hwgpu.dll  = 1
+vulkan_hwgpu.json = 1
+
+[Manufacturer]
+%Mfg% = Hw, NTarm64
+
+[Hw.NTarm64]
+%Desc% = Install, Root\HwGpuAdapter
+
+[Install.NT]
+FeatureScore = FB
+CopyFiles = Hw.Miniport, Hw.Vulkan
+AddReg    = Install.AddReg
+
+[Hw.Miniport]
+hwgpuw.sys,,,0x100
+
+[Hw.Vulkan]
+vulkan_hwgpu.dll,,,0x100
+vulkan_hwgpu.json,,,0x100
+
+[Install.NT.Services]
+AddService = hwgpuw, 0x00000002, Hw.Service
+
+[Hw.Service]
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 0
+LoadOrderGroup = Video
+ServiceBinary  = %13%\hwgpuw.sys
+
+[Install.AddReg]
+HKR,,VulkanDriverName,0,"%13%\vulkan_hwgpu.json"
+; The Direct3D driver part is not built yet; Windows wants the names (wddm/README.md phase 4).
+HKR,,UserModeDriverName,0x00010000,"hwd3d_umd.dll"
+HKR,,UserModeDriverNameWow,0x00010000,"hwd3d_umd_x86.dll"
+HKR,,InstalledDisplayDrivers,0x00010000,"hwd3d_umd"
+
+[Strings]
+Mfg  = "HyperWin"
+Disk = "HyperWin GPU"
+Desc = "HyperWin GPU"

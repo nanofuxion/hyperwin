@@ -62,10 +62,10 @@ index cdb4369..530a66c 100644
 +__attribute__((weak)) void virtGpuHostMemoryWasWritten() {}
 +#endif
 diff --git a/src/gfxstream/guest/platform/include/VirtGpu.h b/src/gfxstream/guest/platform/include/VirtGpu.h
-index 68885b3..558f905 100644
+index 68885b3..0ab1b6f 100644
 --- a/src/gfxstream/guest/platform/include/VirtGpu.h
 +++ b/src/gfxstream/guest/platform/include/VirtGpu.h
-@@ -202,6 +202,22 @@ class VirtGpuDevice {
+@@ -202,6 +202,24 @@ class VirtGpuDevice {
      enum VirtGpuCapset mCapset;
  };
  
@@ -81,8 +81,10 @@ index 68885b3..558f905 100644
 +#if defined(_WIN32)
 +// HyperWin scanout (sgpu_proto.h SGPU_CMD_SCANOUT), for the win32 WSI.
 +bool virtGpuScanoutSupported();                                         // the phone offers it
-+int virtGpuScanout(uint32_t resourceId, uint32_t index, uint32_t seq);  // resource 0 hides; 0 or -EIO
++int virtGpuScanout(uint32_t resourceId, uint32_t index, uint32_t seq,
++                   uint32_t flags = 0);  // resource 0 hides; flags SGPU_SCANOUT_*; 0 or -EIO
 +uint32_t virtGpuScanoutFree(uint32_t index);  // seq of the last show of index the screen let go of
++bool virtGpuScanoutVsync();  // the phone wants every scanout frame paced to its screen
 +#endif
 +
  VirtGpuDevice* kumquatCreateVirtGpuDevice(enum VirtGpuCapset capset = kCapsetNone, int fd = -1);
@@ -104,10 +106,10 @@ index dd98ef4..2e388f4 100644
  
  }  // namespace gfxstream
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
-index 476a2cd..20b1c68 100644
+index 476a2cd..224bb0c 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
-@@ -3,15 +3,100 @@
+@@ -3,15 +3,103 @@
   * SPDX-License-Identifier: MIT
   */
  
@@ -172,11 +174,13 @@ index 476a2cd..20b1c68 100644
 +    // SGPU_CMD_SCANOUT: whether the phone offered it, and what it let go of (hwgpu_ring.h).
 +    bool scanout() const { return mScanout; }
 +    uint32_t scanoutFree(uint32_t index) const;
++    uint32_t scanoutFlags() const;
 +
 +   private:
 +    // The \\.\HwGpu handle stays open for the life of the process; closing it frees the channel.
 +    HwgpuConnection(void* dev, void* chan, uint32_t slot, uint32_t generation)
 +        : mDev(dev), mChan(chan), mSlot(slot), mGeneration(generation) {}
++    void setAdapter(struct hww* a) { mAdapter = a; }
 +    bool hello();
 +    std::vector<uint8_t> callLocked(const void* req, size_t len, const void* tail,
 +                                    size_t tail_len);
@@ -186,7 +190,8 @@ index 476a2cd..20b1c68 100644
 +        std::vector<uint8_t> last;  // contents at the last sync
 +    };
 +
-+    void* mDev;  // the \\.\HwGpu handle
++    void* mDev;  // the \\.\HwGpu handle (legacy), or none
++    struct hww* mAdapter = nullptr;  // the WDDM adapter, when the channel came from it
 +    void* mChan;
 +    uint32_t mSlot;
 +    uint32_t mGeneration;
@@ -210,7 +215,7 @@ index 476a2cd..20b1c68 100644
      ~WindowsVirtGpuResource();
  
      void intoRaw() override;
-@@ -27,13 +112,17 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
+@@ -27,13 +115,17 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
      int transferToHost(uint32_t x, uint32_t y, uint32_t w, uint32_t h) override;
  
     private:
@@ -232,7 +237,7 @@ index 476a2cd..20b1c68 100644
  };
  
  class WindowsVirtGpuResourceMapping : public VirtGpuResourceMapping {
-@@ -54,19 +143,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
+@@ -54,19 +146,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
      WindowsVirtGpuDevice(enum VirtGpuCapset capset, int fd = -1);
      virtual ~WindowsVirtGpuDevice();
  
@@ -455,10 +460,10 @@ index 9113d96..39ea41a 100644
 +    return transfer(false, x, y, w, h);
  }
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-index 9d8b83b..87f08d8 100644
+index 9d8b83b..014c97a 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-@@ -3,37 +3,481 @@
+@@ -3,37 +3,519 @@
   * SPDX-License-Identifier: MIT
   */
  
@@ -469,6 +474,7 @@ index 9d8b83b..87f08d8 100644
 +
  #include "WindowsVirtGpu.h"
 +#include "hwgpu_ioctl.h"
++#include "hww_user.h"
 +#include "hwgpu_ring.h"
 +#include "sgpu_proto.h"
 +#include <stdio.h>
@@ -479,27 +485,41 @@ index 9d8b83b..87f08d8 100644
 +    static std::once_flag once;
 +    static HwgpuConnection* conn = nullptr;
 +    std::call_once(once, [] {
-+        HANDLE dev = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-+                                 OPEN_EXISTING, 0, nullptr);
-+        if (dev == INVALID_HANDLE_VALUE) {
-+            mesa_loge("hwgpu: no \\\\.\\HwGpu (error %lu); is hwgpu.sys running?", GetLastError());
-+            return;
-+        }
++        // The WDDM adapter first (include/hw_wddm.h): D3DKMTEscape maps the channel. Without it, the
++        // legacy \\.\HwGpu device (hwgpu.sys).
++        HANDLE dev = INVALID_HANDLE_VALUE;
 +        hwgpu_open_out out = {};
-+        DWORD got = 0;
-+        if (!DeviceIoControl(dev, IOCTL_HWGPU_OPEN, nullptr, 0, &out, sizeof(out), &got, nullptr) ||
-+            got != sizeof(out)) {
-+            mesa_loge("hwgpu: no GPU channel (error %lu)", GetLastError());
-+            CloseHandle(dev);
-+            return;
++        auto* w = new hww();
++        struct hww_open wo;
++        if (hww_open(w) && hww_open_channel(w, &wo) >= 0) {
++            out.chan = wo.chan;
++            out.slot = wo.slot;
++            out.generation = wo.generation;
++        } else {
++            delete w;
++            w = nullptr;
++            dev = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
++                              OPEN_EXISTING, 0, nullptr);
++            if (dev == INVALID_HANDLE_VALUE) {
++                mesa_loge("hwgpu: no HyperWin GPU adapter and no \\\\.\\HwGpu (error %lu)", GetLastError());
++                return;
++            }
++            DWORD got = 0;
++            if (!DeviceIoControl(dev, IOCTL_HWGPU_OPEN, nullptr, 0, &out, sizeof(out), &got, nullptr) ||
++                got != sizeof(out)) {
++                mesa_loge("hwgpu: no GPU channel (error %lu)", GetLastError());
++                CloseHandle(dev);
++                return;
++            }
 +        }
 +        void* chan = reinterpret_cast<void*>(uintptr_t(out.chan));
 +        // The phone answers within one pass of its loop; give it a few seconds.
 +        for (int i = 0; i < 3000 && !hwgpu_alive(hwgpu_chan_ctl(chan), out.generation); i++) Sleep(1);
 +        auto* c = new HwgpuConnection(dev, chan, out.slot, out.generation);
++        c->setAdapter(w);
 +        if (!hwgpu_alive(hwgpu_chan_ctl(chan), out.generation) || !c->hello()) {
 +            mesa_loge("hwgpu: the phone did not answer on channel %u", out.slot);
-+            CloseHandle(dev);
++            if (dev != INVALID_HANDLE_VALUE) CloseHandle(dev);
 +            delete c;
 +            return;
 +        }
@@ -661,7 +681,12 @@ index 9d8b83b..87f08d8 100644
 +    hwgpu_map_in in = {offset, size};
 +    hwgpu_map_out out = {};
 +    DWORD got = 0;
-+    if (!DeviceIoControl(mDev, IOCTL_HWGPU_MAP, &in, sizeof(in), &out, sizeof(out), &got, nullptr) ||
++    if (mAdapter) {
++        uint64_t user = 0;
++        if (hww_map(mAdapter, mSlot, in.offset, in.size, &user) < 0) user = 0;
++        out.user = user;
++        got = user ? sizeof(out) : 0;
++    } else if (!DeviceIoControl(mDev, IOCTL_HWGPU_MAP, &in, sizeof(in), &out, sizeof(out), &got, nullptr) ||
 +        got != sizeof(out)) {
 +        mesa_loge("hwgpu: heap map at 0x%llx failed (error %lu)", (unsigned long long)offset, GetLastError());
 +        return nullptr;
@@ -672,7 +697,15 @@ index 9d8b83b..87f08d8 100644
 +void HwgpuConnection::unmapHeap(void* p) {
 +    hwgpu_map_out in = {uint64_t(uintptr_t(p))};
 +    DWORD got = 0;
-+    DeviceIoControl(mDev, IOCTL_HWGPU_UNMAP, &in, sizeof(in), nullptr, 0, &got, nullptr);
++    if (mAdapter) {
++        hww_escape e = {};
++        e.op = HWW_ESC_UNMAP;
++        e.u.map.slot = mSlot;
++        e.u.map.user = in.user;
++        hww_call(mAdapter, &e);
++    } else {
++        DeviceIoControl(mDev, IOCTL_HWGPU_UNMAP, &in, sizeof(in), nullptr, 0, &got, nullptr);
++    }
 +}
 +
 +uint32_t HwgpuConnection::scanoutFree(uint32_t index) const {
@@ -684,7 +717,7 @@ index 9d8b83b..87f08d8 100644
 +    return c && c->scanout();
 +}
 +
-+int virtGpuScanout(uint32_t resourceId, uint32_t index, uint32_t seq) {
++int virtGpuScanout(uint32_t resourceId, uint32_t index, uint32_t seq, uint32_t flags) {
 +    auto* c = HwgpuConnection::get();
 +    if (!c) return -EIO;
 +    sgpu_scanout s = {};
@@ -692,12 +725,22 @@ index 9d8b83b..87f08d8 100644
 +    s.resource_id = resourceId;
 +    s.index = index;
 +    s.seq = seq;
++    s.flags = flags;
 +    return c->simple(&s, sizeof(s));
 +}
 +
 +uint32_t virtGpuScanoutFree(uint32_t index) {
 +    auto* c = HwgpuConnection::get();
 +    return c && index < HWGPU_SCANOUT_BUFFERS ? c->scanoutFree(index) : 0;
++}
++
++uint32_t HwgpuConnection::scanoutFlags() const {
++    return *reinterpret_cast<volatile uint32_t*>(&hwgpu_chan_ctl(mChan)->scanout_flags);
++}
++
++bool virtGpuScanoutVsync() {
++    auto* c = HwgpuConnection::get();
++    return c && (c->scanoutFlags() & HWGPU_SCANOUT_VSYNC);
 +}
 +
 +void HwgpuConnection::addMirror(uint32_t resourceId, uint8_t* local, size_t size) {
@@ -973,10 +1016,10 @@ index cce4cf1..8e358c4 100644
      VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
  };
 diff --git a/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp b/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp
-index f45a199..4aa0d49 100644
+index f45a199..854b94f 100644
 --- a/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp
 +++ b/src/gfxstream/guest/vulkan/gfxstream_vk_wsi.cpp
-@@ -7,6 +7,69 @@
+@@ -7,6 +7,73 @@
  #include "gfxstream_vk_private.h"
  #include "wsi_common.h"
  
@@ -1034,19 +1077,23 @@ index f45a199..4aa0d49 100644
 +    sScanoutResources.erase(it);
 +}
 +
-+static VkResult hwgpu_scanout_present(VkDevice, uint32_t resource, uint32_t index, uint32_t seq) {
-+    return virtGpuScanout(resource, index, seq) ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
++static VkResult hwgpu_scanout_present(VkDevice, uint32_t resource, uint32_t index, uint32_t seq,
++                                      bool vsync) {
++    return virtGpuScanout(resource, index, seq, vsync ? 1u /* SGPU_SCANOUT_VSYNC */ : 0) ? VK_ERROR_SURFACE_LOST_KHR
++                                                                                 : VK_SUCCESS;
 +}
 +
 +static uint32_t hwgpu_scanout_released(VkDevice, uint32_t index) {
 +    return virtGpuScanoutFree(index);
 +}
++
++static bool hwgpu_scanout_vsync(VkDevice) { return virtGpuScanoutVsync(); }
 +#endif
 +
  static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
  gfxstream_vk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char* pName) {
      VK_FROM_HANDLE(gfxstream_vk_physical_device, pdevice, physicalDevice);
-@@ -17,8 +80,9 @@ VkResult gfxstream_vk_wsi_init(struct gfxstream_vk_physical_device* physical_dev
+@@ -17,8 +84,9 @@ VkResult gfxstream_vk_wsi_init(struct gfxstream_vk_physical_device* physical_dev
      VkResult result = (VkResult)0;
  
      const struct wsi_device_options options = {
@@ -1057,7 +1104,7 @@ index f45a199..4aa0d49 100644
          .sw_device = true,
  #else
          .sw_device = false,
-@@ -34,6 +98,14 @@ VkResult gfxstream_vk_wsi_init(struct gfxstream_vk_physical_device* physical_dev
+@@ -34,6 +102,15 @@ VkResult gfxstream_vk_wsi_init(struct gfxstream_vk_physical_device* physical_dev
      // Support wsi_image_create_info::scanout
      physical_device->wsi_device.supports_scanout = true;
  
@@ -1067,6 +1114,7 @@ index f45a199..4aa0d49 100644
 +    physical_device->wsi_device.win32.hwgpu_scanout_free = hwgpu_scanout_free;
 +    physical_device->wsi_device.win32.hwgpu_scanout_present = hwgpu_scanout_present;
 +    physical_device->wsi_device.win32.hwgpu_scanout_released = hwgpu_scanout_released;
++    physical_device->wsi_device.win32.hwgpu_scanout_vsync = hwgpu_scanout_vsync;
 +#endif
 +
      physical_device->base.wsi_device = &physical_device->wsi_device;
@@ -1455,10 +1503,10 @@ index e7e077f..c1945e3 100644
     img_mem_barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     img_mem_barriers[0].dstAccessMask = 0;
 diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
-index fef8aee..f51ef6c 100644
+index fef8aee..f1856e8 100644
 --- a/src/vulkan/wsi/wsi_common.h
 +++ b/src/vulkan/wsi/wsi_common.h
-@@ -149,6 +149,22 @@ struct wsi_device {
+@@ -149,6 +149,24 @@ struct wsi_device {
        VkResult (*create_image_memory)(VkDevice device, void *resource,
                                        const VkAllocationCallbacks *alloc,
                                        VkDeviceMemory *out);
@@ -1475,13 +1523,15 @@ index fef8aee..f51ef6c 100644
 +      void (*hwgpu_scanout_free)(VkDevice device, uint32_t resource);
 +      /* Shows resource as buffer index for the seq-th time. Resource 0 hides the layer. */
 +      VkResult (*hwgpu_scanout_present)(VkDevice device, uint32_t resource, uint32_t index,
-+                                        uint32_t seq);
++                                        uint32_t seq, bool vsync);
 +      /* The seq of the last show of buffer index that the screen has let go of. */
 +      uint32_t (*hwgpu_scanout_released)(VkDevice device, uint32_t index);
++      /* The phone wants every scanout frame paced to its screen, whatever the present mode. */
++      bool (*hwgpu_scanout_vsync)(VkDevice device);
     } win32;
  
     struct {
-@@ -218,6 +234,7 @@ struct wsi_device {
+@@ -218,6 +236,7 @@ struct wsi_device {
     WSI_CB(BindImageMemory);
     WSI_CB(BeginCommandBuffer);
     WSI_CB(CmdPipelineBarrier);
@@ -1513,7 +1563,7 @@ index 58b592a..68714f1 100644
     wsi_memory_type_select_cb select_blit_dst_memory_type;
  
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 0622857..22f5e02 100644
+index 0622857..2b3afd8 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
 @@ -27,6 +27,8 @@
@@ -1708,11 +1758,15 @@ index 0622857..22f5e02 100644
  VkResult
  wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
                           const VkSwapchainCreateInfoKHR *pCreateInfo,
-@@ -547,7 +662,10 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+@@ -547,7 +662,14 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
     if (result != VK_SUCCESS)
        return result;
  
 -   info->create_mem = wsi_create_dxgi_image_mem;
++   /* wsi_configure_image starts from a cleared info, which the image blit checks. */
++   info->image_type = WSI_IMAGE_TYPE_DXGI;
++   info->color_space = pCreateInfo->imageColorSpace;
++
 +   info->create_mem = params->hwgpu_scanout ? wsi_create_hwgpu_scanout_mem :
 +                                              wsi_create_dxgi_image_mem;
 +   info->blit_convert = params->hwgpu_scanout &&
@@ -1720,7 +1774,7 @@ index 0622857..22f5e02 100644
  
     if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
        wsi_configure_image_blit_image(chain, info);
-@@ -567,14 +685,19 @@ wsi_win32_image_init(VkDevice device_h,
+@@ -567,14 +689,19 @@ wsi_win32_image_init(VkDevice device_h,
  {
     VkResult result = wsi_create_image(&chain->base, &chain->base.image_info,
                                        &image->base);
@@ -1742,7 +1796,7 @@ index 0622857..22f5e02 100644
        return VK_SUCCESS;
  
     chain->chain_dc = GetDC(chain->wnd);
-@@ -616,6 +739,18 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
+@@ -616,6 +743,18 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
     if(image->sw.bmp)
        DeleteObject(image->sw.bmp);
     wsi_destroy_image(&chain->base, &image->base);
@@ -1756,12 +1810,12 @@ index 0622857..22f5e02 100644
 +{
 +   if (chain->surface->scanout_chain != chain)
 +      return;
-+   chain->wsi->wsi->win32.hwgpu_scanout_present(chain->base.device, 0, 0, 0);
++   chain->wsi->wsi->win32.hwgpu_scanout_present(chain->base.device, 0, 0, 0, false);
 +   chain->surface->scanout_chain = NULL;
  }
  
  static VkResult
-@@ -625,6 +760,9 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+@@ -625,6 +764,9 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
     struct wsi_win32_swapchain *chain =
        (struct wsi_win32_swapchain *) drv_chain;
  
@@ -1771,7 +1825,7 @@ index 0622857..22f5e02 100644
     for (uint32_t i = 0; i < chain->base.image_count; i++)
        wsi_win32_image_finish(chain, allocator, &chain->images[i]);
  
-@@ -742,6 +880,50 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
+@@ -742,6 +884,61 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
     return result;
  }
  
@@ -1811,18 +1865,29 @@ index 0622857..22f5e02 100644
 +         return VK_NOT_READY;
 +      if (os_time_get_nano() >= abs_timeout)
 +         return VK_TIMEOUT;
-+      /* Nothing wakes us when the phone lets go of a buffer; that takes about a frame. */
-+      if (spins < 64)
++      /* Nothing wakes us when the phone lets go of a buffer; that takes about a frame. Sleep(1)
++       * lasts a whole timer tick, often 15.6 ms, so longer waits use a high-resolution timer. */
++      if (spins < 64) {
 +         SwitchToThread();
-+      else
-+         Sleep(1);
++      } else {
++         static __thread HANDLE timer;
++         if (!timer)
++            timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                           TIMER_ALL_ACCESS);
++         LARGE_INTEGER due;
++         due.QuadPart = -2000;   /* 200 us */
++         if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
++            WaitForSingleObject(timer, INFINITE);
++         else
++            Sleep(1);
++      }
 +   }
 +}
 +
  static VkResult
  wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
                               const VkAcquireNextImageInfoKHR *info,
-@@ -754,6 +936,9 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+@@ -754,6 +951,9 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
     if (chain->status != VK_SUCCESS)
        return chain->status;
  
@@ -1832,7 +1897,7 @@ index 0622857..22f5e02 100644
     /* acquire timeout has to be explicitly handled for sw wsi */
     if (!chain->dxgi)
        return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
-@@ -823,6 +1008,94 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
+@@ -823,6 +1023,101 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
     return VK_SUCCESS;
  }
  
@@ -1911,8 +1976,15 @@ index 0622857..22f5e02 100644
 +   /* wsi_common_queue_present waited for this image's blit (a sw device always does), so the
 +    * buffer holds the whole frame. */
 +   uint32_t seq = chain->wsi->scanout.seq[image_index] + 1;
++   /* FIFO is the program asking for vsync, and the phone may ask for it for every program: then
++    * the phone shows every frame for at least one refresh, in order, and the program waits for
++    * buffers at the screen's pace. Otherwise a newer frame replaces one not yet shown, and the
++    * program draws as fast as it can. The phone's compositor never tears either way. */
++   bool vsync = chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ||
++                chain->base.present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
++                (wsi->win32.hwgpu_scanout_vsync && wsi->win32.hwgpu_scanout_vsync(chain->base.device));
 +   if (wsi->win32.hwgpu_scanout_present(chain->base.device, image->scanout.resource,
-+                                        image_index, seq) != VK_SUCCESS) {
++                                        image_index, seq, vsync) != VK_SUCCESS) {
 +      chain->wsi->scanout.broken = true;
 +      wsi_win32_set_image_idle(chain, image);
 +      chain->status = VK_ERROR_OUT_OF_DATE_KHR;
@@ -1927,7 +1999,7 @@ index 0622857..22f5e02 100644
  static VkResult
  wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                          uint32_t image_index,
-@@ -837,6 +1110,8 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+@@ -837,6 +1132,8 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
  
     if (chain->dxgi)
        return wsi_win32_queue_present_dxgi(chain, image, damage);
@@ -1936,7 +2008,7 @@ index 0622857..22f5e02 100644
  
     char *ptr = (char *)image->base.cpu_map;
     char *dptr = (char *)image->sw.ppvBits;
-@@ -851,6 +1126,13 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+@@ -851,6 +1148,13 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
  
     wsi_win32_set_image_idle(chain, image);
  
@@ -1950,7 +2022,7 @@ index 0622857..22f5e02 100644
     return chain->status;
  }
  
-@@ -929,12 +1211,14 @@ wsi_win32_surface_create_swapchain_dxgi(
+@@ -929,12 +1233,14 @@ wsi_win32_surface_create_swapchain_dxgi(
  }
  
  static VkResult
@@ -1966,7 +2038,7 @@ index 0622857..22f5e02 100644
     struct wsi_swapchain **swapchain_out)
  {
     wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
-@@ -972,6 +1256,7 @@ wsi_win32_surface_create_swapchain(
+@@ -972,6 +1278,7 @@ wsi_win32_surface_create_swapchain(
        { WSI_IMAGE_TYPE_DXGI },
     };
     dxgi_image_params.storage_image = (image_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
@@ -1974,7 +2046,7 @@ index 0622857..22f5e02 100644
  
     struct wsi_cpu_image_params cpu_image_params = {
        { WSI_IMAGE_TYPE_CPU },
-@@ -980,7 +1265,7 @@ wsi_win32_surface_create_swapchain(
+@@ -980,7 +1287,7 @@ wsi_win32_surface_create_swapchain(
     bool supports_dxgi = wsi->dxgi.factory &&
                          wsi->dxgi.dcomp &&
                          wsi->wsi->win32.get_d3d12_command_queue;
@@ -1983,7 +2055,7 @@ index 0622857..22f5e02 100644
        &dxgi_image_params.base : &cpu_image_params.base;
  
     VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
-@@ -1005,8 +1290,10 @@ wsi_win32_surface_create_swapchain(
+@@ -1005,8 +1312,10 @@ wsi_win32_surface_create_swapchain(
     chain->status = VK_SUCCESS;
  
     chain->surface = surface;
@@ -1995,7 +2067,7 @@ index 0622857..22f5e02 100644
        result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
        if (result != VK_SUCCESS)
           goto fail;
-@@ -1036,6 +1323,33 @@ fail:
+@@ -1036,6 +1345,33 @@ fail:
     return result;
  }
  

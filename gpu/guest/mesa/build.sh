@@ -20,7 +20,7 @@ if [ ! -d "$SRC/.git" ]; then
   git -C "$SRC" apply "$HERE/windows.patch"
 fi
 mkdir -p "$SRC/src/gfxstream/guest/platform/windows/hwgpu"
-cp "$ROOT/gpu/include/"{hwgpu_ring.h,hwgpu_ioctl.h,sgpu_proto.h} "$SRC/src/gfxstream/guest/platform/windows/hwgpu/"
+cp "$ROOT/gpu/include/"{hwgpu_ring.h,hwgpu_ioctl.h,sgpu_proto.h} "$ROOT/include/"{hw_wddm.h,hww_user.h} "$SRC/src/gfxstream/guest/platform/windows/hwgpu/"
 
 "$HERE/../arm64x/cross.sh" "$WORK/arm64x.ini"
 # --gc-sections and vk_util.c's SPIR-V helpers: see the vulkan/meson.build hunk in windows.patch.

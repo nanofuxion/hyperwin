@@ -9,6 +9,9 @@
 //   - SGPU_CMD_SCANOUT puts a ColorBuffer's AHardwareBuffer on a layer of the phone's compositor
 //     (one the app process owns and lends to this renderer), so GPU frames never reach the CPU.
 
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan_core.h>
+
 #include "hwgpu_host.h"
 
 #include <hw_d3d.h>
@@ -749,6 +752,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
                 e.offset > it->second.size || e.len > it->second.size - e.offset)
                 return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
             memcpy(it->second.hva + e.offset, m.data() + at, e.len);
+            __atomic_add_fetch(&hwgpu_hdr(g_window)->copy_from_guest, e.len, __ATOMIC_RELAXED);
             memcpy(it->second.last.data() + e.offset, m.data() + at, e.len);
             at += e.len;
         }
@@ -788,6 +792,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
             }
         }
         st_out += out.size();
+        __atomic_add_fetch(&hwgpu_hdr(g_window)->copy_to_guest, out.size() - sizeof(vgpu_hdr), __ATOMIC_RELAXED);
         return send_msg(l, out.data(), out.size());
     }
     case SGPU_CMD_PRESENT: {
@@ -980,6 +985,33 @@ void serve_loop() {
 
 extern "C" void gfxstream_set_host_memory_allocator(void* (*alloc)(size_t, size_t), int (*release)(void*));
 
+// The first Vulkan device's name, asked of the phone's own driver, for the adapter's name in Windows.
+void gpu_name(char* out, size_t size) {
+    snprintf(out, size, "Phone GPU");
+#ifdef __ANDROID__
+    void* lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return;
+    auto create = reinterpret_cast<PFN_vkCreateInstance>(dlsym(lib, "vkCreateInstance"));
+    auto get = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr"));
+    if (!create || !get) return;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "hwgpu", 1, "hwgpu", 1, VK_API_VERSION_1_0};
+    VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &app};
+    VkInstance inst = nullptr;
+    if (create(&ci, nullptr, &inst) != VK_SUCCESS || !inst) return;
+    auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(get(inst, "vkEnumeratePhysicalDevices"));
+    auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(get(inst, "vkGetPhysicalDeviceProperties"));
+    auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(get(inst, "vkDestroyInstance"));
+    uint32_t n = 1;
+    VkPhysicalDevice dev = nullptr;
+    if (enumerate && props && enumerate(inst, &n, &dev) >= 0 && n >= 1 && dev) {
+        VkPhysicalDeviceProperties p{};
+        props(dev, &p);
+        snprintf(out, size, "%s", p.deviceName);
+    }
+    if (destroy) destroy(inst, nullptr);
+#endif
+}
+
 int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_bytes, uint32_t renderer_flags,
                      uint32_t width, uint32_t height) {
     if (!window || window_bytes < HWGPU_RING_OFF + HWGPU_RING_BYTES) return -EINVAL;
@@ -1084,6 +1116,13 @@ int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_
     h->channels = HWGPU_CHANNELS;
     h->tx_bytes = HWGPU_TX_BYTES;
     h->rx_bytes = HWGPU_RX_BYTES;
+    // A value no earlier renderer had, so the WDDM adapter can tell a restart (a driver swap).
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    __atomic_store_n(&h->epoch, (uint64_t(ts.tv_sec) << 32) ^ uint64_t(ts.tv_nsec) ^ (uint64_t(getpid()) << 16),
+                     __ATOMIC_RELEASE);
+    h->copy_to_guest = h->copy_from_guest = 0;
+    gpu_name(h->gpu_name, sizeof h->gpu_name);
     __atomic_store_n(&h->magic, HWGPU_MAGIC, __ATOMIC_RELEASE);
 
     g_run = true;

@@ -58,6 +58,14 @@ struct hwgpu_ring_hdr {
     uint32_t tx_bytes;
     uint32_t rx_bytes;
     uint32_t host_tick;  /* the phone bumps it while its server runs */
+    uint32_t reserved;
+    /* phone: a value that differs for every renderer process. The WDDM adapter sees it change
+     * when a driver swap restarts the renderer, and resets (wddm/README.md). */
+    uint64_t epoch;
+    char gpu_name[64];   /* phone: the GPU's name, for the adapter's name in Windows */
+    /* phone: bytes it copied into / out of guest memory to keep a resource in step (the sgpu sync
+     * path: memory that could not be shared). The counters of wddm/README.md. */
+    uint64_t copy_to_guest, copy_from_guest;
 };
 
 /* First page of each channel. */

@@ -51,6 +51,14 @@ for d in hwaudio hwhid; do
   mkdir -p "$OUT/guest/gpu/$d"
   cp "$ROOT/build/$d/$d.sys" "$ROOT/build/$d/$d.inf" "$OUT/guest/gpu/$d/"
 done
+# The render-only GPU adapter's package (wddm/README.md): driver, INF, and the Vulkan driver the INF
+# registers. Built here when its sources changed (the WDK headers are fetched into gpu/work, never kept).
+for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROOT"/include/hw_wddm.h "$ROOT"/gpu/include/hwgpu_ring.h; do
+  [ "$ROOT/build/hwgpuw/pkg/hwgpuw.sys" -nt "$f" ] || { sh "$ROOT/gpu/guest/wddm/build.sh" >/dev/null; break; }
+done
+mkdir -p "$OUT/guest/gpu/hwgpuw"
+cp "$ROOT"/build/hwgpuw/pkg/* "$OUT/guest/gpu/hwgpuw/"
+[ -f "$ROOT/build/hwwtest.exe" ] && cp "$ROOT/build/hwwtest.exe" "$OUT/guest/gpu/"
 # Phone storage as drives: the service and the WinFsp installer it needs.
 [ -f "$ROOT/build/files/hwfiles.exe" ] || sh "$ROOT/guest/files/build.sh"
 cp "$ROOT/build/files/hwfiles.exe" "$ROOT/build/files/winfsp.msi" "$OUT/guest/gpu/"

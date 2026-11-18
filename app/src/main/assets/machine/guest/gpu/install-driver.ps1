@@ -17,8 +17,8 @@ $log = "$src\install.log"
 "$(Get-Date -Format s) install $Name" | Out-File $log
 Remove-Item -Recurse -Force $w -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $w | Out-Null
-Copy-Item "$src\$Name.inf", "$src\$Name.sys" $w
-New-FileCatalog -Path "$w\$Name.inf", "$w\$Name.sys" -CatalogFilePath "$w\$Name.cat" -CatalogVersion 2.0 | Out-Null
+Copy-Item "$src\*" $w -Exclude install.log, *.cat
+New-FileCatalog -Path (Get-ChildItem $w -File).FullName -CatalogFilePath "$w\$Name.cat" -CatalogVersion 2.0 | Out-Null
 $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2("$d\hyperwin-pkg.pfx", 'hyperwin')
 $sig = Set-AuthenticodeSignature -FilePath "$w\$Name.cat" -Certificate $cert -HashAlgorithm SHA256
 "catalog: $($sig.Status)" | Out-File $log -Append

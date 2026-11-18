@@ -1,0 +1,1043 @@
+/* HyperWin GPU, WDDM variant (wddm/README.md): a render-only display miniport. Windows sees one real
+ * graphics adapter, "HyperWin GPU (<the phone's GPU>)". Nothing is drawn here. The adapter exists so
+ * that Windows lists it, so that programs find the user-mode drivers (VulkanDriverName and friends)
+ * through it, and so that each program can ask the kernel for a ring channel to the phone.
+ *
+ *   - D3DKMTEscape (include/hw_wddm.h) claims a channel and maps it, and the shared GPU heap ranges the
+ *     phone grants it, into the calling process. After that, requests are plain memory writes.
+ *   - The scheduler is not in the way: a submission carries at most a marker (a fence the phone is
+ *     writing into the channel's control page), polled with a high-resolution timer only while some
+ *     are pending, and reported to Windows with DxgkCbNotifyInterrupt.
+ *   - A restarted renderer (a driver swap) shows as a new epoch in the ring header. Markers of the old
+ *     one are never completed, so Windows' timeout detection resets the adapter.
+ *
+ * DxgkInitialize is ours: displib.lib is not linked (see wddm/README.md, "Phase 1 findings").
+ * The WDK headers are included from gpu/work/wdk at build time and nothing of them is kept. */
+#include <ntifs.h>
+#include <dispmprt.h>
+
+#include "hw_abi.h"
+#define HWGPU_KERNEL
+#include "hwgpu_ring.h"
+#include "hw_wddm.h"
+
+#define TAG 'wGWH'
+#ifndef MdlMappingNoExecute
+#define MdlMappingNoExecute 0x40000000
+#endif
+
+/* ---- state ---- */
+
+#define MAX_VIEWS 128u
+#define MAX_PENDING 256u
+
+struct view {
+    PMDL mdl;
+    PVOID user;
+    uint64_t offset, size;
+};
+
+/* One channel a process opened. */
+struct chan_ctx {
+    LIST_ENTRY link;
+    PEPROCESS process;     /* referenced */
+    HANDLE pid;
+    int slot;
+    uint32_t generation;
+    PMDL mdl;
+    PVOID user;
+    struct view views[MAX_VIEWS];
+};
+
+struct pending {
+    BOOLEAN used;
+    UINT fence_id, node, engine;
+    uint32_t slot, generation, ring;
+    uint64_t fence, epoch;
+};
+
+struct adapter {
+    PDEVICE_OBJECT pdo;
+    DXGKRNL_INTERFACE dxgk;
+    PVOID ring;            /* kernel mapping of the ring area, offset HWGPU_RING_OFF in the window */
+    PVOID heap;            /* kernel mapping of the shared heap */
+    FAST_MUTEX lock;
+    LIST_ENTRY chans;
+    KSPIN_LOCK pending_lock;
+    struct pending pend[MAX_PENDING];
+    UINT pend_count;
+    PEX_TIMER timer;
+    BOOLEAN timer_on;
+    uint64_t epoch;        /* the renderer's, as the adapter last saw it */
+    volatile LONG completing;
+    UINT last_fence;
+    struct hww_counters counters;
+    WCHAR guard_path[260];
+};
+
+static struct adapter g;
+static BOOLEAN g_notify_set;
+
+static void *window(void) { return (UCHAR *)g.ring - HWGPU_RING_OFF; }
+
+/* ---- the crash-loop breaker ---- */
+
+/* A miniport that bugchecks while it starts would stop Windows booting. DriverEntry counts attempts in
+ * the service's Parameters key and refuses to load when two went wrong in a row; the count is cleared
+ * once the adapter has been up for ten seconds. */
+static ULONG guard_count(BOOLEAN write, ULONG value)
+{
+    HANDLE key = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING path, name;
+    ULONG got = 0;
+    RtlInitUnicodeString(&path, g.guard_path);
+    InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    ULONG disp;
+    if (!NT_SUCCESS(ZwCreateKey(&key, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp))) return 0;
+    RtlInitUnicodeString(&name, L"Attempts");
+    if (write) {
+        ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof value);
+    } else {
+        UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 4];
+        ULONG len = 0;
+        if (NT_SUCCESS(ZwQueryValueKey(key, &name, KeyValuePartialInformation, buf, sizeof buf, &len)) &&
+            ((PKEY_VALUE_PARTIAL_INFORMATION)buf)->DataLength == 4)
+            got = *(ULONG *)((PKEY_VALUE_PARTIAL_INFORMATION)buf)->Data;
+    }
+    ZwClose(key);
+    return got;
+}
+
+/* Ten seconds after a good start the count goes back to zero. A thread does it, because a timer
+ * callback may not touch the registry; it ends early when the device stops. */
+static KEVENT g_guard_stop;
+static PETHREAD g_guard_thread;
+
+static VOID NTAPI guard_thread(PVOID context)
+{
+    (void)context;
+    LARGE_INTEGER wait;
+    wait.QuadPart = -100000000LL;  /* ten seconds */
+    if (KeWaitForSingleObject(&g_guard_stop, Executive, KernelMode, FALSE, &wait) == STATUS_TIMEOUT) {
+        guard_count(TRUE, 0);
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static void guard_start(void)
+{
+    HANDLE th = NULL;
+    KeInitializeEvent(&g_guard_stop, NotificationEvent, FALSE);
+    if (NT_SUCCESS(PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, guard_thread, NULL))) {
+        ObReferenceObjectByHandle(th, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)&g_guard_thread, NULL);
+        ZwClose(th);
+    }
+}
+
+static void guard_stop(void)
+{
+    if (!g_guard_thread) return;
+    KeSetEvent(&g_guard_stop, IO_NO_INCREMENT, FALSE);
+    KeWaitForSingleObject(g_guard_thread, Executive, KernelMode, FALSE, NULL);
+    ObDereferenceObject(g_guard_thread);
+    g_guard_thread = NULL;
+}
+
+/* ---- mapping into a process ---- */
+
+static PVOID map_user(PVOID kernel, uint64_t size, PMDL *out)
+{
+    PMDL mdl = IoAllocateMdl(kernel, (ULONG)size, FALSE, FALSE, NULL);
+    if (!mdl) return NULL;
+    MmBuildMdlForNonPagedPool(mdl);
+    PVOID user = NULL;
+    __try {
+        user = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE, NormalPagePriority | MdlMappingNoExecute);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        user = NULL;
+    }
+    if (!user) {
+        IoFreeMdl(mdl);
+        return NULL;
+    }
+    *out = mdl;
+    return user;
+}
+
+/* Unmaps in the owning process: from its own thread, or attached to it. */
+static void unmap_in_process(struct chan_ctx *c, PVOID user, PMDL mdl)
+{
+    if (user) {
+        KAPC_STATE apc;
+        BOOLEAN attached = FALSE;
+        if (PsGetCurrentProcess() != c->process) {
+            KeStackAttachProcess(c->process, &apc);
+            attached = TRUE;
+        }
+        MmUnmapLockedPages(user, mdl);
+        if (attached) KeUnstackDetachProcess(&apc);
+    }
+    if (mdl) IoFreeMdl(mdl);
+}
+
+static void free_chan(struct chan_ctx *c)
+{
+    /* Heap views first: the phone may hand their memory to someone else once the channel is free. */
+    for (UINT i = 0; i < MAX_VIEWS; i++) {
+        if (c->views[i].user) {
+            g.counters.mapped_bytes -= c->views[i].size;
+            unmap_in_process(c, c->views[i].user, c->views[i].mdl);
+        }
+    }
+    unmap_in_process(c, c->user, c->mdl);
+    g.counters.mapped_bytes -= HWGPU_CHAN_STRIDE;
+    hwgpu_release(window(), (uint32_t)c->slot);
+    ObDereferenceObject(c->process);
+    ExFreePoolWithTag(c, TAG);
+}
+
+static struct chan_ctx *find_chan(int slot)
+{
+    for (PLIST_ENTRY e = g.chans.Flink; e != &g.chans; e = e->Flink) {
+        struct chan_ctx *c = CONTAINING_RECORD(e, struct chan_ctx, link);
+        if (c->slot == slot && c->process == PsGetCurrentProcess()) return c;
+    }
+    return NULL;
+}
+
+/* A process is going away: its channels and mappings go with it. This runs in that process, as
+ * Windows tears down its last thread, while its address space still exists. */
+static VOID NTAPI process_notify(HANDLE parent, HANDLE pid, BOOLEAN create)
+{
+    (void)parent;
+    if (create) return;
+    LIST_ENTRY dead;
+    InitializeListHead(&dead);
+    ExAcquireFastMutex(&g.lock);
+    for (PLIST_ENTRY e = g.chans.Flink, n; e != &g.chans; e = n) {
+        n = e->Flink;
+        struct chan_ctx *c = CONTAINING_RECORD(e, struct chan_ctx, link);
+        if (c->pid == pid) {
+            RemoveEntryList(e);
+            InsertTailList(&dead, e);
+        }
+    }
+    for (PLIST_ENTRY e; !IsListEmpty(&dead);) {
+        e = RemoveHeadList(&dead);
+        free_chan(CONTAINING_RECORD(e, struct chan_ctx, link));
+    }
+    ExReleaseFastMutex(&g.lock);
+}
+
+/* ---- the renderer's epoch ---- */
+
+/* The phone's renderer writes a new epoch into the ring header each time it starts. A different one
+ * than the adapter last saw means a driver swap restarted it: every object on the phone is gone. Markers
+ * made under the old epoch are never completed (marker_ready), so Windows' timeout detection resets the
+ * adapter, DWM rebuilds, and programs see device-lost. Under g.lock or the poll timer. */
+static void check_epoch(void)
+{
+    if (!g.ring || !hwgpu_ring_valid(window())) return;
+    uint64_t now = __atomic_load_n(&hwgpu_hdr(window())->epoch, __ATOMIC_ACQUIRE);
+    if (g.epoch && now && now != g.epoch) g.counters.resets++;
+    if (now) g.epoch = now;
+}
+
+/* ---- escapes ---- */
+
+static NTSTATUS esc_open(struct hww_open *out)
+{
+    if (!g.ring) return STATUS_DEVICE_NOT_READY;
+    if (!hwgpu_ring_valid(window())) return STATUS_DEVICE_NOT_READY;  /* the phone has no GPU server */
+    struct chan_ctx *c = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof *c, TAG);
+    if (!c) return STATUS_INSUFFICIENT_RESOURCES;
+    uint32_t gen = 0;
+    int slot = hwgpu_claim(window(), &gen);
+    if (slot < 0) {
+        ExFreePoolWithTag(c, TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    PVOID chan = (UCHAR *)window() + hwgpu_chan_off((uint32_t)slot);
+    PMDL mdl = NULL;
+    PVOID user = map_user(chan, HWGPU_CHAN_STRIDE, &mdl);
+    if (!user) {
+        hwgpu_release(window(), (uint32_t)slot);
+        ExFreePoolWithTag(c, TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    c->process = PsGetCurrentProcess();
+    ObReferenceObject(c->process);
+    c->pid = PsGetCurrentProcessId();
+    c->slot = slot;
+    c->generation = gen;
+    c->mdl = mdl;
+    c->user = user;
+    InsertTailList(&g.chans, &c->link);
+    g.counters.channels_opened++;
+    g.counters.mapped_bytes += HWGPU_CHAN_STRIDE;
+    out->chan = (uint64_t)(ULONG_PTR)user;
+    out->slot = (uint32_t)slot;
+    out->generation = gen;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS esc_close(uint32_t slot)
+{
+    struct chan_ctx *c = find_chan((int)slot);
+    if (!c) return STATUS_INVALID_PARAMETER;
+    RemoveEntryList(&c->link);
+    free_chan(c);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS esc_map(struct hww_map *m)
+{
+    struct chan_ctx *c = find_chan((int)m->slot);
+    if (!c || !g.heap) return STATUS_INVALID_PARAMETER;
+    if (!m->size || ((m->offset | m->size) & 0xfff) || m->offset > HW_HEAP_SIZE || m->size > HW_HEAP_SIZE - m->offset ||
+        m->size > 0xfffff000ull)
+        return STATUS_INVALID_PARAMETER;
+    /* Only a range the phone granted this channel, matched exactly. */
+    struct hwgpu_ctl *ctl = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off((uint32_t)c->slot));
+    BOOLEAN granted = FALSE;
+    for (uint32_t i = 0; i < HWGPU_GRANTS; i++) {
+        uint64_t sz = __atomic_load_n(&ctl->grant[i].size, __ATOMIC_ACQUIRE);
+        if (sz && sz == m->size && ctl->grant[i].offset == m->offset) granted = TRUE;
+    }
+    if (!granted) return STATUS_ACCESS_DENIED;
+    struct view *v = NULL;
+    for (UINT i = 0; i < MAX_VIEWS && !v; i++)
+        if (!c->views[i].user) v = &c->views[i];
+    if (!v) return STATUS_INSUFFICIENT_RESOURCES;
+    PMDL mdl = NULL;
+    PVOID user = map_user((UCHAR *)g.heap + m->offset, m->size, &mdl);
+    if (!user) return STATUS_INSUFFICIENT_RESOURCES;
+    v->mdl = mdl;
+    v->user = user;
+    v->offset = m->offset;
+    v->size = m->size;
+    g.counters.mapped_bytes += m->size;
+    m->user = (uint64_t)(ULONG_PTR)user;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS esc_unmap(struct hww_map *m)
+{
+    struct chan_ctx *c = find_chan((int)m->slot);
+    if (!c) return STATUS_INVALID_PARAMETER;
+    for (UINT i = 0; i < MAX_VIEWS; i++) {
+        if (c->views[i].user && (uint64_t)(ULONG_PTR)c->views[i].user == m->user) {
+            g.counters.mapped_bytes -= c->views[i].size;
+            unmap_in_process(c, c->views[i].user, c->views[i].mdl);
+            RtlZeroMemory(&c->views[i], sizeof c->views[i]);
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_INVALID_PARAMETER;
+}
+
+static NTSTATUS NTAPI HwEscape(const HANDLE hAdapter, const DXGKARG_ESCAPE *arg)
+{
+    (void)hAdapter;
+    if (!arg->pPrivateDriverData || arg->PrivateDriverDataSize < sizeof(struct hww_escape)) return STATUS_BUFFER_TOO_SMALL;
+    struct hww_escape *e = arg->pPrivateDriverData;
+    /* A refusal is reported in the buffer, with codes that say why, so a wrong caller can tell. */
+    if (e->magic != HWW_MAGIC) {
+        e->status = (int32_t)0xc0de0001;
+        return STATUS_SUCCESS;
+    }
+    if (e->size != sizeof *e) {
+        e->status = (int32_t)0xc0de0002;
+        return STATUS_SUCCESS;
+    }
+    /* Mappings go into the calling process, so the call has to come from it. */
+    if (ExGetPreviousMode() != UserMode) {
+        e->status = (int32_t)0xc0de0003;
+        return STATUS_SUCCESS;
+    }
+    NTSTATUS st = STATUS_INVALID_PARAMETER;
+    ExAcquireFastMutex(&g.lock);
+    g.counters.escapes++;
+    check_epoch();
+    switch (e->op) {
+    case HWW_ESC_INFO: {
+        struct hww_hdr_view { const struct hwgpu_ring_hdr *h; } v = {g.ring ? hwgpu_hdr(window()) : NULL};
+        RtlZeroMemory(&e->u, sizeof e->u);
+        e->u.info.driver_version = HWW_VERSION;
+        e->u.info.channels = HWGPU_CHANNELS;
+        e->u.info.heap_size = g.heap ? HW_HEAP_SIZE : 0;
+        if (v.h && hwgpu_ring_valid(window())) {
+            e->u.info.epoch = __atomic_load_n(&v.h->epoch, __ATOMIC_ACQUIRE);
+            RtlCopyMemory(e->u.info.gpu_name, v.h->gpu_name, sizeof e->u.info.gpu_name - 1);
+        }
+        st = STATUS_SUCCESS;
+        break;
+    }
+    case HWW_ESC_OPEN:
+        RtlZeroMemory(&e->u, sizeof e->u);
+        st = esc_open(&e->u.open);
+        break;
+    case HWW_ESC_CLOSE:
+        st = esc_close(e->u.slot);
+        break;
+    case HWW_ESC_MAP:
+        st = esc_map(&e->u.map);
+        break;
+    case HWW_ESC_UNMAP:
+        st = esc_unmap(&e->u.map);
+        break;
+    case HWW_ESC_COUNTERS: {
+        struct hww_counters k = g.counters;
+        if (g.ring && hwgpu_ring_valid(window())) {
+            k.phone_copy_to_guest = __atomic_load_n(&hwgpu_hdr(window())->copy_to_guest, __ATOMIC_RELAXED);
+            k.phone_copy_from_guest = __atomic_load_n(&hwgpu_hdr(window())->copy_from_guest, __ATOMIC_RELAXED);
+        }
+        k.markers_pending = g.pend_count;
+        e->u.counters = k;
+        st = STATUS_SUCCESS;
+        break;
+    }
+    }
+    ExReleaseFastMutex(&g.lock);
+    e->status = st;
+    return STATUS_SUCCESS;  /* the call worked; the result is in the buffer */
+}
+
+/* ---- markers: fences Windows waits on ---- */
+
+static BOOLEAN NTAPI sync_complete(PVOID context)
+{
+    struct pending *p = context;
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA d;
+    RtlZeroMemory(&d, sizeof d);
+    d.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+    d.DmaCompleted.SubmissionFenceId = p->fence_id;
+    d.DmaCompleted.NodeOrdinal = p->node;
+    d.DmaCompleted.EngineOrdinal = p->engine;
+    g.last_fence = p->fence_id;
+    g.dxgk.DxgkCbNotifyInterrupt(g.dxgk.DeviceHandle, &d);
+    g.dxgk.DxgkCbQueueDpc(g.dxgk.DeviceHandle);
+    return TRUE;
+}
+
+static void complete_fence(UINT fence_id, UINT node, UINT engine)
+{
+    struct pending p = {TRUE, fence_id, node, engine};
+    BOOLEAN ret;
+    g.dxgk.DxgkCbSynchronizeExecution(g.dxgk.DeviceHandle, sync_complete, &p, 0, &ret);
+    g.counters.markers_done++;
+}
+
+static BOOLEAN marker_ready(const struct pending *p, uint64_t epoch_now)
+{
+    if (p->epoch != epoch_now) return FALSE;  /* the renderer was replaced: never, so Windows resets */
+    if (!hwgpu_ring_valid(window())) return FALSE;
+    struct hwgpu_ctl *c = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off(p->slot));
+    if (__atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != p->generation ||
+        __atomic_load_n(&c->guest_state, __ATOMIC_ACQUIRE) != HWGPU_CONNECTED)
+        return TRUE;  /* the program closed its channel: nothing left to wait for */
+    return __atomic_load_n(&c->fence[p->ring % HWGPU_FENCE_RINGS], __ATOMIC_ACQUIRE) >= p->fence;
+}
+
+static VOID NTAPI poll_timer(PEX_TIMER timer, PVOID context)
+{
+    (void)context;
+    check_epoch();
+    uint64_t epoch_now = g.epoch;
+    for (;;) {
+        struct pending done = {0};
+        KIRQL irql;
+        KeAcquireSpinLock(&g.pending_lock, &irql);
+        for (UINT i = 0; i < MAX_PENDING && !done.used; i++) {
+            if (g.pend[i].used && marker_ready(&g.pend[i], epoch_now)) {
+                done = g.pend[i];
+                g.pend[i].used = FALSE;
+                g.pend_count--;
+            }
+        }
+        BOOLEAN more = g.pend_count != 0;
+        if (!done.used && !more && g.timer_on) {
+            ExSetTimer(timer, 0, 0, NULL);  /* nothing pending: stop polling */
+            g.timer_on = FALSE;
+        }
+        KeReleaseSpinLock(&g.pending_lock, irql);
+        if (!done.used) break;
+        complete_fence(done.fence_id, done.node, done.engine);
+    }
+}
+
+static void start_polling(void)
+{
+    if (g.timer && !g.timer_on) {
+        g.timer_on = TRUE;
+        LONGLONG due = -10000;  /* 1 ms */
+        ExSetTimer(g.timer, due, 10000, NULL);
+    }
+}
+
+/* ---- the DDIs ---- */
+
+static NTSTATUS NTAPI HwAddDevice(CONST PDEVICE_OBJECT pdo, PVOID *context)
+{
+    g.pdo = pdo;
+    *context = &g;
+    return STATUS_SUCCESS;
+}
+
+static void write_adapter_strings(const char *gpu)
+{
+    HANDLE key = NULL;
+    if (!NT_SUCCESS(IoOpenDeviceRegistryKey(g.pdo, PLUGPLAY_REGKEY_DRIVER, KEY_SET_VALUE, &key))) return;
+    WCHAR name[96];
+    UNICODE_STRING us;
+    ULONG n = 0;
+    static const WCHAR prefix[] = L"HyperWin GPU (";
+    for (; prefix[n] && n < 80; n++) name[n] = prefix[n];
+    for (const char *s = gpu; *s && n < 90; s++) name[n++] = (WCHAR)(UCHAR)*s;
+    name[n++] = L')';
+    name[n] = 0;
+    RtlInitUnicodeString(&us, L"HardwareInformation.AdapterString");
+    ZwSetValueKey(key, &us, 0, REG_SZ, name, (n + 1) * sizeof(WCHAR));
+    RtlInitUnicodeString(&us, L"HardwareInformation.ChipType");
+    ZwSetValueKey(key, &us, 0, REG_SZ, name, (n + 1) * sizeof(WCHAR));
+    RtlInitUnicodeString(&us, L"HardwareInformation.DACType");
+    static const WCHAR dac[] = L"Phone";
+    ZwSetValueKey(key, &us, 0, REG_SZ, (PVOID)dac, sizeof dac);
+    RtlInitUnicodeString(&us, L"HardwareInformation.qwMemorySize");
+    ULONGLONG mem = HW_HEAP_SIZE;
+    ZwSetValueKey(key, &us, 0, REG_QWORD, &mem, sizeof mem);
+    ZwClose(key);
+}
+
+static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXGKRNL_INTERFACE iface, PULONG sources,
+                                    PULONG children)
+{
+    (void)ctx;
+    (void)info;
+    g.dxgk = *iface;
+    *sources = 0;   /* render-only: no screen, no monitors */
+    *children = 0;
+    InitializeListHead(&g.chans);
+    ExInitializeFastMutex(&g.lock);
+    KeInitializeSpinLock(&g.pending_lock);
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)(HW_WINDOW_PA + HWGPU_RING_OFF);
+    g.ring = MmMapIoSpace(pa, HWGPU_RING_BYTES, MmCached);
+    pa.QuadPart = (LONGLONG)HW_HEAP_PA;
+    g.heap = MmMapIoSpace(pa, (SIZE_T)HW_HEAP_SIZE, MmCached);
+    if (!g.ring) return STATUS_INSUFFICIENT_RESOURCES;
+    g.epoch = hwgpu_ring_valid(window()) ? hwgpu_hdr(window())->epoch : 0;
+    g.timer = ExAllocateTimer(poll_timer, NULL, EX_TIMER_HIGH_RESOLUTION);
+    guard_start();
+    if (!g_notify_set && NT_SUCCESS(PsSetCreateProcessNotifyRoutine(process_notify, FALSE))) g_notify_set = TRUE;
+    const char *name = g.ring && hwgpu_ring_valid(window()) && hwgpu_hdr(window())->gpu_name[0] ? hwgpu_hdr(window())->gpu_name : "Phone GPU";
+    write_adapter_strings(name);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwStopDevice(CONST PVOID ctx)
+{
+    (void)ctx;
+    if (g.timer) {
+        ExDeleteTimer(g.timer, TRUE, FALSE, NULL);
+        g.timer = NULL;
+    }
+    guard_stop();
+    if (g_notify_set) {
+        PsSetCreateProcessNotifyRoutine(process_notify, TRUE);
+        g_notify_set = FALSE;
+    }
+    ExAcquireFastMutex(&g.lock);
+    while (!IsListEmpty(&g.chans)) {
+        PLIST_ENTRY e = RemoveHeadList(&g.chans);
+        free_chan(CONTAINING_RECORD(e, struct chan_ctx, link));
+    }
+    ExReleaseFastMutex(&g.lock);
+    if (g.ring) MmUnmapIoSpace(g.ring, HWGPU_RING_BYTES);
+    if (g.heap) MmUnmapIoSpace(g.heap, (SIZE_T)HW_HEAP_SIZE);
+    g.ring = g.heap = NULL;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwRemoveDevice(CONST PVOID ctx)
+{
+    (void)ctx;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwDispatchIoRequest(CONST PVOID ctx, ULONG source, PVIDEO_REQUEST_PACKET packet)
+{
+    (void)ctx;
+    (void)source;
+    (void)packet;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static BOOLEAN NTAPI HwInterrupt(CONST PVOID ctx, ULONG message)
+{
+    (void)ctx;
+    (void)message;
+    return FALSE;  /* no interrupt line: completions come from the polling timer */
+}
+
+static VOID NTAPI HwDpc(CONST PVOID ctx)
+{
+    (void)ctx;
+}
+
+static NTSTATUS NTAPI HwQueryChildRelations(CONST PVOID ctx, PDXGK_CHILD_DESCRIPTOR rel, ULONG size)
+{
+    (void)ctx;
+    (void)rel;
+    (void)size;
+    return STATUS_SUCCESS;  /* none */
+}
+
+static NTSTATUS NTAPI HwQueryChildStatus(CONST PVOID ctx, PDXGK_CHILD_STATUS status, BOOLEAN safe)
+{
+    (void)ctx;
+    (void)status;
+    (void)safe;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS NTAPI HwQueryDeviceDescriptor(CONST PVOID ctx, ULONG uid, PDXGK_DEVICE_DESCRIPTOR desc)
+{
+    (void)ctx;
+    (void)uid;
+    (void)desc;
+    return STATUS_MONITOR_NO_DESCRIPTOR;
+}
+
+static NTSTATUS NTAPI HwSetPowerState(CONST PVOID ctx, ULONG uid, DEVICE_POWER_STATE state, POWER_ACTION action)
+{
+    (void)ctx;
+    (void)uid;
+    (void)state;
+    (void)action;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwNotifyAcpiEvent(CONST PVOID ctx, DXGK_EVENT_TYPE type, ULONG event, PVOID arg, PULONG flags)
+{
+    (void)ctx;
+    (void)type;
+    (void)event;
+    (void)arg;
+    if (flags) *flags = 0;
+    return STATUS_SUCCESS;
+}
+
+static VOID NTAPI HwResetDevice(CONST PVOID ctx) { (void)ctx; }
+static VOID NTAPI HwUnload(VOID) {}
+
+static NTSTATUS NTAPI HwQueryInterface(CONST PVOID ctx, PQUERY_INTERFACE qi)
+{
+    (void)ctx;
+    (void)qi;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static VOID NTAPI HwControlEtw(BOOLEAN enable, ULONG flags, UCHAR level)
+{
+    (void)enable;
+    (void)flags;
+    (void)level;
+}
+
+/* What the adapter can do, as the scheduler and memory manager need to hear it. A render-only
+ * adapter with no engine of its own to schedule: one node, no preemption, no overlays. */
+static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
+{
+    if (size < sizeof *caps) return STATUS_BUFFER_TOO_SMALL;
+    RtlZeroMemory(caps, size);
+    caps->HighestAcceptableAddress.QuadPart = ~0ull >> 1;
+    caps->MaxAllocationListSlotId = 0xffff;
+    caps->ApertureSegmentCommitLimit = (SIZE_T)HW_HEAP_SIZE;
+    caps->WDDMVersion = DXGKDDI_WDDMv1_3;
+    caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
+    caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
+    caps->PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
+    caps->SupportNonVGA = FALSE;
+    return STATUS_SUCCESS;
+}
+
+/* One aperture segment over the GPU heap: system memory the CPU and the phone both see. Windows places
+ * allocations that need memory here and has nothing to copy, because the phone keeps the real data. */
+static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
+{
+    if (type == DXGKQAITYPE_QUERYSEGMENT3) {
+        if (qai->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT3)) return STATUS_BUFFER_TOO_SMALL;
+        DXGK_QUERYSEGMENTOUT3 *out = qai->pOutputData;
+        if (!out->pSegmentDescriptor) {
+            out->NbSegment = 1;
+        } else {
+            DXGK_SEGMENTDESCRIPTOR3 *d = out->pSegmentDescriptor;
+            RtlZeroMemory(d, sizeof *d);
+            d->Flags.Aperture = 1;
+            d->Flags.CacheCoherent = 1;
+            d->Flags.CpuVisible = 1;
+            d->Size = (SIZE_T)HW_HEAP_SIZE;
+            d->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
+        }
+        out->PagingBufferSegmentId = 1;
+        out->PagingBufferSize = 64 * 1024;
+        out->PagingBufferPrivateDataSize = 0;
+        return STATUS_SUCCESS;
+    }
+    if (qai->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT)) return STATUS_BUFFER_TOO_SMALL;
+    DXGK_QUERYSEGMENTOUT *out = qai->pOutputData;
+    if (!out->pSegmentDescriptor) {
+        out->NbSegment = 1;
+    } else {
+        DXGK_SEGMENTDESCRIPTOR *d = out->pSegmentDescriptor;
+        RtlZeroMemory(d, sizeof *d);
+        d->Flags.Aperture = 1;
+        d->Flags.CacheCoherent = 1;
+        d->Flags.CpuVisible = 1;
+        d->Size = (SIZE_T)HW_HEAP_SIZE;
+        d->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
+    }
+    out->PagingBufferSegmentId = 1;
+    out->PagingBufferSize = 64 * 1024;
+    out->PagingBufferPrivateDataSize = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO *qai)
+{
+    (void)hAdapter;
+    switch (qai->Type) {
+    case DXGKQAITYPE_DRIVERCAPS:
+        return query_caps(qai->pOutputData, qai->OutputDataSize);
+    case DXGKQAITYPE_QUERYSEGMENT:
+    case DXGKQAITYPE_QUERYSEGMENT3:
+        return query_segments(qai->Type, qai);
+    case DXGKQAITYPE_UMDRIVERPRIVATE:
+        if (qai->OutputDataSize >= 4) {
+            RtlZeroMemory(qai->pOutputData, qai->OutputDataSize);
+            *(UINT *)qai->pOutputData = HWW_MAGIC;
+            return STATUS_SUCCESS;
+        }
+        return STATUS_BUFFER_TOO_SMALL;
+    default:
+        return STATUS_NOT_SUPPORTED;
+    }
+}
+
+static NTSTATUS NTAPI HwCreateDevice(const HANDLE hAdapter, DXGKARG_CREATEDEVICE *cd)
+{
+    (void)hAdapter;
+    cd->hDevice = &g;  /* one device context is all it needs: nothing is kept per device */
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwDestroyDevice(const HANDLE hDevice)
+{
+    (void)hDevice;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwCreateContext(const HANDLE hDevice, DXGKARG_CREATECONTEXT *cc)
+{
+    (void)hDevice;
+    cc->hContext = &g;
+    cc->ContextInfo.DmaBufferSize = 64 * 1024;
+    cc->ContextInfo.DmaBufferSegmentSet = 0;           /* system memory */
+    cc->ContextInfo.DmaBufferPrivateDataSize = 64;     /* room for a marker */
+    cc->ContextInfo.AllocationListSize = 16;
+    cc->ContextInfo.PatchLocationListSize = 16;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwDestroyContext(const HANDLE hContext)
+{
+    (void)hContext;
+    return STATUS_SUCCESS;
+}
+
+/* Programs create no kernel allocations through this adapter: the phone owns every object. */
+static NTSTATUS NTAPI HwCreateAllocation(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *ca)
+{
+    (void)hAdapter;
+    (void)ca;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS NTAPI HwDestroyAllocation(const HANDLE hAdapter, const DXGKARG_DESTROYALLOCATION *da)
+{
+    (void)hAdapter;
+    (void)da;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwOpenAllocation(const HANDLE hDevice, const DXGKARG_OPENALLOCATION *oa)
+{
+    (void)hDevice;
+    (void)oa;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS NTAPI HwCloseAllocation(const HANDLE hDevice, const DXGKARG_CLOSEALLOCATION *ca)
+{
+    (void)hDevice;
+    (void)ca;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwNotSupported(const HANDLE h, PVOID arg)
+{
+    (void)h;
+    (void)arg;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS NTAPI HwSuccess(const HANDLE h, PVOID arg)
+{
+    (void)h;
+    (void)arg;
+    return STATUS_SUCCESS;
+}
+
+/* Paging: the phone keeps every object, so Windows' moves, fills and mappings change nothing. An
+ * empty paging buffer is a finished one. */
+static NTSTATUS NTAPI HwBuildPagingBuffer(const HANDLE hAdapter, DXGKARG_BUILDPAGINGBUFFER *pb)
+{
+    (void)hAdapter;
+    (void)pb;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwSubmitCommand(const HANDLE hAdapter, const DXGKARG_SUBMITCOMMAND *sc)
+{
+    (void)hAdapter;
+    const struct hww_marker *m = (const struct hww_marker *)sc->pDmaBufferPrivateData;
+    if (!sc->Flags.Paging && m && sc->DmaBufferPrivateDataSize >= sizeof *m &&
+        sc->DmaBufferPrivateDataSubmissionEndOffset - sc->DmaBufferPrivateDataSubmissionStartOffset >= sizeof *m) {
+        m = (const struct hww_marker *)((const UCHAR *)sc->pDmaBufferPrivateData + sc->DmaBufferPrivateDataSubmissionStartOffset);
+        if (m->magic == HWW_MARKER_MAGIC && m->slot < HWGPU_CHANNELS) {
+            KIRQL irql;
+            BOOLEAN queued = FALSE;
+            KeAcquireSpinLock(&g.pending_lock, &irql);
+            for (UINT i = 0; i < MAX_PENDING && !queued; i++) {
+                if (g.pend[i].used) continue;
+                g.pend[i].used = TRUE;
+                g.pend[i].fence_id = sc->SubmissionFenceId;
+                g.pend[i].node = sc->NodeOrdinal;
+                g.pend[i].engine = sc->EngineOrdinal;
+                g.pend[i].slot = m->slot;
+                g.pend[i].generation = m->generation;
+                g.pend[i].ring = m->ring;
+                g.pend[i].fence = m->fence;
+                g.pend[i].epoch = g.epoch;
+                g.pend_count++;
+                queued = TRUE;
+            }
+            KeReleaseSpinLock(&g.pending_lock, irql);
+            if (queued) {
+                start_polling();
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+    complete_fence(sc->SubmissionFenceId, sc->NodeOrdinal, sc->EngineOrdinal);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwPreemptCommand(const HANDLE hAdapter, const DXGKARG_PREEMPTCOMMAND *pc)
+{
+    (void)hAdapter;
+    (void)pc;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwQueryCurrentFence(const HANDLE hAdapter, DXGKARG_QUERYCURRENTFENCE *qf)
+{
+    (void)hAdapter;
+    qf->CurrentFence = g.last_fence;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwResetFromTimeout(const HANDLE hAdapter)
+{
+    (void)hAdapter;
+    /* Whatever Windows was waiting on is abandoned. */
+    KIRQL irql;
+    KeAcquireSpinLock(&g.pending_lock, &irql);
+    RtlZeroMemory(g.pend, sizeof g.pend);
+    g.pend_count = 0;
+    KeReleaseSpinLock(&g.pending_lock, irql);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwRestartFromTimeout(const HANDLE hAdapter)
+{
+    (void)hAdapter;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwCollectDbgInfo(const HANDLE hAdapter, const DXGKARG_COLLECTDBGINFO *di)
+{
+    (void)hAdapter;
+    (void)di;
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS NTAPI HwControlInterrupt(const HANDLE hAdapter, const DXGK_INTERRUPT_TYPE type, BOOLEAN enable)
+{
+    (void)hAdapter;
+    (void)type;
+    (void)enable;
+    return STATUS_SUCCESS;
+}
+
+/* The engine and power DDIs of WDDM 1.2 and later, answered for an adapter with one engine that is
+ * always responsive and never powered down. */
+static NTSTATUS NTAPI HwResetEngine(const HANDLE hAdapter, DXGKARG_RESETENGINE *re)
+{
+    (void)hAdapter;
+    re->LastAbortedFenceId = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwGetNodeMetadata(const HANDLE hAdapter, UINT node, DXGKARG_GETNODEMETADATA *nm)
+{
+    (void)hAdapter;
+    (void)node;
+    RtlZeroMemory(nm, sizeof *nm);
+    nm->EngineType = DXGK_ENGINE_TYPE_3D;
+    return STATUS_SUCCESS;
+}
+
+/* The scheduler calibrates a GPU's clock against the CPU's on a timer. There is no GPU clock here: the
+ * phone's work is paced on the phone. Report the CPU's counter as both, at its own frequency. */
+static NTSTATUS NTAPI HwCalibrateGpuClock(const HANDLE hAdapter, UINT32 node, UINT32 engine, DXGKARG_CALIBRATEGPUCLOCK *cal)
+{
+    (void)hAdapter;
+    (void)node;
+    (void)engine;
+    LARGE_INTEGER freq;
+    LARGE_INTEGER now = KeQueryPerformanceCounter(&freq);
+    cal->GpuFrequency = (ULONGLONG)freq.QuadPart;
+    cal->GpuClockCounter = (ULONGLONG)now.QuadPart;
+    cal->CpuClockCounter = (ULONGLONG)now.QuadPart;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwCancelCommand(const HANDLE hAdapter, const DXGKARG_CANCELCOMMAND *cc)
+{
+    (void)hAdapter;
+    (void)cc;
+    return STATUS_SUCCESS;
+}
+
+/* ---- DxgkInitialize, without displib.lib ---- */
+
+static NTSTATUS call_internal(PDEVICE_OBJECT dev, ULONG code, PVOID out, ULONG out_len)
+{
+    KEVENT ev;
+    IO_STATUS_BLOCK iosb;
+    KeInitializeEvent(&ev, NotificationEvent, FALSE);
+    PIRP irp = IoBuildDeviceIoControlRequest(code, dev, NULL, 0, out, out_len, TRUE, &ev, &iosb);
+    if (!irp) return STATUS_INSUFFICIENT_RESOURCES;
+    NTSTATUS st = IoCallDriver(dev, irp);
+    if (st == STATUS_PENDING) {
+        KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, NULL);
+        st = iosb.Status;
+    }
+    return st;
+}
+
+typedef NTSTATUS (NTAPI *dxgk_init_fn)(PDRIVER_OBJECT, PUNICODE_STRING, PVOID);
+
+static NTSTATUS HwDxgkInitialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry, DRIVER_INITIALIZATION_DATA *init)
+{
+    UNICODE_STRING service, device;
+    RtlInitUnicodeString(&service, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\DXGKrnl");
+    RtlInitUnicodeString(&device, L"\\Device\\DxgKrnl");
+    NTSTATUS load = ZwLoadDriver(&service);
+    BOOLEAN loaded_now = load != STATUS_IMAGE_ALREADY_LOADED;
+    if (!NT_SUCCESS(load) && load != STATUS_IMAGE_ALREADY_LOADED) return load;
+    PFILE_OBJECT file = NULL;
+    PDEVICE_OBJECT dev = NULL;
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    for (int tries = 0; tries < 10; tries++) {
+        st = IoGetDeviceObjectPointer(&device, GENERIC_READ | GENERIC_WRITE, &file, &dev);
+        if (NT_SUCCESS(st) || !loaded_now) break;
+        LARGE_INTEGER d;
+        d.QuadPart = -50000;  /* 5 ms */
+        KeDelayExecutionThread(KernelMode, FALSE, &d);
+    }
+    if (!NT_SUCCESS(st)) return st;
+    dxgk_init_fn fn = NULL;
+    st = call_internal(dev, 0x00230047, &fn, sizeof fn);
+    if (st == STATUS_INVALID_DEVICE_REQUEST) st = call_internal(dev, 0x0023003F, &fn, sizeof fn);
+    ObDereferenceObject(file);
+    if (!NT_SUCCESS(st) || !fn) return NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st;
+    return fn(driver, registry, init);
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
+{
+    /* The crash-loop breaker first: two starts in a row that did not finish means the third boot
+     * goes without this driver. */
+    RtlZeroMemory(g.guard_path, sizeof g.guard_path);
+    ULONG chars = registry->Length / sizeof(WCHAR);
+    if (chars > 200) return STATUS_INVALID_PARAMETER;
+    RtlCopyMemory(g.guard_path, registry->Buffer, registry->Length);
+    static const WCHAR sub[] = L"\\Parameters";
+    RtlCopyMemory(g.guard_path + chars, sub, sizeof sub);
+    ULONG tries = guard_count(FALSE, 0);
+    if (tries >= 2) return STATUS_UNSUCCESSFUL;
+    guard_count(TRUE, tries + 1);
+
+    DRIVER_INITIALIZATION_DATA init;
+    RtlZeroMemory(&init, sizeof init);
+    init.Version = DXGKDDI_INTERFACE_VERSION_WDDM1_3;
+    init.DxgkDdiAddDevice = HwAddDevice;
+    init.DxgkDdiStartDevice = HwStartDevice;
+    init.DxgkDdiStopDevice = HwStopDevice;
+    init.DxgkDdiRemoveDevice = HwRemoveDevice;
+    init.DxgkDdiDispatchIoRequest = HwDispatchIoRequest;
+    init.DxgkDdiInterruptRoutine = HwInterrupt;
+    init.DxgkDdiDpcRoutine = HwDpc;
+    init.DxgkDdiQueryChildRelations = HwQueryChildRelations;
+    init.DxgkDdiQueryChildStatus = HwQueryChildStatus;
+    init.DxgkDdiQueryDeviceDescriptor = HwQueryDeviceDescriptor;
+    init.DxgkDdiSetPowerState = HwSetPowerState;
+    init.DxgkDdiNotifyAcpiEvent = HwNotifyAcpiEvent;
+    init.DxgkDdiResetDevice = HwResetDevice;
+    init.DxgkDdiUnload = HwUnload;
+    init.DxgkDdiQueryInterface = HwQueryInterface;
+    init.DxgkDdiControlEtwLogging = HwControlEtw;
+    init.DxgkDdiQueryAdapterInfo = HwQueryAdapterInfo;
+    init.DxgkDdiCreateDevice = HwCreateDevice;
+    init.DxgkDdiCreateAllocation = HwCreateAllocation;
+    init.DxgkDdiDestroyAllocation = HwDestroyAllocation;
+    init.DxgkDdiDescribeAllocation = (PDXGKDDI_DESCRIBEALLOCATION)HwNotSupported;
+    init.DxgkDdiGetStandardAllocationDriverData = (PDXGKDDI_GETSTANDARDALLOCATIONDRIVERDATA)HwNotSupported;
+    init.DxgkDdiPatch = (PDXGKDDI_PATCH)HwSuccess;
+    init.DxgkDdiSubmitCommand = HwSubmitCommand;
+    init.DxgkDdiPreemptCommand = HwPreemptCommand;
+    init.DxgkDdiBuildPagingBuffer = HwBuildPagingBuffer;
+    init.DxgkDdiResetFromTimeout = HwResetFromTimeout;
+    init.DxgkDdiRestartFromTimeout = HwRestartFromTimeout;
+    init.DxgkDdiEscape = HwEscape;
+    init.DxgkDdiCollectDbgInfo = HwCollectDbgInfo;
+    init.DxgkDdiQueryCurrentFence = HwQueryCurrentFence;
+    init.DxgkDdiControlInterrupt = HwControlInterrupt;
+    init.DxgkDdiDestroyDevice = HwDestroyDevice;
+    init.DxgkDdiOpenAllocation = HwOpenAllocation;
+    init.DxgkDdiCloseAllocation = HwCloseAllocation;
+    init.DxgkDdiRender = (PDXGKDDI_RENDER)HwNotSupported;
+    init.DxgkDdiPresent = (PDXGKDDI_PRESENT)HwNotSupported;
+    init.DxgkDdiCreateContext = HwCreateContext;
+    init.DxgkDdiDestroyContext = HwDestroyContext;
+    init.DxgkDdiRenderKm = (PDXGKDDI_RENDER)HwNotSupported;
+    init.DxgkDdiResetEngine = HwResetEngine;
+    init.DxgkDdiCancelCommand = HwCancelCommand;
+    init.DxgkDdiGetNodeMetadata = HwGetNodeMetadata;
+    init.DxgkDdiCalibrateGpuClock = HwCalibrateGpuClock;
+    return HwDxgkInitialize(driver, registry, &init);
+}

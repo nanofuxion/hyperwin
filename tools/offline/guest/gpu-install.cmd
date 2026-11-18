@@ -36,8 +36,17 @@ rem touchpad (mouse/README.md), each installed again when its driver changes. Th
 rem signs the package's catalog; for sound it also takes out the older Scream card.
 fc /b %G%\hwaudio\hwaudio.sys %SystemRoot%\System32\drivers\hwaudio.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwaudio Root\HwAudio
 fc /b %G%\hwhid\hwhid.sys %SystemRoot%\System32\drivers\hwhid.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwhid Root\HwHid
+rem The render-only GPU adapter (wddm/README.md). Windows runs it from the driver store, so what is
+rem installed is remembered by the package's hash rather than by a copy in System32.
+set "NEWH="
+for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwgpuw\hwgpuw.sys SHA256 2^>nul') do if not defined NEWH set "NEWH=%%h"
+set "OLDH="
+if exist %G%\hwgpuw\installed.sha set /p OLDH=<%G%\hwgpuw\installed.sha
+if defined NEWH if not "%NEWH%"=="%OLDH%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwgpuw Root\HwGpuAdapter && (echo %NEWH%> %G%\hwgpuw\installed.sha)
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
-reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
+rem Vulkan finds the driver through the adapter's VulkanDriverName. The global key is only for a
+rem machine that has no adapter (wddm/README.md).
+powershell -NoProfile -Command "if (Get-PnpDevice | ? HardwareID -contains 'Root\HwGpuAdapter') { exit 0 } else { exit 1 }" && (reg delete HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /f >nul 2>&1) || reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_hwgpu.json /t REG_DWORD /d 0 /f
 rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).
 for /d %%u in (C:\Users\*) do if exist "%%u\AppData\Roaming\Microsoft\Windows\SendTo" call :sendto "%%u\AppData\Roaming\Microsoft\Windows\SendTo"
 call :sendto "C:\Users\Default\AppData\Roaming\Microsoft\Windows\SendTo"

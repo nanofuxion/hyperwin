@@ -20,11 +20,13 @@
 #include <hw_d3d.h>
 #include <hwgpu_ioctl.h>
 #include <hwgpu_ring.h>
+#include <hww_user.h>
 
 /* ---- the channel ---- */
 
 static void *g_chan;
 static uint32_t g_gen, g_seq;
+static struct hww *g_adapter;          /* the WDDM adapter, when the channel came from it */
 static uint8_t *g_stage;               /* the staging area (hw_d3d.h), or null */
 static uint64_t g_stage_cap, g_stage_pos;
 static volatile struct hwd3d_query_slot *g_qpage;  /* query results (hw_d3d.h), or null */
@@ -51,13 +53,28 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
     (void)once; (void)param; (void)ctx;
     if (getenv("HWD3D_OFF")) return TRUE;
-    HANDLE dev = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (dev == INVALID_HANDLE_VALUE) return TRUE;
+    /* The WDDM adapter first (include/hw_wddm.h), the legacy \\.\HwGpu device without it. */
     struct hwgpu_open_out o;
     DWORD got = 0;
-    if (!DeviceIoControl(dev, IOCTL_HWGPU_OPEN, NULL, 0, &o, sizeof o, &got, NULL) || got != sizeof o) {
-        CloseHandle(dev);
-        return TRUE;
+    HANDLE dev = INVALID_HANDLE_VALUE;
+    static struct hww adapter;
+    if (hww_open(&adapter)) {
+        struct hww_open wo;
+        if (hww_open_channel(&adapter, &wo) < 0) {
+            hww_close(&adapter);
+            return TRUE;
+        }
+        o.chan = wo.chan;
+        o.slot = wo.slot;
+        o.generation = wo.generation;
+        g_adapter = &adapter;
+    } else {
+        dev = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (dev == INVALID_HANDLE_VALUE) return TRUE;
+        if (!DeviceIoControl(dev, IOCTL_HWGPU_OPEN, NULL, 0, &o, sizeof o, &got, NULL) || got != sizeof o) {
+            CloseHandle(dev);
+            return TRUE;
+        }
     }
     /* The handle stays open for the life of the process: closing it frees the channel. */
     g_chan = (void *)(uintptr_t)o.chan;
@@ -78,8 +95,12 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
         /* The staging area, where uploads go instead of the ring. Without it they ride inline. */
         struct hwgpu_map_in in = {r.staging_offset, r.staging_size};
         struct hwgpu_map_out out = {0};
-        if (r.staging_size > HWD3D_STAGING_DATA &&
-            DeviceIoControl(dev, IOCTL_HWGPU_MAP, &in, sizeof in, &out, sizeof out, &got, NULL) && out.user) {
+        int mapped = 0;
+        if (r.staging_size > HWD3D_STAGING_DATA) {
+            if (g_adapter) mapped = hww_map(g_adapter, o.slot, r.staging_offset, r.staging_size, &out.user) >= 0 && out.user;
+            else mapped = DeviceIoControl(dev, IOCTL_HWGPU_MAP, &in, sizeof in, &out, sizeof out, &got, NULL) && out.user;
+        }
+        if (mapped) {
             g_stage = (uint8_t *)(uintptr_t)out.user;
             g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
             g_qpage = (volatile struct hwd3d_query_slot *)(g_stage + r.staging_size - HWD3D_QUERY_PAGE);

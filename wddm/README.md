@@ -208,12 +208,32 @@ ICD entry points.
 
 ## Headers and the WDK
 
-- The kernel driver only needs `d3dkmddi.h`, `dispmprt.h` and their friends.
-  `gpu/work/reactos-ddk` already has them. **No WDK.**
-- The Direct3D driver parts need `d3d10umddi.h` (10 and 11), `d3dumddi.h`
-  (9) and `d3d12umddi.h` (12). These only ship in the WDK. Those phases wait
-  for your OK on the WDK license.
-- HwD3D's per-program DLLs and the OpenGL ICD need neither.
+The user has approved the WDK for this work (2026-11-18). Its text is Microsoft's
+"pre-release" license even on the stable NuGet package, so these rules keep us
+inside it:
+
+- **Fetched at build time, on this Mac only.** `gpu/guest/wddm/fetch-wdk.sh`
+  downloads the NuGet packages `Microsoft.Windows.WDK.ARM64` and
+  `Microsoft.Windows.SDK.CPP`, version **10.0.26100.6584**, into `gpu/work/wdk`,
+  which git ignores. No WDK header, library, tool or binary goes into git, the
+  app or the machine assets.
+- **Included, never copied.** Our sources `#include <dispmprt.h>` from that
+  path. No text of a WDK header goes into our headers or comments. Our wire
+  formats (`hw_d3d.h`, `hw_wddm.h`, the ring) stay our own definitions.
+- **Nothing on the phone side** uses WDK material.
+- **No WDK library is linked into a driver we ship.** `DxgkInitialize` is ours
+  (see "Phase 1 findings"), and the driver imports only `ntoskrnl.exe`. If a
+  library ever becomes unavoidable, such as `WdfDriverEntry.lib` for a USB
+  KMDF driver, say so first.
+- **Nothing that is only in the WDK is published.** Microsoft's public
+  documentation is fine to cite.
+- **Microsoft's own driver files** (`BasicRender.sys` and friends, studied for
+  how a render-only driver registers) stay out of the repository.
+
+What the WDK is needed for: the kernel driver's render structures (segments,
+paging, submit, allocations, engines: `d3dkmddi.h`), and the Direct3D driver
+parts, `d3d10umddi.h` (10 and 11), `d3dumddi.h` (9) and `d3d12umddi.h` (12).
+HwD3D's per-program DLLs and the OpenGL ICD need neither.
 
 ## Prior art to read first
 
@@ -281,25 +301,9 @@ a small shim into each miniport. What the shim does, seen from the two drivers:
 So the driver can carry its own twenty-line `DxgkInitialize`. Do that, and note
 here if a later Windows needs a different code.
 
-**The reactos-ddk headers are a display-only subset.** `dispmprt.h` has
-`DRIVER_INITIALIZATION_DATA`, `DXGKRNL_INTERFACE` and the VidPN types. But
-`d3dkmddi.h` leaves out the render side. It has no `DXGK_QUERYSEGMENTOUT`,
-`DXGK_SEGMENTDESCRIPTOR`, `DXGKARG_BUILDPAGINGBUFFER`, `DXGKARG_SUBMITCOMMAND`,
-`DXGKARG_PATCH`, `DXGKARG_DESCRIBEALLOCATION`, the engine and node types, or the
-`DXGKDDI_*` prototypes for the allocation, scheduling and paging DDIs. Its
-function-pointer typedefs for those are `UINT32*` placeholders. Two ways
-forward, and the choice is the user's:
-
-- **The WDK's `d3dkmddi.h` and `dispmprt.h`** (the real headers). One more file
-  to take from the WDK than phase 4 needs, and it removes guessing.
-- **Write the missing definitions from the public documentation** on Microsoft
-  Learn. It shows each structure's fields and bit-fields, but not the
-  `#if DXGKDDI_INTERFACE_VERSION` widths of the reserved bits, and a wrong bit
-  position fails quietly inside `dxgkrnl.sys`. Roughly a hundred pages.
-
-The documented parts needed are already in hand for `DXGK_DRIVERCAPS`,
-`DXGK_VIDSCHCAPS`, `DXGK_VIDMMCAPS`, `DXGK_PRESENTATIONCAPS`, the segment
-structures, `DXGKARG_BUILDPAGINGBUFFER`, `DXGKARG_SUBMITCOMMAND`.
+**The reactos-ddk headers are a display-only subset,** with no segment, paging,
+submit or allocation structures, so the WDK's `d3dkmddi.h` and `dispmprt.h`
+are used (see "Headers and the WDK").
 
 **Designs settled while reading:**
 
@@ -323,6 +327,68 @@ structures, `DXGKARG_BUILDPAGINGBUFFER`, `DXGKARG_SUBMITCOMMAND`.
   them.
 - **Windows' own driver files** for study are copied to `P:\Download\wdsys` on
   the phone. They are Microsoft's and stay out of the repository.
+
+## Phase 1 result (2026-11-18): the adapter is up
+
+`gpu/guest/wddm/hwgpuw.c` builds `hwgpuw.sys`, a WDDM 1.3 render-only miniport.
+`install-driver.ps1` installs it as `Root\HwGpuAdapter` with `hwdev`, from a
+package of `hwgpuw.sys`, its INF, `vulkan_hwgpu.dll` and `.json`. Windows shows
+"HyperWin GPU (Mali-G78)", the name the renderer reads from the phone's Vulkan
+device and writes into the ring header.
+
+What it took, in the order it was found:
+
+- **System class, not Display.** Windows' own Basic Render and Basic Display
+  drivers are `Class=System`. As a Display-class device the start failed after
+  `DxgkDdiStartDevice` with `CM_PROB_FAILED_POST_START`.
+- **The user-mode driver names are required.** Windows reads
+  `UserModeDriverName`, `UserModeDriverNameWow` and `InstalledDisplayDrivers`
+  when it starts the adapter and stops it with `STATUS_OBJECT_NAME_NOT_FOUND`
+  (0xC0000034) when they are missing. Until the Direct3D driver part exists the
+  INF names `hwd3d_umd.dll`, which is not there. Programs that ask this
+  adapter for Direct3D fall back as they do for any adapter without one.
+- **The DDI set** is Windows' own render driver's, plus ours: the 1.0 to 1.3
+  entries, `DxgkDdiCalibrateGpuClock` (Windows calls it every few milliseconds),
+  `DxgkDdiCancelCommand`, `DxgkDdiResetEngine` and `DxgkDdiGetNodeMetadata`. The
+  swizzling, palette, pointer, VidPN and overlay DDIs stay null.
+- **How it was found:** Windows' ETW provider `Microsoft-Windows-DxgKrnl`
+  (`logman`, `tracerpt -of XML`) prints "Adapter StartDevice has completed with
+  status ..." and the miniport's own return values.
+
+What it does:
+
+- **Escape.** `D3DKMTEscape` (`include/hw_wddm.h`, `include/hww_user.h`) opens a
+  channel and maps it, and the granted GPU-heap ranges, into the caller. After
+  that a request is a plain memory write. The adapter is found by an info escape
+  to each adapter; ours answers with its version. A process's mappings are
+  undone by a process-exit callback.
+- **Vulkan** is found through `VulkanDriverName` on the adapter's key
+  (`vktest` passes through the loader with the Khronos key removed).
+  `vulkan_hwgpu.dll` and `d3d11.dll` open their channel through the escape and
+  fall back to `\\.\HwGpu`. `gpu-install.cmd` deletes the global Khronos key
+  once the adapter exists and keeps it only for a machine without one.
+  `VulkanDriverNameWow` waits on a 32-bit driver.
+- **Markers and fences.** A submission whose private data holds a `hww_marker`
+  (a channel's `fence[ring]` the phone will reach) is held, polled with a
+  high-resolution timer only while some are pending, and finished with
+  `DxgkCbNotifyInterrupt`. Any other submission finishes at once. Untested until
+  the Direct3D driver part sends markers.
+- **A driver swap.** The renderer's epoch in the ring header changes when the
+  app restarts it. The adapter notices (`resets` in the counters), and markers
+  of the old epoch never finish, so Windows' timeout detection resets the
+  adapter. Tested: toggling a graphics driver in the app gave a new epoch and
+  `resets 1`, and a new channel opened and said hello straight after.
+- **The crash-loop breaker** counts starts in
+  `HKLM\SYSTEM\CurrentControlSet\Services\hwgpuw\Parameters\Attempts`,
+  clears the count ten seconds after a good start, and refuses to load when two
+  starts in a row did not get that far. It stopped a failing build from being
+  loaded a third time while this was being found.
+- **Counters** (`hwwtest counters`): bytes the phone copied into and out of
+  Windows memory (the sgpu sync path), bytes this driver copied for a program
+  (always 0), escapes, channels, mapped bytes, markers, resets.
+
+Not done: the x86 Vulkan driver (`VulkanDriverNameWow`), and the marker path
+under load.
 
 ## Things to check early
 

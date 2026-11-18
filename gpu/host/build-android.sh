@@ -13,7 +13,7 @@ CXX=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clan
 OUT=$HERE/../work/android/arm64-v8a
 mkdir -p "$OUT"
 "$CXX" -std=c++17 -O2 -fPIC -shared -Wall -Wextra -Wno-missing-field-initializers \
-  -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/hwgpu_host.cpp" "$HERE/hwgpu_jni.cpp" \
+  -I"$HERE/../work/mesa/include" -I"$HERE/../include" -I"$HERE/../../include" -I"$GFX/include" "$HERE/hwgpu_host.cpp" "$HERE/hwgpu_jni.cpp" \
   -L"$GFX/lib/arm64-v8a" -lgfxstream_backend -llog -ldl -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 \
   -o "$OUT/libhwgpu.so"
 # libhwd3d.so (hwd3d/hwd3d.cpp): HwD3D channels, which libhwgpu.so hands over (d3d/README.md), on
