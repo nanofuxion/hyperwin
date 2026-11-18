@@ -39,7 +39,7 @@ fc /b %G%\hwhid\hwhid.sys %SystemRoot%\System32\drivers\hwhid.sys >nul 2>&1 || p
 rem The render-only GPU adapter (wddm/README.md). Windows runs it from the driver store, so what is
 rem installed is remembered by the package's hash rather than by a copy in System32.
 set "NEWH="
-for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwgpuw\hwgpuw.sys SHA256 2^>nul') do if not defined NEWH set "NEWH=%%h"
+for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwgpuw\hwgpuw.inf SHA256 2^>nul') do if not defined NEWH set "NEWH=%%h"
 set "OLDH="
 if exist %G%\hwgpuw\installed.sha set /p OLDH=<%G%\hwgpuw\installed.sha
 if defined NEWH if not "%NEWH%"=="%OLDH%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwgpuw Root\HwGpuAdapter && (echo %NEWH%> %G%\hwgpuw\installed.sha)

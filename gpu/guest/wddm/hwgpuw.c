@@ -109,6 +109,34 @@ static ULONG guard_count(BOOLEAN write, ULONG value)
     return got;
 }
 
+/* Bring-up trace, built with -DHWW_TRACE: the names of the driver entries dxgkrnl calls, in order, kept in the
+ * service's Parameters key as Trace2. */
+#ifdef HWW_TRACE
+static CHAR g_tr[512];
+static LONG g_trn;
+static void tr(const char *name)
+{
+    LONG at = InterlockedExchangeAdd(&g_trn, 0);
+    for (ULONG i = 0; name[i] && at < (LONG)sizeof g_tr - 2; i++) g_tr[at++] = name[i];
+    g_tr[at++] = ' ';
+    g_tr[at] = 0;
+    InterlockedExchange(&g_trn, at);
+    if (KeGetCurrentIrql() > APC_LEVEL) return;
+    HANDLE key = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING path, vname;
+    ULONG disp;
+    RtlInitUnicodeString(&path, g.guard_path);
+    InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateKey(&key, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp))) return;
+    RtlInitUnicodeString(&vname, L"Trace2");
+    ZwSetValueKey(key, &vname, 0, REG_BINARY, g_tr, (ULONG)at + 1);
+    ZwClose(key);
+}
+#else
+#define tr(name) ((void)0)
+#endif
+
 /* Ten seconds after a good start the count goes back to zero. A thread does it, because a timer
  * callback may not touch the registry; it ends early when the device stops. */
 static KEVENT g_guard_stop;
@@ -653,7 +681,10 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     if (size < sizeof *caps) return STATUS_BUFFER_TOO_SMALL;
     RtlZeroMemory(caps, size);
     caps->HighestAcceptableAddress.QuadPart = ~0ull >> 1;
-    caps->MaxAllocationListSlotId = 0xffff;
+    caps->MaxAllocationListSlotId = 256;
+    caps->SchedulingCaps.MultiEngineAware = 1;
+    caps->SchedulingCaps.PreemptionAware = 1;
+    caps->PresentationCaps.SupportKernelModeCommandBuffer = 1;
     caps->ApertureSegmentCommitLimit = (SIZE_T)HW_HEAP_SIZE;
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
@@ -707,6 +738,7 @@ static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
 
 static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO *qai)
 {
+    tr("QAI");
     (void)hAdapter;
     switch (qai->Type) {
     case DXGKQAITYPE_DRIVERCAPS:
@@ -729,12 +761,14 @@ static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QU
 static NTSTATUS NTAPI HwCreateDevice(const HANDLE hAdapter, DXGKARG_CREATEDEVICE *cd)
 {
     (void)hAdapter;
+    tr("CreateDevice");
     cd->hDevice = &g;  /* one device context is all it needs: nothing is kept per device */
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI HwDestroyDevice(const HANDLE hDevice)
 {
+    tr("DestroyDevice");
     (void)hDevice;
     return STATUS_SUCCESS;
 }
@@ -742,17 +776,19 @@ static NTSTATUS NTAPI HwDestroyDevice(const HANDLE hDevice)
 static NTSTATUS NTAPI HwCreateContext(const HANDLE hDevice, DXGKARG_CREATECONTEXT *cc)
 {
     (void)hDevice;
+    tr("CreateContext");
     cc->hContext = &g;
-    cc->ContextInfo.DmaBufferSize = 64 * 1024;
+    cc->ContextInfo.DmaBufferSize = 16 * 1024;
     cc->ContextInfo.DmaBufferSegmentSet = 0;           /* system memory */
     cc->ContextInfo.DmaBufferPrivateDataSize = 64;     /* room for a marker */
-    cc->ContextInfo.AllocationListSize = 16;
-    cc->ContextInfo.PatchLocationListSize = 16;
+    cc->ContextInfo.AllocationListSize = 256;
+    cc->ContextInfo.PatchLocationListSize = 256;
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI HwDestroyContext(const HANDLE hContext)
 {
+    tr("DestroyContext");
     (void)hContext;
     return STATUS_SUCCESS;
 }
@@ -760,6 +796,7 @@ static NTSTATUS NTAPI HwDestroyContext(const HANDLE hContext)
 /* Programs create no kernel allocations through this adapter: the phone owns every object. */
 static NTSTATUS NTAPI HwCreateAllocation(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *ca)
 {
+    tr("CreateAlloc");
     (void)hAdapter;
     (void)ca;
     return STATUS_NOT_SUPPORTED;
@@ -786,12 +823,19 @@ static NTSTATUS NTAPI HwCloseAllocation(const HANDLE hDevice, const DXGKARG_CLOS
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS NTAPI HwNotSupported(const HANDLE h, PVOID arg)
-{
-    (void)h;
-    (void)arg;
-    return STATUS_NOT_SUPPORTED;
-}
+#define NOTSUP(fn, label) \
+    static NTSTATUS NTAPI fn(const HANDLE h, PVOID arg) \
+    { \
+        (void)h; \
+        (void)arg; \
+        tr(label); \
+        return STATUS_NOT_SUPPORTED; \
+    }
+NOTSUP(HwDescribeAllocation, "Describe")
+NOTSUP(HwGetStandardData, "StdData")
+NOTSUP(HwRenderDdi, "Render")
+NOTSUP(HwPresentDdi, "Present")
+NOTSUP(HwRenderKmDdi, "RenderKm")
 
 static NTSTATUS NTAPI HwSuccess(const HANDLE h, PVOID arg)
 {
@@ -901,8 +945,28 @@ static NTSTATUS NTAPI HwResetEngine(const HANDLE hAdapter, DXGKARG_RESETENGINE *
     return STATUS_SUCCESS;
 }
 
+/* Windows asks whether an engine answers, and which nodes a reset of it takes down. The phone keeps no
+ * engine apart from the channels, so the answer is always: responsive, and none but itself. */
+static NTSTATUS NTAPI HwQueryEngineStatus(const HANDLE hAdapter, DXGKARG_QUERYENGINESTATUS *qs)
+{
+    (void)hAdapter;
+    tr("EngineStatus");
+    RtlZeroMemory(&qs->EngineStatus, sizeof qs->EngineStatus);
+    qs->EngineStatus.Responsive = 1;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwQueryDependentEngineGroup(const HANDLE hAdapter, DXGKARG_QUERYDEPENDENTENGINEGROUP *dg)
+{
+    (void)hAdapter;
+    tr("DepGroup");
+    dg->DependentNodeOrdinalMask = 0;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS NTAPI HwGetNodeMetadata(const HANDLE hAdapter, UINT node, DXGKARG_GETNODEMETADATA *nm)
 {
+    tr("NodeMeta");
     (void)hAdapter;
     (void)node;
     RtlZeroMemory(nm, sizeof *nm);
@@ -1015,8 +1079,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     init.DxgkDdiCreateDevice = HwCreateDevice;
     init.DxgkDdiCreateAllocation = HwCreateAllocation;
     init.DxgkDdiDestroyAllocation = HwDestroyAllocation;
-    init.DxgkDdiDescribeAllocation = (PDXGKDDI_DESCRIBEALLOCATION)HwNotSupported;
-    init.DxgkDdiGetStandardAllocationDriverData = (PDXGKDDI_GETSTANDARDALLOCATIONDRIVERDATA)HwNotSupported;
+    init.DxgkDdiDescribeAllocation = (PDXGKDDI_DESCRIBEALLOCATION)HwDescribeAllocation;
+    init.DxgkDdiGetStandardAllocationDriverData = (PDXGKDDI_GETSTANDARDALLOCATIONDRIVERDATA)HwGetStandardData;
     init.DxgkDdiPatch = (PDXGKDDI_PATCH)HwSuccess;
     init.DxgkDdiSubmitCommand = HwSubmitCommand;
     init.DxgkDdiPreemptCommand = HwPreemptCommand;
@@ -1030,14 +1094,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     init.DxgkDdiDestroyDevice = HwDestroyDevice;
     init.DxgkDdiOpenAllocation = HwOpenAllocation;
     init.DxgkDdiCloseAllocation = HwCloseAllocation;
-    init.DxgkDdiRender = (PDXGKDDI_RENDER)HwNotSupported;
-    init.DxgkDdiPresent = (PDXGKDDI_PRESENT)HwNotSupported;
+    init.DxgkDdiRender = (PDXGKDDI_RENDER)HwRenderDdi;
+    init.DxgkDdiPresent = (PDXGKDDI_PRESENT)HwPresentDdi;
     init.DxgkDdiCreateContext = HwCreateContext;
     init.DxgkDdiDestroyContext = HwDestroyContext;
-    init.DxgkDdiRenderKm = (PDXGKDDI_RENDER)HwNotSupported;
+    init.DxgkDdiRenderKm = (PDXGKDDI_RENDER)HwRenderKmDdi;
     init.DxgkDdiResetEngine = HwResetEngine;
     init.DxgkDdiCancelCommand = HwCancelCommand;
     init.DxgkDdiGetNodeMetadata = HwGetNodeMetadata;
     init.DxgkDdiCalibrateGpuClock = HwCalibrateGpuClock;
+    init.DxgkDdiQueryEngineStatus = HwQueryEngineStatus;
+    init.DxgkDdiQueryDependentEngineGroup = HwQueryDependentEngineGroup;
     return HwDxgkInitialize(driver, registry, &init);
 }

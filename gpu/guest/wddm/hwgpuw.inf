@@ -13,6 +13,7 @@ PnpLockdown = 1
 [DestinationDirs]
 Hw.Miniport = 13
 Hw.Vulkan   = 13
+Hw.D3D      = 13
 
 [SourceDisksNames]
 1 = %Disk%,,,
@@ -21,6 +22,7 @@ Hw.Vulkan   = 13
 hwgpuw.sys        = 1
 vulkan_hwgpu.dll  = 1
 vulkan_hwgpu.json = 1
+hwd3d_umd.dll     = 1
 
 [Manufacturer]
 %Mfg% = Hw, NTarm64
@@ -30,7 +32,7 @@ vulkan_hwgpu.json = 1
 
 [Install.NT]
 FeatureScore = FB
-CopyFiles = Hw.Miniport, Hw.Vulkan
+CopyFiles = Hw.Miniport, Hw.Vulkan, Hw.D3D
 AddReg    = Install.AddReg
 
 [Hw.Miniport]
@@ -39,6 +41,9 @@ hwgpuw.sys,,,0x100
 [Hw.Vulkan]
 vulkan_hwgpu.dll,,,0x100
 vulkan_hwgpu.json,,,0x100
+
+[Hw.D3D]
+hwd3d_umd.dll,,,0x100
 
 [Install.NT.Services]
 AddService = hwgpuw, 0x00000002, Hw.Service
@@ -52,9 +57,10 @@ ServiceBinary  = %13%\hwgpuw.sys
 
 [Install.AddReg]
 HKR,,VulkanDriverName,0,"%13%\vulkan_hwgpu.json"
-; The Direct3D driver part is not built yet; Windows wants the names (wddm/README.md phase 4).
-HKR,,UserModeDriverName,0x00010000,"hwd3d_umd.dll"
-HKR,,UserModeDriverNameWow,0x00010000,"hwd3d_umd_x86.dll"
+; The Direct3D 10/11 driver (gpu/guest/hwd3d/umd.cpp, wddm/README.md phase 4). The 32-bit one follows.
+; One name per Direct3D version, in order: 9, 10, 11, 12. Full paths: the kernel opens them to read their version.
+HKR,,UserModeDriverName,0x00010000,"%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll"
+HKR,,UserModeDriverNameWow,0x00010000,"%13%\hwd3d_umd_x86.dll","%13%\hwd3d_umd_x86.dll","%13%\hwd3d_umd_x86.dll","%13%\hwd3d_umd_x86.dll"
 HKR,,InstalledDisplayDrivers,0x00010000,"hwd3d_umd"
 
 [Strings]

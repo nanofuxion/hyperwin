@@ -430,6 +430,56 @@ settles, so the work can be cut into steps that each run:
   rest. d3d10core (Direct3D 10 programs) comes with it, since the runtime's
   Direct3D 10 faces sit on the same driver.
 
+## Phase 4, first results (2026-11-18)
+
+Built: `gpu/guest/hwd3d/umd.cpp`, the Direct3D 10/11 user-mode driver, as ARM64X
+`hwd3d_umd.dll`, shipped in the adapter's package. `gen_umd.py` reads the driver
+header (from `gpu/work/wdk`, never committed) and writes the table of every entry;
+`wire.h` is the channel code that `d3d11.c` shares. Reached on the phone:
+
+- Windows loads the driver for the adapter, negotiates the interface (it offers
+  WDDM 1.3, 11.1 and 11.0), reads the caps and creates a device and an immediate
+  context on the phone's DXVK. The entries written so far: resources, render target
+  views, clear, copy, maps, format and multisample answers, flush, destroy.
+
+What the work found, for whoever picks it up:
+
+- **Driver names.** `UserModeDriverName` is one name per Direct3D version, in order
+  9, 10, 11, 12, and each must be a full path (`%13%\hwd3d_umd.dll`). A bare name
+  works for 9 and fails for the rest, and the kernel logs "Failed to open the user
+  mode driver DLL" (ETW provider Microsoft-Windows-DxgKrnl).
+- **Kernel contexts.** dxgkrnl refused `D3DKMTCreateContext` with `0xC000000D`
+  without calling the driver ("Can't create regular DMA buffer with no associated
+  allocation list"). It took `PresentationCaps.SupportKernelModeCommandBuffer = 1`,
+  `SchedulingCaps` multi-engine and preemption aware, `MaxAllocationListSlotId = 256`,
+  and the two engine DDIs `DxgkDdiQueryEngineStatus` and
+  `DxgkDdiQueryDependentEngineGroup`. The runtime wants a context from the driver.
+- **Format answers.** The runtime cross-checks them. A format with multisample
+  levels must say it can be loaded or targeted that way, and the four depth planes
+  that exist only as shader views (`R32_FLOAT_X8X24`, `X32_TYPELESS_G8X24`,
+  `R24_UNORM_X8`, `X24_TYPELESS_G8`) must answer nothing. The driver answers from
+  DXVK and applies those rules (`ddi_format_bits`).
+- **Pipeline levels.** Caps word 130 with the 11.0 bit set makes the runtime close
+  the adapter right after the caps, before it asks for a device size. With 10.0 and
+  10.1 it goes on. Not solved: what 11.0 needs, so the adapter reports 10.1 for now.
+- **Result.** `dxtest 11` passes with nothing beside it, through Windows' own
+  `d3d11.dll`: the device is made on the HyperWin GPU (feature level 10.1), a
+  target is cleared on the phone, copied to a staging resource and read back
+  (`00 ff 00 ff`). The default adapter works too. Every other entry is still a
+  stub that logs its name once: state objects, shaders, views, draws, queries,
+  presents. They come next, as the cube and the AIO scenes ask for them.
+- **Last bug.** The runtime stopped for a long while at the depth planes that exist
+  only as shader views. See "Format answers" above.
+- **Tools.** `HWD3D_UMDLOG=<file>` logs the driver's calls, `HWD3D_UMDFMT=1` the
+  format answers, `HWD3D_CAP_<n>=<hex>` and `HWD3D_FMT_<n>=<hex>` override a caps word
+  or a format's bits, `-DHWW_TRACE` makes the kernel driver keep a call trace in
+  `Parameters\Trace2`. `umdprobe.cpp`, `kmtprobe.cpp`, `warpcaps.cpp` and
+  `guest/tools/umdname.c` are the test programs. A new driver DLL can be swapped
+  into the driver store without a restart (rename the old one first).
+- **The default adapter.** DXGI lists the HyperWin GPU first, so a program that
+  passes no adapter gets it. Until the driver makes a device, such a program fails
+  with `0x887A0004`, as it did before this driver existed.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
