@@ -11,7 +11,7 @@
 //
 // Built for Windows too (gpu/guest/hwd3d/build.sh, d3dcube-*.exe), it is HwD3D's phase-2 test: the
 // same cube through HwD3D's d3d11.dll beside it, onto the phone's screen.
-//   d3dcube.exe [seconds] [width] [height] [cubes] [1: wait for each frame with a query]
+//   d3dcube.exe [seconds] [width] [height] [cubes] [1: wait for each frame with a query] [1: flip model]
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -113,6 +113,8 @@ int main(int argc, char** argv) {
     // Wait for each frame with an event query, as games that keep one frame in flight do (HwD3D
     // phase 3's query page).
     bool sync = argc > 5 && atoi(argv[5]);
+    // A flip-model swap chain (DXGI_SWAP_EFFECT_FLIP_DISCARD): DWM takes the buffers themselves.
+    bool flip = argc > 6 && atoi(argv[6]);
 #ifdef _WIN32
     HWND window = make_window(w, h);
 #else
@@ -139,6 +141,14 @@ int main(int argc, char** argv) {
     scd.OutputWindow = reinterpret_cast<HWND>(window);
     scd.SampleDesc.Count = 1;
     scd.Windowed = TRUE;
+#ifdef _WIN32
+    if (flip) {
+        scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scd.BufferCount = 2;
+    }
+#else
+    (void)flip;
+#endif
     const D3D_FEATURE_LEVEL want[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;

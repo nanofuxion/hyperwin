@@ -763,6 +763,14 @@ to Windows and back.
 - The touch keyboard (TabTip.exe, under `Common Files\microsoft shared`) made a device every few
   seconds. It is now treated as Windows' own program and gets the software renderer.
 - Seen working: the desktop, taskbar, Registry Editor and winver, all drawn by DWM on the phone.
+- Direct3D programs in a window: DXGI asks for a blt with no destination (flags 0x1), even for a
+  `FLIP_DISCARD` swap chain (`d3dcube ... 1` as the seventh argument) and with Windows' "optimizations
+  for windowed games" on. The kernel present of such a blt is accepted, but `DxgkDdiPresent` is never
+  called and nothing shows. So the driver sends only flips (or presents with a destination) through
+  the kernel. Blts keep the read-back into the window, which costs a copy each frame. DXGI picks the
+  model from the adapter's kind: next to read is how a render-only adapter behind an indirect display
+  gets flips (hybrid caps, cross-adapter resources). Swap chain buffers (`BIND_PRESENT`) are already
+  shared surfaces, so a flip would need no other change in the user-mode driver.
 - Left: a sync fence instead of the wait, the cursor, the screen layer hidden when not
   used, the HyperWin screen made the main one and installed by default, and `IddRender`/`HWD3D_SYSTEM` on
   by default. A crash in `call_async`/`call_wait` when a channel goes away (TabTip, DWM restart) and one

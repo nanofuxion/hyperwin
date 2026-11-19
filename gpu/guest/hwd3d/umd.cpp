@@ -352,7 +352,8 @@ static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CRE
         ulog("hwd3d_umd:   %p dim %u %ux%ux%u format %u usage %u bind 0x%x map 0x%x misc 0x%x primary %d init %d\n", (void *)o,
              (unsigned)a->ResourceDimension, o->r.width, o->r.height, o->r.depth, (unsigned)a->Format, (unsigned)a->Usage, a->BindFlags,
              a->MapFlags, a->MiscFlags, a->pPrimaryDesc != NULL, a->pInitialDataUP != NULL);
-    if (o->dim == 3 && ((a->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) || a->pPrimaryDesc) && o->subs == 1 && o->samples <= 1 &&
+    if (o->dim == 3 && ((a->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) || a->pPrimaryDesc || (a->BindFlags & D3D10_DDI_BIND_PRESENT)) &&
+        o->subs == 1 && o->samples <= 1 &&
         !a->pInitialDataUP && create_shared(d, a, rt, o, &desc.t2))
         return;
     struct wbuf *b = dc(d, method);
@@ -2065,7 +2066,8 @@ static HRESULT __stdcall u_dxgi_present(DXGI_DDI_ARG_PRESENT *a)
     ulog_call("dxgi Present");
     Dev *d = reinterpret_cast<Dev *>(a->hDevice);
     Obj *src = reinterpret_cast<Obj *>(a->hSurfaceToPresent);
-    if (src && src->kalloc) return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
+    if (src && src->kalloc && (a->Flags.Flip || a->hDstResource))
+        return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
     return present_surface(d, src);
 }
 
@@ -2076,7 +2078,14 @@ static HRESULT __stdcall u_dxgi_present1(DXGI_DDI_ARG_PRESENT1 *a)
     if (!a->SurfacesToPresent) return S_OK;
     Dev *d = reinterpret_cast<Dev *>(a->hDevice);
     Obj *src = reinterpret_cast<Obj *>(a->phSurfacesToPresent[0].hSurface);
-    if (src && src->kalloc) return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
+    static LONG told;
+    if (!InterlockedExchange(&told, 1))
+        ulog("hwd3d_umd: first present: flags 0x%x, destination %d, shared %d\n", a->Flags.Value, a->hDstResource != 0, src && src->kalloc);
+    /* A flip hands the surface itself to DWM, which draws on the phone too: no copy. A blt to a window
+     * (DXGI's older swap effects) has nowhere on the phone to go yet, so it is read back and drawn into the
+     * window. Windows' "optimizations for windowed games" turns those into flips. */
+    if (src && src->kalloc && (a->Flags.Flip || a->hDstResource))
+        return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
     return present_surface(d, src);
 }
 
