@@ -158,6 +158,7 @@ struct Obj {
     Shadow *shadows;
     uint32_t share;        /* shared surfaces: the phone's share id (HWD3D_OP_CREATE_SHARED) */
     uint32_t swap_rb;      /* a BGRA surface the phone keeps as RGBA (see rgba_of): its views are swapped too */
+    uint32_t primary;      /* a surface of a screen this adapter shows (the screen half, wddm/README.md) */
     D3DKMT_HANDLE kalloc;  /* and the kernel allocation that carries it to other programs */
     HANDLE rtres;          /* the runtime's resource, for freeing that allocation */
     /* Views of shared surfaces are remade when DXGI rotates the surfaces (u_dxgi_rotate). */
@@ -266,12 +267,17 @@ static bool create_shared(Dev *d, const D3D11DDIARG_CREATERESOURCE *a, D3D10DDI_
     o->h = h;
     o->share = id;
     o->swap_rb = phone.Format != t2->Format;
+    o->primary = a->pPrimaryDesc != nullptr;
     struct hww_alloc al = {};
     al.magic = HWW_ALLOC_MAGIC;
     al.kind = a->pPrimaryDesc ? HWW_ALLOC_PRIMARY : HWW_ALLOC_UMD;
     al.width = t2->Width;
     al.height = t2->Height;
     al.format = (uint32_t)t2->Format;
+    if (a->pPrimaryDesc)   /* Windows matches a primary against the screen's mode, in its own format codes */
+        al.format = t2->Format == DXGI_FORMAT_B8G8R8X8_UNORM ? D3DDDIFMT_X8R8G8B8
+                  : t2->Format == DXGI_FORMAT_R8G8B8A8_UNORM || t2->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? D3DDDIFMT_A8B8G8R8
+                                                                                                             : D3DDDIFMT_A8R8G8B8;
     al.source = a->pPrimaryDesc ? a->pPrimaryDesc->VidPnSourceId : 0;
     al.id = id;
     D3DDDI_ALLOCATIONINFO ai = {};
@@ -400,6 +406,7 @@ static void APIENTRY u_DestroyResource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE h
 {
     Obj *o = OB(h);
     Dev *d = DV(hd);
+    if (o->primary) ulog("hwd3d_umd: primary %u destroyed\n", o->share);
     if (o->kalloc && d->kcb && d->kcb->pfnDeallocateCb) {
         D3DDDICB_DEALLOCATE cb = {};
         cb.hResource = o->rtres;
@@ -2263,7 +2270,16 @@ static HRESULT kernel_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
     p.pDXGIContext = dxgi_context;
     p.hContext = d->kctx;
     HRESULT hr = d->dxcb->pfnPresentCb(d->rt.handle, &p);
-    if (FAILED(hr)) ulog("hwd3d_umd: kernel present of shared surface %u: 0x%08lx\n", src->share, (unsigned long)hr);
+    if (hr != S_OK) ulog("hwd3d_umd: kernel present of shared surface %u: 0x%08lx\n", src->share, (unsigned long)hr);
+    static LONG primaries_told;
+    if (src->primary && InterlockedIncrement(&primaries_told) <= 40)
+        ulog("hwd3d_umd: present of primary %u: 0x%08lx\n", src->share, (unsigned long)hr);
+    /* A flip to a screen this adapter shows: the phone shows that surface as it is, no copy. */
+    if (SUCCEEDED(hr) && src->primary && !dst) {
+        struct wbuf *b = begin(d->hdev, 0, HWD3D_OP_SCANOUT);
+        put32(b, src->share);
+        call_async(b);
+    }
     return hr;
 }
 

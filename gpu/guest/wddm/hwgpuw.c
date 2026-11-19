@@ -701,6 +701,7 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     (void)info;
     g.dxgk = *iface;
     report_bases();
+    if (d.on) hwd_size_from_phone();
     *sources = d.on ? 1 : 0;   /* render-only unless Parameters\Display asks for the screen half */
     *children = d.on ? 1 : 0;
     InitializeListHead(&g.chans);

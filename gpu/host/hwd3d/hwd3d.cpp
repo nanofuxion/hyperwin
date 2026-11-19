@@ -155,6 +155,8 @@ struct Mapped {
     uint8_t* data;
 };
 
+void drop_shared_object(uint32_t slot, uint32_t object);
+
 struct Chan {
     void* chan = nullptr;
     uint32_t slot = 0, generation = 0;
@@ -300,6 +302,7 @@ struct Chan {
     void release(uint32_t h) {
         uint32_t i = h & 0xFFFFF;
         if (!h || i >= table.size() || !table[i].ptr || handle(i, table[i].gen) != h) return;
+        drop_shared_object(slot, h);
         Obj& o = table[i];
         found.erase({o.ident, o.iface});
         if (h == swapchain) {
@@ -835,6 +838,7 @@ struct Shared {
     AHardwareBuffer* ahb = nullptr;
     D3D11_TEXTURE2D_DESC desc{};
     uint32_t owner = 0;   // the channel slot that made it; it goes when that channel ends
+    uint32_t object = 0;  // or sooner, when the owner releases this texture
 };
 std::mutex g_shared_lock;
 std::map<uint32_t, Shared> g_shared;
@@ -1064,7 +1068,12 @@ int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
         id = g_next_share++;
         g_shared[id] = Shared{ahb, d, c.slot};
     }
-    w.u32(c.put(tex, HI_ID3D11Texture2D));
+    uint32_t object = c.put(tex, HI_ID3D11Texture2D);
+    {
+        std::lock_guard<std::mutex> g(g_shared_lock);
+        g_shared[id].object = object;
+    }
+    w.u32(object);
     w.u32(id);
     LOG("channel %u: shared surface %u, %ux%u format %u", c.slot, id, d.Width, d.Height, unsigned(d.Format));
     return S_OK;
@@ -1175,6 +1184,20 @@ int32_t scanout(Chan& c, Rd& r) {
     if (tell) LOG("channel %u: screen frame %llu on the layer", c.slot, (unsigned long long)c.presents + 1);
     c.presents++;
     return S_OK;
+}
+
+// The owner let go of its texture: no new program can open the surface. Programs that opened it keep
+// their own import, and the screen keeps what it shows. Without this every swap chain DWM rebuilt stayed
+// in phone memory until DWM's channel closed.
+void drop_shared_object(uint32_t slot, uint32_t object) {
+    std::lock_guard<std::mutex> g(g_shared_lock);
+    for (auto it = g_shared.begin(); it != g_shared.end(); ++it) {
+        if (it->second.owner == slot && it->second.object == object) {
+            AHardwareBuffer_release(it->second.ahb);
+            g_shared.erase(it);
+            return;
+        }
+    }
 }
 
 void drop_shared(uint32_t slot) {

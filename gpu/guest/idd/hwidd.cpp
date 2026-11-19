@@ -432,6 +432,14 @@ static void choose_render_adapter(IDDCX_ADAPTER adapter)
 // Connects the monitor with the modes and EDID for the current app size.
 static NTSTATUS connect_monitor(IDDCX_ADAPTER adapter)
 {
+    /* With the GPU driver's screen half on (hwgpuw Parameters\Display = 1) that adapter is the screen:
+     * this one shows nothing, so Windows has one monitor and the phone one source of frames. */
+    DWORD gpu_screen = 0, size = sizeof gpu_screen;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\hwgpuw\\Parameters", L"Display",
+                     RRF_RT_REG_DWORD, nullptr, &gpu_screen, &size) == ERROR_SUCCESS && gpu_screen == 1) {
+        hwidd_log("the HyperWin GPU shows the screen: no monitor here");
+        return STATUS_SUCCESS;
+    }
     build_modes();
     IDDCX_MONITOR_INFO info = {};
     info.Size = sizeof info;

@@ -541,6 +541,7 @@ static NTSTATUS NTAPI HwdGetStandardData_impl(const HANDLE hAdapter, DXGKARG_GET
         arg->pCreateStagingSurfaceData->Pitch = a->width * 4;
         return STATUS_SUCCESS;
     default:
+        report(L"D_StdTypeRefused", (ULONG)arg->StandardAllocationType);
         return STATUS_NOT_SUPPORTED;
     }
 }
@@ -745,6 +746,22 @@ static void hwd_stop(void)
 }
 
 /* Called from DriverEntry: read the switch, and fill the display entries only when it is on. */
+/* The screen's size is the one chosen in the app (the window header's want_*), as the indirect display
+ * had it; DisplayWidth/DisplayHeight in Parameters are only the fallback. */
+static void hwd_size_from_phone(void)
+{
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)HW_WINDOW_PA;
+    const struct hw_header *h = MmMapIoSpace(pa, PAGE_SIZE, MmCached);
+    if (!h) return;
+    if (RtlCompareMemory(h->magic, HW_MAGIC, 8) == 8 && h->screen_want_width >= 640 && h->screen_want_width <= 7680 &&
+        h->screen_want_height >= 480 && h->screen_want_height <= 4320) {
+        d.native_w = d.cur_w = h->screen_want_width & ~1u;
+        d.native_h = d.cur_h = h->screen_want_height & ~1u;
+    }
+    MmUnmapIoSpace((PVOID)h, PAGE_SIZE);
+}
+
 static void hwd_setup(DRIVER_INITIALIZATION_DATA *init)
 {
     /* Allocations whatever the switch: shared surfaces (DWM's, for the screen driver) need them. */

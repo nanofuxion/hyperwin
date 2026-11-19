@@ -856,6 +856,15 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
     `GraphicsDrivers\TdrLevel` = 0 keeps a stall from becoming a blue screen so `T_*` can be read.
   - Recovering a machine that crashes on every boot: the guard catches the third start. Overwrite the
     driver file in its DriverStore folder from Windows, set `Attempts` = 0 and restart.
+  - Second try at owning the screen (same day): with `Display` = 1 the IDD now creates no monitor
+    (hwidd reads hwgpuw's `Parameters\Display`), the kernel takes the screen size from the window header
+    (`screen_want_*`), the Direct3D driver marks primaries and sends `HWD3D_OP_SCANOUT` for each flip
+    of one, and primaries carry D3DDDI format codes. Windows then makes the HyperWin GPU the main
+    screen (800x600 from its saved settings; 1950x900 is offered). The phone stays black: DWM creates
+    its three buffers and a primary, `SetDisplayMode` succeeds, and DWM destroys the primary at once
+    and starts again, in a loop, with no present. Unsolved. Each round left four shared surfaces on
+    the phone until DWM's channel closed, which ran the phone out of memory (the low-memory killer
+    took the GPU process and the app). Shared surfaces are now freed when their owner releases them.
   - Next: the phone's screen still comes from the IDD. The HyperWin GPU's own source address has to reach
     the phone (scanout), then the IDD can go and our adapter becomes the only screen.
 - For quick tests the driver DLL can be renamed and replaced inside the installed package: programs
