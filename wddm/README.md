@@ -826,6 +826,13 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
   adapter has no 3D. Windows' hybrid support needs an integrated WDDM GPU for the screen, so it does not
   apply. What is left to try: the kernel display half (the HyperWin GPU owning the screen, parked on
   `VIDEO_TDR`), or Direct3D 9 on 12 once phase 8 brings a Direct3D 12 driver.
+- Option one tried (2026-11-19, spare): `Display` = 1 with today's driver makes Windows stop with
+  `SYSTEM_THREAD_EXCEPTION_NOT_HANDLED` (`C0000005` inside `dxgmms1.sys`, the video memory manager) as
+  soon as the adapter starts with its screen half, at boot or on a device restart. The last step marker
+  points at the kernel present. The start guard then keeps the driver off, and `Display` = 0 brings the
+  machine back. No dump was written: this Windows has no page file, so the next try needs one (or a
+  dedicated dump file that exists before the crash) and Microsoft's debugger to read it.
+  `CrashControl\AutoReboot` = 0 on the spare keeps the blue screen up, and it reaches the phone.
 - For quick tests the driver DLL can be renamed and replaced inside the installed package: programs
   started afterwards load the new one (`/tmp/swapumd.sh` while testing).
 
