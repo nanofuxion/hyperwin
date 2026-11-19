@@ -28,7 +28,7 @@ DXN=$HERE/../work/dxvk-native/include
   -I"$DXN/native/windows" -I"$DXN/native/directx" -I"$DXN/native" -I"$GEN" \
   -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -L"$OUT" \
   -lhwgpu -llog -ldl -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
-for l in d3d11 dxgi; do "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" -o "$OUT/libdxvk_$l.so" "$DXVK/libdxvk_$l.so"; done
+for l in d3d11 dxgi d3d9; do "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" -o "$OUT/libdxvk_$l.so" "$DXVK/libdxvk_$l.so"; done
 cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"
 # ring_test for the phone's shell: adb push gpu/work/android/arm64-v8a /data/local/tmp/hwgpu, then

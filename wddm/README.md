@@ -808,6 +808,27 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
   an imported image during a copy (`find_crc_invalidate_transitions`), also with linear buffers. Explorer
   stays on Windows' software renderer.
 
+## Phase 7, first slice (2026-11-19): the Direct3D 9 driver part
+
+- `gpu/guest/hwd3d/umd9.inc` (in `hwd3d_umd.dll`, export `OpenAdapter`) implements the Direct3D 9
+  driver interface: caps and formats from the phone, resources with CPU copies for locks, render and
+  texture stage states (sampler states split out), streams including user-memory ones, draws, clears,
+  shaders and declarations, constants, render targets, blts, colour fills, `TexBlt` from system memory,
+  queries and a present that reads back into the program's window. `gen_umd.py` lists the Direct3D 9
+  table from the WDK's `d3dumddi.h` at build time, and every entry not written yet logs once.
+- On the phone, `gpu/host/hwd3d/hwd3d9.inc` runs each `HWD3D_OP_D9` request on DXVK's Direct3D 9
+  (`libdxvk_d3d9.so`, now in the app), with a device made without a window.
+- `guest/tools/d3d9test.c` (ARM64, x64, x86): Windows' `d3d9.dll` opens the HyperWin GPU's driver
+  ("HyperWin GPU (hwd3d_umd.dll)"), takes its caps (vs/ps 3.0 from DXVK) and 40 formats, then answers
+  `D3DERR_NOTAVAILABLE` for the HAL device (`GetDeviceCaps`, `CheckDeviceType`, `CreateDevice`) without
+  calling `CreateDevice` in the driver. The driver interface version (Windows 7, WDDM 1.3, latest) makes
+  no difference. Direct3D 9 enumerates screens, and the screen here is the indirect display, whose own
+  adapter has no 3D. Windows' hybrid support needs an integrated WDDM GPU for the screen, so it does not
+  apply. What is left to try: the kernel display half (the HyperWin GPU owning the screen, parked on
+  `VIDEO_TDR`), or Direct3D 9 on 12 once phase 8 brings a Direct3D 12 driver.
+- For quick tests the driver DLL can be renamed and replaced inside the installed package: programs
+  started afterwards load the new one (`/tmp/swapumd.sh` while testing).
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

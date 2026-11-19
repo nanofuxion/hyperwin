@@ -13,7 +13,7 @@ GEN=$ROOT/gpu/work/umd-gen
 OUT=$ROOT/gpu/work/umd-out
 INC=$ROOT/build/third_party/win/llvm-mingw/generic-w64-mingw32/include
 mkdir -p "$OUT"
-python3 "$HERE/gen_umd.py" "$K/um/d3d10umddi.h" "$GEN"
+python3 "$HERE/gen_umd.py" "$K/um/d3d10umddi.h" "$GEN" "$K/um/d3dumddi.h"
 python3 "$ROOT/gpu/host/hwd3d/gen_thunks.py" "$INC" "$ROOT/gpu/work/hwd3d-gen" >/dev/null
 # mingw's headers first, the driver headers after: the driver header needs nothing mingw lacks but dxmini.h.
 "$ROOT/gpu/guest/arm64x/clang++" -std=c++17 -O2 -Wall -Wno-unused-function -Wno-microsoft-anon-tag -Wno-missing-field-initializers \

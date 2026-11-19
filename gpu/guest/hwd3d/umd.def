@@ -1,3 +1,4 @@
 LIBRARY hwd3d_umd
 EXPORTS
     OpenAdapter10_2
+    OpenAdapter

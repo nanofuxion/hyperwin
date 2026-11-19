@@ -2681,3 +2681,5 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
     }
     return TRUE;
 }
+
+#include "umd9.inc"

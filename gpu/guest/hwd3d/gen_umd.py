@@ -5,7 +5,9 @@ writes what the user-mode driver needs at build time:
                   from the first build (hwd3d_umd.cpp points the ones it has not written at a stub)
   umd_proto.txt   each entry's member name and prototype, for reading while writing entries by hand
 Nothing here is copied into a source file we keep: the output stays under gpu/work.
-  gen_umd.py <d3d10umddi.h> <outdir>"""
+  umd9_tables.inc one UMD9_FILL(member) line per entry of the Direct3D 9 driver's table (d3dumddi.h, the
+                  second argument when given)
+  gen_umd.py <d3d10umddi.h> <outdir> [d3dumddi.h]"""
 import re, sys, os
 
 hdr, out = sys.argv[1], sys.argv[2]
@@ -37,3 +39,16 @@ for t in TABLES:
 open(os.path.join(out, "umd_tables.inc"), "w").write("\n".join(inc) + "\n")
 open(os.path.join(out, "umd_proto.txt"), "w").write("\n".join(txt) + "\n")
 print(len(inc), "table entries")
+
+# The Direct3D 9 driver's table (wddm/README.md phase 7).
+if len(sys.argv) > 3:
+    s9 = open(sys.argv[3], encoding="utf-8", errors="replace").read()
+    s9 = re.sub(r"/\*.*?\*/", "", s9, flags=re.S)
+    s9 = re.sub(r"//[^\n]*", "", s9)
+    m = re.search(r"typedef\s+struct\s+_D3DDDI_DEVICEFUNCS\s*\{(.*?)\}\s*D3DDDI_DEVICEFUNCS\s*;", s9, flags=re.S)
+    if not m:
+        sys.exit("no D3DDDI_DEVICEFUNCS")
+    body = re.sub(r"#\s*\w+[^\n]*", "", m.group(1))
+    names9 = [fm.group(2) for fm in re.finditer(r"(PFN\w+)\s+(pfn\w+)\s*;", body)]
+    open(os.path.join(out, "umd9_tables.inc"), "w").write("".join("UMD9_FILL(%s)\n" % n for n in names9))
+    print(len(names9), "Direct3D 9 entries")

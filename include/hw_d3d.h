@@ -41,7 +41,74 @@
 #define HWD3D_OP_SCANOUT        0x0017u   /* share id: put that surface on the phone's screen; no answer */
 #define HWD3D_OP_SET_CB1        0x0019u   /* object: context, method: stage (VS PS GS HS DS CS = 0-5); start, n,
                                              handles, then n first constants and n counts: XSSetConstantBuffers1 */
-#define HWD3D_OP_FINISH         0x0018u   /* -> status once this channel's GPU work is done (before a shared surface is shown) */
+#define HWD3D_OP_FINISH         0x0018u
+/* Direct3D 9 (wddm/README.md phase 7): HWD3D_OP_D9 with the call's object = a Direct3D 9 handle of the
+ * channel (0 for device-less calls) and method = one of these. Each maps onto DXVK's IDirect3DDevice9. */
+#define HWD3D_OP_D9             0x001Au
+enum hwd3d9_method {
+    HWD3D9_CREATE_DEVICE = 1,  /* -> device handle, D3DCAPS9 */
+    HWD3D9_FORMATS,            /* n, D3DFORMATs -> n HWD3D9_FMT_* masks */
+    HWD3D9_CREATE_RES,         /* struct hwd3d9_res -> handle */
+    HWD3D9_RELEASE,
+    HWD3D9_RS,                 /* state, value */
+    HWD3D9_TSS,                /* stage, type, value */
+    HWD3D9_SS,                 /* sampler, type, value */
+    HWD3D9_TEXTURE,            /* stage, resource */
+    HWD3D9_STREAM,             /* stream, buffer, offset, stride */
+    HWD3D9_INDICES,            /* buffer */
+    HWD3D9_DRAW,               /* type, start, count */
+    HWD3D9_DRAW_IDX,           /* type, base, min, vertices, start, count */
+    HWD3D9_DRAW_UP,            /* type, count, stride, vertices */
+    HWD3D9_DRAW_IDX_UP,        /* type, min, vertices, count, index format, indices, stride, vertex data */
+    HWD3D9_CLEAR,              /* flags, colour, z (float bits), stencil, rects */
+    HWD3D9_VIEWPORT,           /* D3DVIEWPORT9 */
+    HWD3D9_TRANSFORM,          /* state, D3DMATRIX */
+    HWD3D9_MATERIAL,           /* D3DMATERIAL9 */
+    HWD3D9_LIGHT,              /* index, D3DLIGHT9 */
+    HWD3D9_LIGHT_ENABLE,       /* index, on */
+    HWD3D9_CLIP_PLANE,         /* index, 4 floats */
+    HWD3D9_CREATE_VS,          /* tokens -> handle */
+    HWD3D9_CREATE_PS,          /* tokens -> handle */
+    HWD3D9_CREATE_DECL,        /* D3DVERTEXELEMENT9s -> handle */
+    HWD3D9_SET_VS, HWD3D9_SET_PS, HWD3D9_SET_DECL,
+    HWD3D9_VS_F, HWD3D9_VS_I, HWD3D9_VS_B, HWD3D9_PS_F, HWD3D9_PS_I, HWD3D9_PS_B,   /* first, count, values */
+    HWD3D9_SCISSOR,            /* RECT */
+    HWD3D9_RT,                 /* index, resource, subresource */
+    HWD3D9_DS,                 /* resource */
+    HWD3D9_WRITE,              /* resource, subresource, struct hwd3d9_box, row pitch, slice pitch, bytes */
+    HWD3D9_READ,               /* resource, subresource -> row pitch, rows, bytes */
+    HWD3D9_STRETCH,            /* src, sub, RECT, dst, sub, RECT, filter */
+    HWD3D9_FILL,               /* dst, sub, RECT, colour */
+    HWD3D9_FREQ,               /* stream, divider */
+    HWD3D9_COPY_RES,           /* src, dst: every subresource, as TexBlt and UpdateTexture */
+    HWD3D9_GENMIPS,            /* resource */
+    HWD3D9_FINISH,             /* -> when the device's work is done */
+    HWD3D9_QUERY,              /* type -> handle */
+    HWD3D9_QUERY_ISSUE,        /* query, flags */
+    HWD3D9_QUERY_DATA,         /* query, size -> S_FALSE or the data */
+};
+/* What the phone can do with a format (HWD3D9_FORMATS). */
+#define HWD3D9_FMT_TEXTURE   0x001u
+#define HWD3D9_FMT_CUBE      0x002u
+#define HWD3D9_FMT_VOLUME    0x004u
+#define HWD3D9_FMT_RT        0x008u
+#define HWD3D9_FMT_DS        0x010u
+#define HWD3D9_FMT_SRGBREAD  0x020u
+#define HWD3D9_FMT_SRGBWRITE 0x040u
+#define HWD3D9_FMT_VTX_TEX   0x080u
+#define HWD3D9_FMT_DISPLAY   0x100u
+#define HWD3D9_FMT_PLAIN     0x200u
+#define HWD3D9_FMT_BLEND     0x400u   /* post-pixel-shader blending */
+#define HWD3D9_FMT_FILTER    0x800u
+#define HWD3D9_FMT_AUTOGEN   0x1000u
+enum hwd3d9_kind { HWD3D9_TEX = 1, HWD3D9_CUBE, HWD3D9_VOL, HWD3D9_RTSURF, HWD3D9_DSSURF, HWD3D9_PLAIN, HWD3D9_VB, HWD3D9_IB };
+struct hwd3d9_res {
+    uint32_t kind, format, pool, usage, width, height, depth, levels, ms_type, ms_quality, fvf, lockable;
+};
+struct hwd3d9_box {
+    uint32_t valid, left, top, front, right, bottom, back;   /* buffers: left..right are bytes */
+};
+   /* -> status once this channel's GPU work is done (before a shared surface is shown) */
 /* The screen driver's way to hand a frame over through the ordinary Direct3D 11 API: UpdateSubresource of a
  * shared surface with a 1x1 box at 0,0, row pitch HWD3D_SCANOUT_PITCH and depth pitch HWD3D_SCANOUT_SLICE.
  * The driver sends HWD3D_OP_SCANOUT instead of writing the pixel. (SetResourceMinLOD never reached the

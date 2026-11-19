@@ -7,6 +7,7 @@
 // (gen_thunks.py) read the arguments of most methods; the rest are below.
 #include <windows.h>
 #include <d3d11_3.h>
+#include <d3d9.h>
 #include <dxgi.h>
 
 #include <hw_d3d.h>
@@ -175,6 +176,7 @@ struct Chan {
     void* window = nullptr;                    // the surface, while this program has it
     uint32_t swapchain = 0;
     std::string exe, conf;                     // the program this channel draws for, and its dxvk.conf
+    struct D9State* d9 = nullptr;              // Direct3D 9 objects (hwd3d9.inc)
     uint8_t* stage = nullptr;                  // the staging area in the heap (hw_d3d.h)
     uint64_t stage_size = 0;
     // Queries ended and not yet answered in the query page.
@@ -339,6 +341,7 @@ struct Chan {
 };
 
 #include "hwd3d_host.inc"
+#include "hwd3d9.inc"
 
 // ---- methods written by hand ----
 
@@ -1267,6 +1270,7 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
     case HWD3D_OP_OPEN_SHARED:
     case HWD3D_OP_SCANOUT:
     case HWD3D_OP_SET_CB1:
+    case HWD3D_OP_D9:
     case HWD3D_OP_FINISH: {
         if (m.size() < sizeof(hwd3d_call)) return false;
         hwd3d_call call;
@@ -1312,6 +1316,8 @@ int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, 
             st = scanout(c, r);
         } else if (h.op == HWD3D_OP_FINISH) {
             st = finish(c);
+        } else if (h.op == HWD3D_OP_D9) {
+            st = d9_call(c, call, r, w);
         } else if (h.op == HWD3D_OP_SET_CB1) {
             st = set_cb1(c, call, r);
         } else if (call.method >= HM_COUNT || !hm_table[call.method].fn) {
@@ -1381,6 +1387,7 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
         c.poll_queries();
     }
     if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation)) LOG("channel %u: bad HwD3D stream, dropping it", slot);
+    d9_release(c);
     c.release_all();
     sweep_dead();
     drop_shared(slot);
