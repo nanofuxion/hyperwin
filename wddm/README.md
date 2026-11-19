@@ -1012,3 +1012,21 @@ x64 through `vulkan-1.dll` with no Khronos key all PASS, the three copy counters
 The default install now also sets `HWD3D_SYSTEM` = `dwm.exe,WUDFHost.exe` and `IddRender` = 1 when they are
 not set, so a new machine puts its desktop on the phone's GPU. Windows still has to make the HyperWin
 screen the only one once (`dispinfo only \\.\DISPLAYn` or `dispset` from the desktop session).
+
+#### Direct3D 9: the device is created (2026-11-19, rebuilt spare, indirect display as the screen)
+
+- The runtime's own messages (breakpoint on `d3d9!D3DRecordHRESULT` with `dbgrun`, `da @x1`) named each
+  refusal. After the 16-bit display-mode one: "UMD did not provide non-null pfnCreateResource2, and null
+  pfnCreateResource" (and Flush1, Present1, TexBlt1, BufBlt1, VolBlt1). The runtime checks the device
+  table against the `DriverVersion` the driver reports. The driver now reports
+  `D3D_UMD_INTERFACE_VERSION_WIN7`, whose entries are the ones it has. `CheckDeviceType`,
+  `CheckDeviceFormat`, `GetDeviceCaps` and `CreateDevice` then succeed, with the indirect display as the
+  screen: the kernel screen half is not needed for Direct3D 9.
+- `g_spans` was a global `std::map`; this DLL starts at `DllMain` without the C runtime, so it was never
+  constructed and the first lock crashed. It is made on first use now.
+- A blt from a GPU surface to a system-memory one (`GetRenderTargetData`) reads the surface back.
+- Now blocking: the first fixed-function draw makes DXVK build a shader that crashes Mali's SPIR-V
+  compiler on the phone (`spir2lir::SPIR2LIR::evaluate_address` under `vkCreateGraphicsPipelines`, null
+  read). That takes the phone's GPU process down, and with it every program's device for a few seconds;
+  until it restarts, Direct3D 9 answers `NOTAVAILABLE` again. `d3d9test` reads back black. Next: dump
+  that SPIR-V (the Vortek shim sits in the path), find the construct, and work around it or fall back.

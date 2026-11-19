@@ -376,6 +376,7 @@ static void fetch(Dev *d, Res *o, UINT sub)
 
 static HRESULT APIENTRY Lock(HANDLE hd, D3DDDIARG_LOCK *a)
 {
+    D9LOG("hwd3d_umd: d9 Lock\n");
     Dev *d = DV(hd);
     Res *o = RS(a->hResource);
     if (!o || a->SubResourceIndex >= o->subs.size()) return E_INVALIDARG;
@@ -407,11 +408,18 @@ struct LockSpan {
     uint32_t off, size;
     hwd3d9_box box;
 };
-static std::map<std::pair<Res *, UINT>, LockSpan> g_spans;
+/* Made on first use: this DLL starts at DllMain without the C runtime, so no global constructor ever runs. */
+static std::map<std::pair<Res *, UINT>, LockSpan> &spans()
+{
+    static std::map<std::pair<Res *, UINT>, LockSpan> *m = new std::map<std::pair<Res *, UINT>, LockSpan>();
+    return *m;
+}
+#define g_spans spans()
 static SRWLOCK g_span_lock = SRWLOCK_INIT;
 
 static HRESULT APIENTRY LockSpanned(HANDLE hd, D3DDDIARG_LOCK *a)
 {
+    D9LOG("hwd3d_umd: d9 LockSpanned\n");
     HRESULT hr = Lock(hd, a);
     if (FAILED(hr) || a->Flags.ReadOnly) return hr;
     Res *o = RS(a->hResource);
@@ -435,6 +443,7 @@ static HRESULT APIENTRY LockSpanned(HANDLE hd, D3DDDIARG_LOCK *a)
 
 static HRESULT APIENTRY Unlock(HANDLE hd, const D3DDDIARG_UNLOCK *a)
 {
+    D9LOG("hwd3d_umd: d9 Unlock\n");
     Dev *d = DV(hd);
     Res *o = RS(a->hResource);
     if (!o || o->sysmem || !o->h) return S_OK;
@@ -586,6 +595,7 @@ static HRESULT APIENTRY SetStreamSource(HANDLE hd, const D3DDDIARG_SETSTREAMSOUR
 
 static HRESULT APIENTRY SetStreamSourceUm(HANDLE hd, const D3DDDIARG_SETSTREAMSOURCEUM *a, const VOID *p)
 {
+    D9LOG("hwd3d_umd: d9 SetStreamSourceUm\n");
     Dev *d = DV(hd);
     d->um_vb = static_cast<const uint8_t *>(p);
     d->um_stride = a->Stride;
@@ -653,6 +663,7 @@ static HRESULT draw_up(Dev *d, D3DPRIMITIVETYPE t, uint32_t first_byte, uint32_t
 
 static HRESULT APIENTRY DrawPrimitive(HANDLE hd, const D3DDDIARG_DRAWPRIMITIVE *a, const UINT *)
 {
+    D9LOG("hwd3d_umd: d9 DrawPrimitive\n");
     Dev *d = DV(hd);
     if (d->um_vb) return draw_up(d, a->PrimitiveType, a->VStart * d->um_stride, a->PrimitiveCount);
     struct wbuf *b = req(d->h, HWD3D9_DRAW);
@@ -666,6 +677,7 @@ static HRESULT APIENTRY DrawPrimitive(HANDLE hd, const D3DDDIARG_DRAWPRIMITIVE *
 
 static HRESULT APIENTRY DrawPrimitive2(HANDLE hd, const D3DDDIARG_DRAWPRIMITIVE2 *a)
 {
+    D9LOG("hwd3d_umd: d9 DrawPrimitive2\n");
     Dev *d = DV(hd);
     if (!d->um_vb) return S_OK;
     return draw_up(d, a->PrimitiveType, a->FirstVertexOffset, a->PrimitiveCount);
@@ -688,6 +700,7 @@ static HRESULT APIENTRY DrawIndexedPrimitive(HANDLE hd, const D3DDDIARG_DRAWINDE
 
 static HRESULT APIENTRY DrawIndexedPrimitive2(HANDLE hd, const D3DDDIARG_DRAWINDEXEDPRIMITIVE2 *a, UINT isize, const VOID *ib, const UINT *)
 {
+    D9LOG("hwd3d_umd: d9 DrawIndexedPrimitive2\n");
     Dev *d = DV(hd);
     if (!d->um_vb || !ib || (isize != 2 && isize != 4)) return S_OK;
     uint32_t ni = vertices_of(a->PrimitiveType, a->PrimitiveCount);
@@ -709,6 +722,7 @@ static HRESULT APIENTRY DrawIndexedPrimitive2(HANDLE hd, const D3DDDIARG_DRAWIND
 
 static HRESULT APIENTRY Clear(HANDLE hd, const D3DDDIARG_CLEAR *a, UINT n, const RECT *rects)
 {
+    D9LOG("hwd3d_umd: d9 Clear\n");
     Dev *d = DV(hd);
     struct wbuf *b = req(d->h, HWD3D9_CLEAR);
     put32(b, a->Flags);
@@ -810,6 +824,7 @@ static HRESULT APIENTRY SetScissorRect(HANDLE hd, const RECT *rc)
 
 static HRESULT APIENTRY SetRenderTarget(HANDLE hd, const D3DDDIARG_SETRENDERTARGET *a)
 {
+    D9LOG("hwd3d_umd: d9 SetRenderTarget\n");
     Dev *d = DV(hd);
     Res *o = RS(a->hRenderTarget);
     if (a->RenderTargetIndex < 4) d->rts[a->RenderTargetIndex] = o;
@@ -856,6 +871,7 @@ static HRESULT APIENTRY CreatePixelShader(HANDLE hd, D3DDDIARG_CREATEPIXELSHADER
 }
 static HRESULT APIENTRY CreateVertexShaderDecl(HANDLE hd, D3DDDIARG_CREATEVERTEXSHADERDECL *a, const D3DDDIVERTEXELEMENT *e)
 {
+    D9LOG("hwd3d_umd: d9 CreateVertexShaderDecl\n");
     struct wbuf *b = req(DV(hd)->h, HWD3D9_CREATE_DECL);
     put_arr(b, e, a->NumVertexElements, sizeof(D3DVERTEXELEMENT9));
     struct rd r;
@@ -886,6 +902,7 @@ static HRESULT APIENTRY DeleteHandle(HANDLE, HANDLE h)
 
 static HRESULT APIENTRY Blt(HANDLE hd, const D3DDDIARG_BLT *a)
 {
+    D9LOG("hwd3d_umd: d9 Blt\n");
     Dev *d = DV(hd);
     Res *s = RS(a->hSrcResource), *t = RS(a->hDstResource);
     if (!s || !t) return E_INVALIDARG;
@@ -912,6 +929,29 @@ static HRESULT APIENTRY Blt(HANDLE hd, const D3DDDIARG_BLT *a)
         gpu_wrote(t);
         return S_OK;
     }
+    D9LOG("hwd3d_umd: d9 Blt src %p sys %d h %u -> dst %p sys %d h %u\n", (void *)s, s->sysmem, s->h, (void *)t, t->sysmem, t->h);
+    if (t->sysmem || !t->h) {
+        /* To system memory (GetRenderTargetData, GetFrontBufferData): a read the program asked for. */
+        Sub &ts = t->subs[a->DstSubResourceIndex];
+        if (!ts.sys) return S_OK;
+        struct wbuf *rb = req(d->h, HWD3D9_READ);
+        put32(rb, s->h);
+        put32(rb, a->SrcSubResourceIndex);
+        struct rd r;
+        HRESULT hr = (HRESULT)call_wait(rb, &r);
+        uint32_t pitch = take32(&r), rows = take32(&r), n = take32(&r);
+        if (SUCCEEDED(hr) && pitch && n) {
+            const uint8_t *src = r.p;   /* the answer's bytes, read in place */
+            uint32_t dp = ts.sys_pitch ? ts.sys_pitch : ts.pitch;
+            uint32_t x0 = row_bytes(s->format, a->SrcRect.left), w = row_bytes(s->format, a->SrcRect.right) - x0;
+            uint32_t y0 = rows_of(s->format, a->SrcRect.top), h = rows_of(s->format, a->SrcRect.bottom) - y0;
+            uint32_t dx = row_bytes(t->format, a->DstRect.left), dy = rows_of(t->format, a->DstRect.top);
+            for (uint32_t y = 0; y < h && y0 + y < rows && (size_t)(y0 + y) * pitch + x0 + w <= n; y++)
+                memcpy(const_cast<uint8_t *>(ts.sys) + (size_t)(dy + y) * dp + dx, src + (size_t)(y0 + y) * pitch + x0, w);
+        }
+        call_end(&r);
+        return hr;
+    }
     struct wbuf *b = req(d->h, HWD3D9_STRETCH);
     put32(b, s->h);
     put32(b, a->SrcSubResourceIndex);
@@ -927,6 +967,7 @@ static HRESULT APIENTRY Blt(HANDLE hd, const D3DDDIARG_BLT *a)
 
 static HRESULT APIENTRY ColorFill(HANDLE hd, const D3DDDIARG_COLORFILL *a)
 {
+    D9LOG("hwd3d_umd: d9 ColorFill\n");
     Res *t = RS(a->hResource);
     if (!t || !t->h) return S_OK;
     struct wbuf *b = req(DV(hd)->h, HWD3D9_FILL);
@@ -1034,6 +1075,7 @@ static HRESULT APIENTRY GetQueryData(HANDLE hd, const D3DDDIARG_GETQUERYDATA *a)
  * As with Direct3D 11 blts, the copy goes when DXGI and Direct3D 9 can flip on this adapter. */
 static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
 {
+    D9LOG("hwd3d_umd: d9 Present\n");
     Dev *d = DV(hd);
     Res *s = RS(a->hSrcResource);
     if (!s || !s->h || s->subs.empty()) return S_OK;
@@ -1201,6 +1243,6 @@ extern "C" HRESULT APIENTRY OpenAdapter(D3DDDIARG_OPENADAPTER *a)
     a->pAdapterFuncs->pfnGetCaps = d9::GetCaps;
     a->pAdapterFuncs->pfnCreateDevice = d9::CreateDevice;
     a->pAdapterFuncs->pfnCloseAdapter = d9::CloseAdapter;
-    a->DriverVersion = D3D_UMD_INTERFACE_VERSION_WDDM1_3;   /* the kernel driver is WDDM 1.3 */
+    a->DriverVersion = D3D_UMD_INTERFACE_VERSION_WIN7;   /* the entry points of this version: the runtime checks the table against it */
     return S_OK;
 }
