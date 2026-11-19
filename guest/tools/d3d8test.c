@@ -4,11 +4,20 @@
 #include <windows.h>
 #include <d3d8.h>
 #include <stdio.h>
+#include <string.h>
 
 struct vtx { float x, y, z, rhw; DWORD color; };
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* arguments: hw = hardware vertex processing, d16 / d24 = with that depth buffer, discard = that swap effect */
+    int hw = 0, depth = 0, discard = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "hw")) hw = 1;
+        if (!strcmp(argv[i], "d16")) depth = D3DFMT_D16;
+        if (!strcmp(argv[i], "d24")) depth = D3DFMT_D24S8;
+        if (!strcmp(argv[i], "discard")) discard = 1;
+    }
     setvbuf(stdout, NULL, _IONBF, 0);
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = DefWindowProcA;
@@ -29,12 +38,21 @@ int main(void)
     pp.BackBufferWidth = 256; pp.BackBufferHeight = 256; pp.BackBufferFormat = dm.Format; pp.BackBufferCount = 1;
     pp.SwapEffect = D3DSWAPEFFECT_COPY; pp.hDeviceWindow = hwnd; pp.Windowed = TRUE;
     pp.Flags = D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+    if (discard) pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    for (int i = 1; i < argc; i++)   /* imm: an interval on a windowed device, which Microsoft's Direct3D 8 refuses */
+        if (!strcmp(argv[i], "imm")) pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    if (depth) {
+        pp.EnableAutoDepthStencil = TRUE;
+        pp.AutoDepthStencilFormat = (D3DFORMAT)depth;
+        printf("CheckDeviceFormat depth 0x%08lx, match 0x%08lx\n", IDirect3D8_CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, dm.Format, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, (D3DFORMAT)depth),
+               IDirect3D8_CheckDepthStencilMatch(d3d, 0, D3DDEVTYPE_HAL, dm.Format, dm.Format, (D3DFORMAT)depth));
+    }
     IDirect3DDevice8 *dev = NULL;
-    HRESULT hr = IDirect3D8_CreateDevice(d3d, 0, D3DDEVTYPE_HAL, hwnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+    HRESULT hr = IDirect3D8_CreateDevice(d3d, 0, D3DDEVTYPE_HAL, hwnd, hw ? D3DCREATE_HARDWARE_VERTEXPROCESSING : D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
     printf("CreateDevice 0x%08lx\n", hr);
     if (FAILED(hr)) return 1;
     struct vtx tri[3] = {{128, 32, 0.5f, 1, 0xff00ff00}, {224, 224, 0.5f, 1, 0xff00ff00}, {32, 224, 0.5f, 1, 0xff00ff00}};
-    IDirect3DDevice8_Clear(dev, 0, NULL, D3DCLEAR_TARGET, 0xffff0000, 1.0f, 0);
+    IDirect3DDevice8_Clear(dev, 0, NULL, D3DCLEAR_TARGET | (depth ? D3DCLEAR_ZBUFFER : 0), 0xffff0000, 1.0f, 0);
     IDirect3DDevice8_BeginScene(dev);
     IDirect3DDevice8_SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     IDirect3DDevice8_SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);

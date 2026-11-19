@@ -203,6 +203,8 @@ static HRESULT APIENTRY GetCaps(HANDLE ha, const D3DDDIARG_GETCAPS *g)
         load_caps(a);
         if (!a->caps_ok) return E_FAIL;
         memcpy(g->pData, &a->caps, g->DataSize < sizeof a->caps ? g->DataSize : sizeof a->caps);
+        /* Direct3D 8 refuses windowed devices without D3DCAPS2_CANRENDERWINDOWED, a bit Direct3D 9 dropped. */
+        if (g->Type == D3DDDICAPS_GETD3D8CAPS && g->DataSize >= 16) static_cast<DWORD *>(g->pData)[3] |= 0x00080000;
         return S_OK;
     case D3DDDICAPS_GETFORMATCOUNT:
         load_caps(a);

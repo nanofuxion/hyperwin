@@ -1077,3 +1077,29 @@ our Direct3D 9 driver part with interface 8.
 - Debugging 32-bit programs: `build/dbgrun-x86.exe` (same source, i686) with the 32-bit `d3d8.pdb` and
   `d3d9.pdb` in one folder as `_NT_SYMBOL_PATH`. Windows Defender removed `aio32.exe` when it was started
   under the debugger; the spare now has `C:\HyperWin` excluded.
+- Direct3D 8 refuses windowed devices unless the caps carry `D3DCAPS2_CANRENDERWINDOWED`, a bit Direct3D 9
+  dropped: the driver adds it to the Direct3D 8 caps. `d3d8test hw d24 discard` passes. AIO's Direct3D 8
+  cube still fails, and not because of the driver: it sets `FullScreen_PresentationInterval` on a
+  windowed device, which Microsoft's `d3d8.dll` answers with `D3DERR_INVALIDCALL` (`d3d8test ... imm`
+  shows the same). It was written for DXVK's Direct3D 8, which lets that pass.
+- DirectDraw and Direct3D 7: `ddraw.dll` opens the driver with interface 7, asks `GetCaps` 1, 2, 3, 4 and 8
+  (DirectDraw caps, mode caps, formats, Direct3D 3 caps) and then crashes inside
+  `DdQueryDirectDrawObject` (+0x8c5, writing a texture format count through a null pointer). The driver
+  answers those older caps with zeros today. Next: fill `D3DDDICAPS_DDRAW`, `_DDRAW_MODE_SPECIFIC` and the
+  Direct3D 3, 5, 6 and 7 caps (the 32-bit `ddraw.pdb` and `ddraw.dll` come from Microsoft's symbol server
+  by GUID and by time stamp + size).
+
+#### Checklist run on the rebuilt spare (2026-11-19, nothing beside the programs)
+
+| Check | Result |
+| --- | --- |
+| dxtest 11 as ARM64, x64, x86 | PASS, PASS, PASS |
+| dxtest 12 | `D3D12CreateDevice` 0x887a0004 (phase 8 not started) |
+| gltest as ARM64, x64, x86 | PASS, PASS, PASS |
+| vktest as ARM64, x64 through `vulkan-1.dll`, no Khronos key | PASS, PASS |
+| d3d9test as ARM64, x64, x86 | PASS, PASS, PASS |
+| d3d8test (x86) | PASS |
+| Copy counters | 0 bytes each way, 0 kernel copies |
+| dxdiag | "HyperWin GPU" and "HyperWin screen", WDDM 1.3 |
+| AIO cubes (x64): Vulkan, OpenGL, Direct3D 11, Direct3D 9 | 485, 190, 240, 240 FPS average |
+| GPU process killed | desktop back in about 6 s, dxtest 11 passes after |
