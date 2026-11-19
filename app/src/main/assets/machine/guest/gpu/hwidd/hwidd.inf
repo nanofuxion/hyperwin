@@ -1,0 +1,69 @@
+; HyperWin screen: an indirect display (IddCx) driver, gpu/guest/idd. One root device, ROOT\HwIdd. It runs
+; in WUDFHost.exe as a user-mode driver, so a fault in it cannot stop Windows.
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider    = %Mfg%
+CatalogFile = hwidd.cat
+DriverVer   = 11/18/2026,1.0.20049.4975
+PnpLockdown = 1
+
+[DestinationDirs]
+Hw.Files = 13
+
+[SourceDisksNames]
+1 = %Disk%,,,
+
+[SourceDisksFiles]
+hwidd.dll = 1
+
+[Manufacturer]
+%Mfg% = Hw, NTarm64
+
+[Hw.NTarm64]
+%Desc% = Install, Root\HwIdd
+
+[Install.NT]
+CopyFiles = Hw.Files
+
+[Hw.Files]
+hwidd.dll,,,0x100
+
+[Install.NT.hw]
+AddReg = Install.HwAddReg
+
+[Install.HwAddReg]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",0x00000000,"HyperWinScreen"
+
+[Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WudfRd.Service
+
+[WudfRd.Service]
+DisplayName   = %WudfRdDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[Install.NT.Wdf]
+UmdfService              = HwIdd, HwIdd.Wdf
+UmdfServiceOrder         = HwIdd
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction  = Copy
+UmdfFsContextUsePolicy   = CanUseFsContext2
+UmdfHostProcessSharing   = ProcessSharingDisabled
+
+[HwIdd.Wdf]
+UmdfLibraryVersion = 2.25.0
+ServiceBinary      = %13%\hwidd.dll
+; The class extension is named here, in the service section, as in Windows' own rdpidd.inf.
+UmdfExtensions     = IddCx0102
+
+[Strings]
+Mfg        = "HyperWin"
+Disk       = "HyperWin screen"
+Desc       = "HyperWin screen"
+WudfRdDesc = "Windows Driver Foundation - User-mode Driver Framework Reflector"

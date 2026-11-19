@@ -964,3 +964,20 @@ desktop session; results land in `C:\HyperWin\AIO Results\Benchmark` as `avg|min
 | Direct3D 9 | "could not create Direct3D9 device" (the `NOTAVAILABLE` above) |
 | Direct3D 7 | fails to start (DirectDraw sits on Direct3D 9 here) |
 | Direct3D 8, 12 | not run to a result: 8 needs Direct3D 9, 12 needs phase 8 |
+
+#### OpenGL: two programs corrupt each other (2026-11-19)
+
+`guest/tools/gldepth.c` draws a far and a near quad each frame, reads the centre back, and swaps. One copy
+is clean (120 of 120 frames). Two copies at once (the second draws other colours with `gldepth alt`) lose
+the near quad or read black in 40 to 60 percent of frames, and sometimes see the other copy's colours.
+This is what showed as the AIO OpenGL cube flickering between the outside and the inside. Depth testing
+and culling by themselves pass. Checked on a freshly built machine as well, so it is not that spare's
+state. Ruled out so far: overlapping shared-heap ranges (the host logs any, none seen), heap fallback to
+copy mode (none logged), channel, context and resource ids (partitioned per channel), gfxstream's blob id
+maps (keyed by context). Not yet looked at: fence timing of the read-back, and whether both
+processes' window targets share a host buffer.
+
+The default install now also installs the phone-screen driver (`hwidd`, staged by `tools/machine_assets.sh`
+and installed by `gpu-install.cmd`), which the first rebuild of a machine was missing. On the rebuilt
+spare Windows boots and the driver loads, but the phone stays black: Basic Display is primary and `dispset
+\\.\DISPLAY3 1280 720` did not change that. Not solved.

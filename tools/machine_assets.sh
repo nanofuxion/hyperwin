@@ -58,6 +58,12 @@ for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROO
 done
 mkdir -p "$OUT/guest/gpu/hwgpuw"
 cp "$ROOT"/build/hwgpuw/pkg/* "$OUT/guest/gpu/hwgpuw/"
+# The phone-screen driver (an indirect display, gpu/guest/idd): without it Windows has no monitor the phone can show.
+for f in "$ROOT"/gpu/guest/idd/hwidd.cpp "$ROOT"/gpu/guest/idd/hwidd.inf "$ROOT"/gpu/guest/idd/hwidd.h; do
+  [ "$ROOT/build/hwidd/pkg/hwidd.dll" -nt "$f" ] || { bash "$ROOT/gpu/guest/idd/build.sh" >/dev/null; break; }
+done
+mkdir -p "$OUT/guest/gpu/hwidd"
+cp "$ROOT"/build/hwidd/pkg/* "$OUT/guest/gpu/hwidd/"
 [ -f "$ROOT/build/hwwtest.exe" ] && cp "$ROOT/build/hwwtest.exe" "$OUT/guest/gpu/"
 # Phone storage as drives: the service and the WinFsp installer it needs.
 [ -f "$ROOT/build/files/hwfiles.exe" ] || sh "$ROOT/guest/files/build.sh"

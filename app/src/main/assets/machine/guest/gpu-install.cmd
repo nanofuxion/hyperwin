@@ -50,6 +50,12 @@ for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwgpuw\hwgpuw.inf SHA25
 set "OLDH="
 if exist %G%\hwgpuw\installed.sha set /p OLDH=<%G%\hwgpuw\installed.sha
 if defined NEWH if not "%NEWH%"=="%OLDH%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwgpuw %GPUID% && (echo %NEWH%> %G%\hwgpuw\installed.sha)
+rem The phone-screen driver (gpu/guest/idd), installed again when its package changes.
+set "NEWI="
+for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwidd\hwidd.inf SHA256 2^>nul') do if not defined NEWI set "NEWI=%%h"
+set "OLDI="
+if exist %G%\hwidd\installed.sha set /p OLDI=<%G%\hwidd\installed.sha
+if defined NEWI if not "%NEWI%"=="%OLDI%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwidd Root\HwIdd && (echo %NEWI%> %G%\hwidd\installed.sha)
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 rem Vulkan finds the driver through the adapter's VulkanDriverName. The global key is only for a
 rem machine that has no adapter (wddm/README.md).
