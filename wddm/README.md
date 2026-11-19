@@ -833,6 +833,31 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
   machine back. No dump was written: this Windows has no page file, so the next try needs one (or a
   dedicated dump file that exists before the crash) and Microsoft's debugger to read it.
   `CrashControl\AutoReboot` = 0 on the spare keeps the blue screen up, and it reaches the phone.
+- Fixed the same day; with `Display` = 1 Windows now boots, DWM runs on the GPU and the HyperWin GPU
+  is an extra 800x600 screen beside the phone's (IDD) one. What it took, in order:
+  - The crash dump never gets written here (the blue screen stays at 0%). Instead the driver writes
+    where `dxgkrnl`, `dxgmms1`, `dxgmms2` and itself sit this boot (`Parameters\B_<module>_Hi/Lo`); the
+    stop code's address minus that is an offset, and Microsoft's public symbols for that exact
+    `dxgmms1.sys` (symbol server, by time stamp and size) name the function.
+  - `dxgmms1` faulted in `VIDMM_DMA_POOL::BeginCPUAccess`: paging buffers were placed in the aperture
+    segment (`PagingBufferSegmentId` = 1) and it could not map one. They now come from system memory (0).
+  - Then `VIDEO_TDR_FAILURE`: the first paging buffer never finished. `DxgkCbSynchronizeExecution`
+    returns `STATUS_UNSUCCESSFUL` without calling the routine once the screen half is on (there is no
+    interrupt line), so no fence and no vsync reached Windows. `run_synced` now falls back to calling the
+    routine under the driver's own spin lock. The recovery itself failed too, because
+    `DxgkDdiCollectDbgInfo` answered "not supported"; it answers success now.
+  - Fences finish in the order they were given (one queue, the polling timer finishes them), preemption
+    is answered at once (`DMA_PREEMPTED`, Windows resubmits), and an engine reset reports the newest
+    fence it dropped.
+  - DWM then crashed in a loop (`0x8898008d` in `dwmcore.dll`): the user-mode driver lacked DXGI's
+    `SetDisplayMode`. It now passes the primary's allocation to Windows' `pfnSetDisplayModeCb`.
+  - With the screen half on, `Parameters\T_*` (queue head, fences, vsyncs, presents) is rewritten every
+    3 s, and the start guard waits 2 minutes before clearing, since this half fails late. Setting
+    `GraphicsDrivers\TdrLevel` = 0 keeps a stall from becoming a blue screen so `T_*` can be read.
+  - Recovering a machine that crashes on every boot: the guard catches the third start. Overwrite the
+    driver file in its DriverStore folder from Windows, set `Attempts` = 0 and restart.
+  - Next: the phone's screen still comes from the IDD. The HyperWin GPU's own source address has to reach
+    the phone (scanout), then the IDD can go and our adapter becomes the only screen.
 - For quick tests the driver DLL can be renamed and replaced inside the installed package: programs
   started afterwards load the new one (`/tmp/swapumd.sh` while testing).
 

@@ -58,7 +58,8 @@ static ULONG hwd_reg_dword(const WCHAR *name, ULONG def)
 
 /* Each display entry's last answer goes into Parameters as D_<name>, so a run can be read afterwards. */
 static void report(const WCHAR *what, ULONG value);
-#define HWD_STEP(n) report(L"D_Step", (ULONG)(n))
+static void report_bases(void);
+#define HWD_STEP(n) (report_bases(), report(L"D_Step", (ULONG)(n)))
 static void hwd_log(const char *name, NTSTATUS ns)
 {
     WCHAR w[48] = L"D_";
@@ -718,8 +719,7 @@ static VOID NTAPI hwd_vsync_tick(PEX_TIMER timer, PVOID context)
     (void)timer;
     (void)context;
     if (!hwd_vsync_on) return;
-    BOOLEAN ret;
-    g.dxgk.DxgkCbSynchronizeExecution(g.dxgk.DeviceHandle, hwd_vsync_sync, NULL, 0, &ret);
+    run_synced(hwd_vsync_sync, NULL);
     d.vsyncs++;
 }
 

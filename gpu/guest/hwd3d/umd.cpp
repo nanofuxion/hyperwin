@@ -2406,6 +2406,23 @@ static HRESULT __stdcall u_dxgi_rotate(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *
     return S_OK;
 }
 
+/* DWM makes a primary the screen's picture. Windows' own call does it: the kernel driver then points the
+ * screen at that allocation (DxgkDdiSetVidPnSourceAddress). */
+static HRESULT __stdcall u_dxgi_setdisplaymode(DXGI_DDI_ARG_SETDISPLAYMODE *a)
+{
+    Dev *d = reinterpret_cast<Dev *>(a->hDevice);
+    Obj *o = reinterpret_cast<Obj *>(a->hResource);
+    if (!d || !o || !o->kalloc || !d->kcb || !d->kcb->pfnSetDisplayModeCb) {
+        ulog("hwd3d_umd: SetDisplayMode without a kernel allocation\n");
+        return E_INVALIDARG;
+    }
+    D3DDDICB_SETDISPLAYMODE m = {};
+    m.hPrimaryAllocation = o->kalloc;
+    HRESULT hr = d->kcb->pfnSetDisplayModeCb(d->rt.handle, &m);
+    ulog("hwd3d_umd: SetDisplayMode surface %u: 0x%08lx\n", o->share, (unsigned long)hr);
+    return hr;
+}
+
 static HRESULT __stdcall u_dxgi_residency(DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *a)
 {
     for (SIZE_T i = 0; i < a->Resources; i++) a->pStatus[i] = DXGI_DDI_RESIDENCY_FULLY_RESIDENT;
@@ -2455,6 +2472,7 @@ static void fill_dxgi(DXGI_DDI_BASE_ARGS *a, UINT interface_version)
     DXGI1_1_DDI_BASE_FUNCTIONS *t1 = a->pDXGIDDIBaseFunctions2;  /* the shared first entries */
     t1->pfnPresent = u_dxgi_present;
     t1->pfnRotateResourceIdentities = u_dxgi_rotate;
+    t1->pfnSetDisplayMode = u_dxgi_setdisplaymode;
     t1->pfnQueryResourceResidency = u_dxgi_residency;
     t1->pfnSetResourcePriority = u_dxgi_priority;
     t1->pfnResolveSharedResource = u_dxgi_resolve_shared;

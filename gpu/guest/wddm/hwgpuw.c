@@ -30,6 +30,7 @@
 
 #define MAX_VIEWS 128u
 #define MAX_PENDING 256u
+#define NO_MARKER 0xFFFFFFFFu   /* a queued buffer with nothing on the phone to wait for */
 
 struct view {
     PMDL mdl;
@@ -66,6 +67,7 @@ struct adapter {
     KSPIN_LOCK pending_lock;
     struct pending pend[MAX_PENDING];
     UINT pend_count;
+    UINT pend_head;        /* pend is a queue in submission order: fences finish in the order given */
     PEX_TIMER timer;
     BOOLEAN timer_on;
     uint64_t epoch;        /* the renderer's, as the adapter last saw it */
@@ -77,10 +79,26 @@ struct adapter {
 
 static struct adapter g;
 static BOOLEAN g_notify_set;
+static ULONG g_sync_fallbacks;
+
+/* Interrupt notifications must run where the interrupt routine would. There is no interrupt line, and
+ * with the screen half on DxgkCbSynchronizeExecution refuses (STATUS_UNSUCCESSFUL) without calling the
+ * routine, so then it runs under this driver's own lock at DISPATCH_LEVEL instead. */
+static KSPIN_LOCK g_isr_lock;
+static void run_synced(PKSYNCHRONIZE_ROUTINE routine, PVOID context)
+{
+    BOOLEAN ret;
+    if (NT_SUCCESS(g.dxgk.DxgkCbSynchronizeExecution(g.dxgk.DeviceHandle, routine, context, 0, &ret))) return;
+    g_sync_fallbacks++;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_isr_lock, &irql);
+    routine(context);
+    KeReleaseSpinLock(&g_isr_lock, irql);
+}
 
 #include "hwdisplay.inc"
 
-static struct { ULONG submits, last_submit, last_flags, resets; } g_diag;
+static struct { ULONG submits, last_submit, last_flags, resets, preempts, sync_runs; } g_diag;
 
 static void *window(void) { return (UCHAR *)g.ring - HWGPU_RING_OFF; }
 
@@ -130,6 +148,45 @@ static void report(const WCHAR *what, ULONG value)
     ZwClose(key);
 }
 
+/* Where dxgkrnl and its memory managers sit this boot, as B_<name>_Hi/Lo, so a stop code's address can be
+ * turned into an offset inside the module even when no dump gets written. */
+NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(ULONG cls, PVOID buf, ULONG len, PULONG ret);
+static BOOLEAN g_mms1_seen;
+static void report_bases(void)
+{
+    if (g_mms1_seen) return;
+    struct mod { HANDLE section; PVOID mapped, base; ULONG size, flags; USHORT order, init, count, name_at; UCHAR path[256]; };
+    ULONG len = 0;
+    ZwQuerySystemInformation(11, NULL, 0, &len);
+    if (!len) return;
+    len += 4096;
+    ULONG *buf = ExAllocatePool2(POOL_FLAG_PAGED, len, 'bwgH');
+    if (!buf) return;
+    if (NT_SUCCESS(ZwQuerySystemInformation(11, buf, len, &len))) {
+        struct mod *m = (struct mod *)(buf + 2);
+        static const char *want[] = {"dxgkrnl.sys", "dxgmms1.sys", "dxgmms2.sys", "hwgpuw.sys"};
+        for (ULONG i = 0; i < buf[0]; i++) {
+            const char *n = (const char *)m[i].path + m[i].name_at;
+            for (int w = 0; w < 4; w++) {
+                const char *a = n, *b = want[w];
+                while (*a && (*a | 0x20) == (*b | 0x20)) a++, b++;
+                if (*a || *b) continue;
+                WCHAR v[24] = L"B_";
+                UINT k = 2;
+                for (const char *c = want[w]; *c != '.'; c++) v[k++] = (WCHAR)*c;
+                v[k++] = L'_';
+                v[k + 2] = 0;
+                v[k] = L'H', v[k + 1] = L'i';
+                report(v, (ULONG)((ULONG64)m[i].base >> 32));
+                v[k] = L'L', v[k + 1] = L'o';
+                report(v, (ULONG)(ULONG64)m[i].base);
+                if (w == 1) g_mms1_seen = TRUE;
+            }
+        }
+    }
+    ExFreePoolWithTag(buf, 'bwgH');
+}
+
 /* Bring-up trace, built with -DHWW_TRACE: the names of the driver entries dxgkrnl calls, in order, kept in the
  * service's Parameters key as Trace2. */
 #ifdef HWW_TRACE
@@ -158,18 +215,64 @@ static void tr(const char *name)
 #define tr(name) ((void)0)
 #endif
 
-/* Ten seconds after a good start the count goes back to zero. A thread does it, because a timer
+/* Ten seconds after a good start the count goes back to zero, two minutes with the screen half on (its
+ * failures come when the desktop starts, well after the adapter). A thread does it, because a timer
  * callback may not touch the registry; it ends early when the device stops. */
 static KEVENT g_guard_stop;
 static PETHREAD g_guard_thread;
 
+static BOOLEAN marker_ready(const struct pending *p, uint64_t epoch_now);
+
+/* With the screen half on, the queue's state goes into Parameters as T_<name> every few seconds, so a
+ * stall can be read from outside while Windows waits. */
+static void diag_write(void)
+{
+    KIRQL irql;
+    struct pending h;
+    RtlZeroMemory(&h, sizeof h);
+    KeAcquireSpinLock(&g.pending_lock, &irql);
+    UINT n = g.pend_count;
+    if (n) h = g.pend[g.pend_head];
+    KeReleaseSpinLock(&g.pending_lock, irql);
+    report(L"T_Pending", n);
+    report(L"T_HeadFenceId", h.fence_id);
+    report(L"T_HeadSlot", h.slot);
+    report(L"T_HeadWant", (ULONG)h.fence);
+    report(L"T_HeadEpochOk", h.epoch == g.epoch);
+    if (n && h.slot != NO_MARKER && hwgpu_ring_valid(window())) {
+        struct hwgpu_ctl *c = hwgpu_chan_ctl((UCHAR *)window() + hwgpu_chan_off(h.slot));
+        report(L"T_HeadHave", (ULONG)c->fence[h.ring % HWGPU_FENCE_RINGS]);
+        report(L"T_HeadGenOk", c->generation == h.generation);
+        report(L"T_HeadState", c->guest_state);
+        report(L"T_HeadReady", marker_ready(&h, g.epoch));
+    }
+    report(L"T_LastFence", g.last_fence);
+    report(L"T_Submits", g_diag.submits);
+    report(L"T_LastSubmit", g_diag.last_submit);
+    report(L"T_LastFlags", g_diag.last_flags);
+    report(L"T_Preempts", g_diag.preempts);
+    report(L"T_TimerOn", g.timer_on);
+    report(L"T_SyncRuns", g_diag.sync_runs);
+    report(L"T_SyncFallbacks", g_sync_fallbacks);
+    report(L"T_Vsyncs", d.vsyncs);
+    report(L"T_Presents", d.presents);
+    report(L"T_SourceSets", d.source_sets);
+}
+
 static VOID NTAPI guard_thread(PVOID context)
 {
     (void)context;
-    LARGE_INTEGER wait;
-    wait.QuadPart = -100000000LL;  /* ten seconds */
-    if (KeWaitForSingleObject(&g_guard_stop, Executive, KernelMode, FALSE, &wait) == STATUS_TIMEOUT) {
-        guard_count(TRUE, 0);
+    LONGLONG left = d.on ? 1200000000LL : 100000000LL;
+    for (;;) {
+        LARGE_INTEGER wait;
+        wait.QuadPart = d.on ? -30000000LL : -left;
+        if (KeWaitForSingleObject(&g_guard_stop, Executive, KernelMode, FALSE, &wait) != STATUS_TIMEOUT) break;
+        if (d.on) diag_write();
+        left += wait.QuadPart;
+        if (left <= 0) {
+            if (left > wait.QuadPart) guard_count(TRUE, 0);   /* only the first time past the mark */
+            if (!d.on) break;
+        }
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -497,6 +600,7 @@ static BOOLEAN NTAPI sync_complete(PVOID context)
     d.DmaCompleted.NodeOrdinal = p->node;
     d.DmaCompleted.EngineOrdinal = p->engine;
     g.last_fence = p->fence_id;
+    g_diag.sync_runs++;
     g.dxgk.DxgkCbNotifyInterrupt(g.dxgk.DeviceHandle, &d);
     g.dxgk.DxgkCbQueueDpc(g.dxgk.DeviceHandle);
     return TRUE;
@@ -505,8 +609,7 @@ static BOOLEAN NTAPI sync_complete(PVOID context)
 static void complete_fence(UINT fence_id, UINT node, UINT engine)
 {
     struct pending p = {TRUE, fence_id, node, engine};
-    BOOLEAN ret;
-    g.dxgk.DxgkCbSynchronizeExecution(g.dxgk.DeviceHandle, sync_complete, &p, 0, &ret);
+    run_synced(sync_complete, &p);
     g.counters.markers_done++;
 }
 
@@ -530,12 +633,12 @@ static VOID NTAPI poll_timer(PEX_TIMER timer, PVOID context)
         struct pending done = {0};
         KIRQL irql;
         KeAcquireSpinLock(&g.pending_lock, &irql);
-        for (UINT i = 0; i < MAX_PENDING && !done.used; i++) {
-            if (g.pend[i].used && marker_ready(&g.pend[i], epoch_now)) {
-                done = g.pend[i];
-                g.pend[i].used = FALSE;
-                g.pend_count--;
-            }
+        struct pending *head = &g.pend[g.pend_head];
+        if (g.pend_count && (head->slot == NO_MARKER || marker_ready(head, epoch_now))) {
+            done = *head;
+            done.used = TRUE;
+            g.pend_head = (g.pend_head + 1) % MAX_PENDING;
+            g.pend_count--;
         }
         BOOLEAN more = g.pend_count != 0;
         if (!done.used && !more && g.timer_on) {
@@ -597,11 +700,13 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     (void)ctx;
     (void)info;
     g.dxgk = *iface;
+    report_bases();
     *sources = d.on ? 1 : 0;   /* render-only unless Parameters\Display asks for the screen half */
     *children = d.on ? 1 : 0;
     InitializeListHead(&g.chans);
     ExInitializeFastMutex(&g.lock);
     KeInitializeSpinLock(&g.pending_lock);
+    KeInitializeSpinLock(&g_isr_lock);
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = (LONGLONG)(HW_WINDOW_PA + HWGPU_RING_OFF);
     g.ring = MmMapIoSpace(pa, HWGPU_RING_BYTES, MmCached);
@@ -772,7 +877,7 @@ static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
             d->Size = (SIZE_T)HW_HEAP_SIZE;
             d->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
         }
-        out->PagingBufferSegmentId = 1;
+        out->PagingBufferSegmentId = 0;   /* system memory: dxgmms1 faults mapping a paging buffer kept in the aperture */
         out->PagingBufferSize = 64 * 1024;
         out->PagingBufferPrivateDataSize = 0;
         return STATUS_SUCCESS;
@@ -790,7 +895,7 @@ static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
         d->Size = (SIZE_T)HW_HEAP_SIZE;
         d->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
     }
-    out->PagingBufferSegmentId = 1;
+    out->PagingBufferSegmentId = 0;   /* system memory: dxgmms1 faults mapping a paging buffer kept in the aperture */
     out->PagingBufferSize = 64 * 1024;
     out->PagingBufferPrivateDataSize = 0;
     return STATUS_SUCCESS;
@@ -920,43 +1025,71 @@ static NTSTATUS NTAPI HwSubmitCommand(const HANDLE hAdapter, const DXGKARG_SUBMI
     g_diag.last_submit = sc->SubmissionFenceId;
     g_diag.last_flags = sc->Flags.Value | (sc->NodeOrdinal << 24);
     const struct hww_marker *m = (const struct hww_marker *)sc->pDmaBufferPrivateData;
+    BOOLEAN marker = FALSE;
     if (!sc->Flags.Paging && m && sc->DmaBufferPrivateDataSize >= sizeof *m &&
         sc->DmaBufferPrivateDataSubmissionEndOffset - sc->DmaBufferPrivateDataSubmissionStartOffset >= sizeof *m) {
         m = (const struct hww_marker *)((const UCHAR *)sc->pDmaBufferPrivateData + sc->DmaBufferPrivateDataSubmissionStartOffset);
-        if (m->magic == HWW_MARKER_MAGIC && m->slot < HWGPU_CHANNELS) {
-            KIRQL irql;
-            BOOLEAN queued = FALSE;
-            KeAcquireSpinLock(&g.pending_lock, &irql);
-            for (UINT i = 0; i < MAX_PENDING && !queued; i++) {
-                if (g.pend[i].used) continue;
-                g.pend[i].used = TRUE;
-                g.pend[i].fence_id = sc->SubmissionFenceId;
-                g.pend[i].node = sc->NodeOrdinal;
-                g.pend[i].engine = sc->EngineOrdinal;
-                g.pend[i].slot = m->slot;
-                g.pend[i].generation = m->generation;
-                g.pend[i].ring = m->ring;
-                g.pend[i].fence = m->fence;
-                g.pend[i].epoch = g.epoch;
-                g.pend_count++;
-                queued = TRUE;
-            }
-            KeReleaseSpinLock(&g.pending_lock, irql);
-            if (queued) {
-                g.counters.marker_submits++;
-                start_polling();
-                return STATUS_SUCCESS;
-            }
+        marker = m->magic == HWW_MARKER_MAGIC && m->slot < HWGPU_CHANNELS;
+    }
+    /* A buffer with nothing to wait for still waits behind the ones before it, and is finished by the
+     * polling timer too: finishing it here, inside the submit, never reached Windows. */
+    KIRQL irql;
+    BOOLEAN queued = FALSE;
+    KeAcquireSpinLock(&g.pending_lock, &irql);
+    if (g.pend_count < MAX_PENDING) {
+        struct pending *p = &g.pend[(g.pend_head + g.pend_count) % MAX_PENDING];
+        RtlZeroMemory(p, sizeof *p);
+        p->used = TRUE;
+        p->fence_id = sc->SubmissionFenceId;
+        p->node = sc->NodeOrdinal;
+        p->engine = sc->EngineOrdinal;
+        p->slot = marker ? m->slot : NO_MARKER;
+        if (marker) {
+            p->generation = m->generation;
+            p->ring = m->ring;
+            p->fence = m->fence;
         }
+        p->epoch = g.epoch;
+        g.pend_count++;
+        queued = TRUE;
+    }
+    KeReleaseSpinLock(&g.pending_lock, irql);
+    if (queued) {
+        if (marker) g.counters.marker_submits++;
+        start_polling();
+        return STATUS_SUCCESS;
     }
     complete_fence(sc->SubmissionFenceId, sc->NodeOrdinal, sc->EngineOrdinal);
     return STATUS_SUCCESS;
 }
 
+/* Windows asks to preempt when it wants something else to run first. What is queued is dropped and the
+ * preemption reported at once: Windows submits the dropped buffers again, and never waits on an answer. */
+static BOOLEAN NTAPI sync_preempted(PVOID context)
+{
+    const DXGKARG_PREEMPTCOMMAND *pc = context;
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA d;
+    RtlZeroMemory(&d, sizeof d);
+    d.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
+    d.DmaPreempted.PreemptionFenceId = pc->PreemptionFenceId;
+    d.DmaPreempted.LastCompletedFenceId = g.last_fence;
+    d.DmaPreempted.NodeOrdinal = pc->NodeOrdinal;
+    d.DmaPreempted.EngineOrdinal = pc->EngineOrdinal;
+    g.dxgk.DxgkCbNotifyInterrupt(g.dxgk.DeviceHandle, &d);
+    g.dxgk.DxgkCbQueueDpc(g.dxgk.DeviceHandle);
+    return TRUE;
+}
+
 static NTSTATUS NTAPI HwPreemptCommand(const HANDLE hAdapter, const DXGKARG_PREEMPTCOMMAND *pc)
 {
     (void)hAdapter;
-    (void)pc;
+    KIRQL irql;
+    KeAcquireSpinLock(&g.pending_lock, &irql);
+    g.pend_count = 0;
+    g.pend_head = 0;
+    KeReleaseSpinLock(&g.pending_lock, irql);
+    g_diag.preempts++;
+    run_synced(sync_preempted, (PVOID)pc);
     return STATUS_SUCCESS;
 }
 
@@ -982,11 +1115,13 @@ static NTSTATUS NTAPI HwResetFromTimeout(const HANDLE hAdapter)
     report(L"T_SourceAddr", (ULONG)d.source_addr.QuadPart);
     report(L"T_Pending", g.pend_count);
     report(L"T_Resets", ++g_diag.resets);
+    report(L"T_Preempts", g_diag.preempts);
     /* Whatever Windows was waiting on is abandoned. */
     KIRQL irql;
     KeAcquireSpinLock(&g.pending_lock, &irql);
     RtlZeroMemory(g.pend, sizeof g.pend);
     g.pend_count = 0;
+    g.pend_head = 0;
     KeReleaseSpinLock(&g.pending_lock, irql);
     return STATUS_SUCCESS;
 }
@@ -997,11 +1132,13 @@ static NTSTATUS NTAPI HwRestartFromTimeout(const HANDLE hAdapter)
     return STATUS_SUCCESS;
 }
 
+/* Windows asks for this at the start of every timeout recovery, and a failure here stops the recovery
+ * with VIDEO_TDR_FAILURE. There is nothing on this side worth adding to its report. */
 static NTSTATUS NTAPI HwCollectDbgInfo(const HANDLE hAdapter, const DXGKARG_COLLECTDBGINFO *di)
 {
     (void)hAdapter;
-    (void)di;
-    return STATUS_NOT_SUPPORTED;
+    if (di->pBuffer && di->BufferSize) RtlZeroMemory(di->pBuffer, di->BufferSize);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI HwControlInterrupt(const HANDLE hAdapter, const DXGK_INTERRUPT_TYPE type, BOOLEAN enable)
@@ -1012,10 +1149,22 @@ static NTSTATUS NTAPI HwControlInterrupt(const HANDLE hAdapter, const DXGK_INTER
 
 /* The engine and power DDIs of WDDM 1.2 and later, answered for an adapter with one engine that is
  * always responsive and never powered down. */
+/* An engine reset drops everything queued; Windows needs the newest fence it dropped. */
 static NTSTATUS NTAPI HwResetEngine(const HANDLE hAdapter, DXGKARG_RESETENGINE *re)
 {
     (void)hAdapter;
-    re->LastAbortedFenceId = 0;
+    KIRQL irql;
+    KeAcquireSpinLock(&g.pending_lock, &irql);
+    re->LastAbortedFenceId = g.pend_count ? g.pend[(g.pend_head + g.pend_count - 1) % MAX_PENDING].fence_id : g.last_fence;
+    g.pend_count = 0;
+    g.pend_head = 0;
+    KeReleaseSpinLock(&g.pending_lock, irql);
+    report(L"T_EngineResets", ++g_diag.resets);
+    report(L"T_Aborted", re->LastAbortedFenceId);
+    report(L"T_LastFence", g.last_fence);
+    report(L"T_Submits", g_diag.submits);
+    report(L"T_Preempts", g_diag.preempts);
+    report(L"T_LastFlags", g_diag.last_flags);
     return STATUS_SUCCESS;
 }
 
