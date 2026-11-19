@@ -485,6 +485,18 @@ const T* as(const std::vector<uint8_t>& m) {
     return m.size() >= sizeof(T) ? reinterpret_cast<const T*>(m.data()) : nullptr;
 }
 
+// Writes back and drops the CPU cache lines of a range (all cores).
+void flush_cache(uint8_t* p, uint64_t size) {
+#if defined(__aarch64__)
+    uint8_t* end = p + size;
+    for (p = reinterpret_cast<uint8_t*>(uintptr_t(p) & ~uintptr_t(63)); p < end; p += 64)
+        __asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
+    __asm__ volatile("dsb sy" : : : "memory");
+#else
+    (void)p; (void)size;
+#endif
+}
+
 bool own_res(const Link& l, uint32_t res) {
     return res >= HWGPU_RES_BASE(l.slot) && res < HWGPU_RES_BASE(l.slot + 1);
 }
@@ -730,14 +742,16 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
     case SGPU_CMD_SYNC: {
         // Every 5 s: how much mapped memory the syncs walked, and how long they took.
         static uint64_t st_calls, st_pull, st_scan, st_in, st_out, st_ns, st_last;
+        static uint64_t st_flush;
         const uint64_t t0 = now_ns();
         struct Stat {
             uint64_t t0;
             ~Stat() {
                 st_ns += now_ns() - t0;
                 if (st_ns && now_ns() - st_last > 5000000000ull) {
-                    LOG("sync: %llu calls (%llu pull), walked %llu MB, in %llu KB, out %llu KB, %llu ms",
-                        (unsigned long long)st_calls, (unsigned long long)st_pull, (unsigned long long)(st_scan >> 20),
+                    LOG("sync: %llu calls (%llu pull), flushed %llu MB, walked %llu MB, in %llu KB, out %llu KB, %llu ms",
+                        (unsigned long long)st_calls, (unsigned long long)st_pull, (unsigned long long)(st_flush >> 20),
+                        (unsigned long long)(st_scan >> 20),
                         (unsigned long long)(st_in >> 10), (unsigned long long)(st_out >> 10),
                         (unsigned long long)(st_ns / 1000000));
                     st_calls = st_pull = st_scan = st_in = st_out = st_ns = 0;
@@ -762,6 +776,18 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
             memcpy(it->second.last.data() + e.offset, m.data() + at, e.len);
             at += e.len;
         }
+        // Shared (granted) ranges are not copied, but the phone's GPU does not see the CPU caches and the
+        // CPUs do not see what the GPU wrote: Mali only brings an imported range in step now and then
+        // (lost under load: stale 64-byte lines in read-backs, vertices the GPU never saw). So here,
+        // before the GPU reads (push) and after it wrote (pull), every cache line of this channel's
+        // shared ranges is written back and dropped. The instruction reaches all cores.
+        for (auto res : slot.resources) {
+            auto mi = g_maps.find(res);
+            if (mi == g_maps.end() || mi->second.grant < 0) continue;
+            flush_cache(mi->second.hva, mi->second.size);
+            st_flush += mi->second.size;
+        }
+        if (hdr->flags & SGPU_FLAG_NO_REPLY) return true;  // a push of shared ranges only: the guest did not wait
         std::vector<uint8_t> out(sizeof(vgpu_hdr));
         reinterpret_cast<vgpu_hdr*>(out.data())->type = SGPU_RESP_SYNC;
         if (hdr->flags & SGPU_SYNC_PULL) {

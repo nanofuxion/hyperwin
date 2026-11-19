@@ -981,3 +981,24 @@ The default install now also installs the phone-screen driver (`hwidd`, staged b
 and installed by `gpu-install.cmd`), which the first rebuild of a machine was missing. On the rebuilt
 spare Windows boots and the driver loads, but the phone stays black: Basic Display is primary and `dispset
 \\.\DISPLAY3 1280 720` did not change that. Not solved.
+
+#### Fixed: the GPU and the CPUs did not see each other's caches (2026-11-19)
+
+The two-program OpenGL corruption above, and Vulkan read-backs failing under load, were one bug. Host-visible
+Vulkan memory lives in the shared heap and Mali gets it as an imported host pointer. Mali brings such a
+range in step with the CPU caches only now and then, so under load whole 64-byte cache lines went wrong:
+the GPU read vertex data the CPU had not written back yet, and Windows read stale lines after the GPU
+wrote. Proof: a Vulkan read-back test lost pixels in runs of 16 (one cache line), they never arrived, and
+pushing the lines out of the CPU caches before the GPU wrote made 20 of 20 runs pass.
+
+The fix uses the sync message that copy-mode ranges already had. The guest (`windows.patch`,
+`HwgpuConnection::sync`) now sends it for shared ranges too: before a queue submit (no answer awaited)
+and after every fence wait, fence status and wait-idle. The phone (`SGPU_CMD_SYNC` in
+`hwgpu_host.cpp`) then runs `dc civac` over every shared range of that channel, which writes back and
+drops those lines on all cores. With another GPU program busy: Vulkan read-back 25 of 25 (was about
+half), two `gldepth` at once 120 of 120 frames each (was about half).
+
+Cost: the whole of a channel's shared ranges is flushed each time (about 8 GB per 5 s in the AIO runs,
+0.45 s of the serving thread). AIO on the rebuilt spare shows Vulkan 106 and OpenGL 58 FPS; that machine
+has no working screen path, so the earlier 494 and 223 are not a fair baseline, and the cost is not
+measured cleanly yet. Next: flush only what a submit or read-back can have touched.

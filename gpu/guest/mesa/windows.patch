@@ -106,10 +106,10 @@ index dd98ef4..2e388f4 100644
  
  }  // namespace gfxstream
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
-index 476a2cd..224bb0c 100644
+index 476a2cd..f8417c0 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpu.h
-@@ -3,15 +3,103 @@
+@@ -3,15 +3,104 @@
   * SPDX-License-Identifier: MIT
   */
  
@@ -198,6 +198,7 @@ index 476a2cd..224bb0c 100644
 +    bool mBroken = false;
 +    bool mScanout = false;
 +    std::atomic<bool> mPush{false};
++    std::atomic<int> mHeapMaps{0};  // shared heap ranges mapped now
 +    std::recursive_mutex mLock;
 +    uint32_t mContext = 0;
 +    uint32_t mNextResource = 1;
@@ -215,7 +216,7 @@ index 476a2cd..224bb0c 100644
      ~WindowsVirtGpuResource();
  
      void intoRaw() override;
-@@ -27,13 +115,17 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
+@@ -27,13 +116,17 @@ class WindowsVirtGpuResource : public std::enable_shared_from_this<WindowsVirtGp
      int transferToHost(uint32_t x, uint32_t y, uint32_t w, uint32_t h) override;
  
     private:
@@ -237,7 +238,7 @@ index 476a2cd..224bb0c 100644
  };
  
  class WindowsVirtGpuResourceMapping : public VirtGpuResourceMapping {
-@@ -54,19 +146,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
+@@ -54,19 +147,21 @@ class WindowsVirtGpuDevice : public VirtGpuDevice {
      WindowsVirtGpuDevice(enum VirtGpuCapset capset, int fd = -1);
      virtual ~WindowsVirtGpuDevice();
  
@@ -460,10 +461,10 @@ index 9113d96..39ea41a 100644
 +    return transfer(false, x, y, w, h);
  }
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-index 9d8b83b..28e92c7 100644
+index 9d8b83b..80684de 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-@@ -3,37 +3,519 @@
+@@ -3,37 +3,529 @@
   * SPDX-License-Identifier: MIT
   */
  
@@ -691,10 +692,12 @@ index 9d8b83b..28e92c7 100644
 +        mesa_loge("hwgpu: heap map at 0x%llx failed (error %lu)", (unsigned long long)offset, GetLastError());
 +        return nullptr;
 +    }
++    if (out.user) mHeapMaps++;
 +    return reinterpret_cast<void*>(uintptr_t(out.user));
 +}
 +
 +void HwgpuConnection::unmapHeap(void* p) {
++    mHeapMaps--;
 +    hwgpu_map_out in = {uint64_t(uintptr_t(p))};
 +    DWORD got = 0;
 +    if (mAdapter) {
@@ -755,7 +758,9 @@ index 9d8b83b..28e92c7 100644
 +
 +void HwgpuConnection::sync(bool pull) {
 +    std::lock_guard<std::recursive_mutex> l(mLock);
-+    if (mMirrors.empty()) return;
++    // Shared heap ranges need no copying, but the phone must still be told: its GPU and the CPUs do
++    // not see each other's caches, and the phone brings them in step on this message.
++    if (mMirrors.empty() && mHeapMaps.load() <= 0) return;
 +
 +    vgpu_hdr h = {};
 +    h.type = SGPU_CMD_SYNC;
@@ -797,7 +802,13 @@ index 9d8b83b..28e92c7 100644
 +        }
 +    }
 +    if (!pull) {
-+        if (!body.empty() && !push()) mesa_loge("hwgpu: sync failed");
++        if (!body.empty()) {
++            if (!push()) mesa_loge("hwgpu: sync failed");
++        } else if (mHeapMaps.load() > 0) {
++            // Shared ranges only: nothing to answer, and the phone takes it before the bytes that follow.
++            h.flags = SGPU_FLAG_NO_REPLY;
++            post(&h, sizeof(h), nullptr, 0);
++        }
 +        return;
 +    }
 +

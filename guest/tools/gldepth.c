@@ -71,6 +71,7 @@ int main(int argc, char **argv)
         if (alt) glColor3f(1, 1, 0); else glColor3f(0, 1, 0);
         glBegin(GL_QUADS); glVertex3f(-0.5f, -0.5f, zn); glVertex3f(0.5f, -0.5f, zn); glVertex3f(0.5f, 0.5f, zn); glVertex3f(-0.5f, 0.5f, zn); glEnd();
         unsigned char c[3];
+        if (argc > 2) glFinish();   /* second argument: wait for the GPU before reading */
         px(100, 100, c);
         int good = alt ? (c[0] > 200 && c[1] > 200 && c[2] < 50) : (c[1] > 200 && c[0] < 50 && c[2] < 50);
         if (!good) { bad++; if (bad < 6) printf("frame %d: centre %d,%d,%d\n", f, c[0], c[1], c[2]); }
