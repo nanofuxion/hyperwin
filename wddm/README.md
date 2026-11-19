@@ -916,3 +916,8 @@ The HyperWin GPU now shows the desktop on the phone, with nothing else drawing i
 - Direct3D 9 now sees our adapter on the screen: `Direct3D9` lists "HyperWin GPU", the display mode is
   right, and the runtime opens our driver and reads its caps and 24 formats, but `CheckDeviceType` for
   X8R8G8B8 still returns `D3DERR_NOTAVAILABLE`. Next: find which of the runtime's checks fails.
+- D3D9 `NOTAVAILABLE`, what is ruled out (2026-11-19): the same result as SYSTEM and as the logged-in
+  user's own task. The runtime calls `GetCaps` 13 (D3DCAPS9 from DXVK on the phone: 16384 textures, 8
+  stages, shader model 3), 3 (40 formats), 6, 34, then 4 (the 40 `FORMATOP`s, 800 bytes) and 7, and
+  never reaches `CreateDevice`. `X8R8G8B8` carries display-mode and 3D-acceleration ops. The runtime
+  rejects the adapter on some check we do not see yet.

@@ -178,6 +178,11 @@ static void load_caps(Adapter *a)
           (unsigned long)hr, (unsigned long)a->caps.VertexShaderVersion, (unsigned long)a->caps.PixelShaderVersion, (unsigned)a->caps.DeviceType,
           (unsigned long)a->caps.Caps, (unsigned long)a->caps.Caps2, (unsigned long)a->caps.Caps3, (unsigned long)a->caps.DevCaps,
           (unsigned long)a->caps.DevCaps2, (unsigned long)a->caps.MaxStreams);
+    D9LOG("hwd3d_umd: Direct3D 9 caps: tex %lux%lu, textures %lu, primcount %lu, vertexindex %lu, texcaps 0x%lx, rast 0x%lx, zcmp 0x%lx, blend 0x%lx/0x%lx, adapters %lu, ordinal %lu, driver ver %lu\n",
+          (unsigned long)a->caps.MaxTextureWidth, (unsigned long)a->caps.MaxTextureHeight, (unsigned long)a->caps.MaxSimultaneousTextures,
+          (unsigned long)a->caps.MaxPrimitiveCount, (unsigned long)a->caps.MaxVertexIndex, (unsigned long)a->caps.TextureCaps,
+          (unsigned long)a->caps.RasterCaps, (unsigned long)a->caps.ZCmpCaps, (unsigned long)a->caps.SrcBlendCaps, (unsigned long)a->caps.DestBlendCaps,
+          (unsigned long)a->caps.NumberOfAdaptersInGroup, (unsigned long)a->caps.AdapterOrdinal, (unsigned long)a->caps.MasterAdapterOrdinal);
     load_formats(a);
 }
 
@@ -196,6 +201,7 @@ static HRESULT APIENTRY GetCaps(HANDLE ha, const D3DDDIARG_GETCAPS *g)
     case D3DDDICAPS_GETFORMATCOUNT:
         load_caps(a);
         *static_cast<UINT *>(g->pData) = (UINT)a->formats.size();
+        D9LOG("hwd3d_umd: Direct3D 9 format count %u\n", (unsigned)a->formats.size());
         return S_OK;
     case D3DDDICAPS_GETFORMATDATA: {
         load_caps(a);
