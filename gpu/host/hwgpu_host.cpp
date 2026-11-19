@@ -123,7 +123,11 @@ void* heap_alloc(size_t alignment, size_t size) {
     for (auto& [off, len] : g_heap_free) {
         uint64_t at = (off + alignment - 1) & ~uint64_t(alignment - 1);
         if (at + size > off + len) continue;
-        heap_take(at, size);
+        if (!heap_take(at, size)) LOG("heap: could not take %llu at %llu", (unsigned long long)size, (unsigned long long)at);
+        for (auto& [uo, us] : g_heap_used)
+            if (at < uo + us && uo < at + size)
+                LOG("heap: OVERLAP new %llu+%llu with live %llu+%llu", (unsigned long long)at, (unsigned long long)size,
+                    (unsigned long long)uo, (unsigned long long)us);
         g_heap_used[at] = size;
         return g_heap + at;
     }
