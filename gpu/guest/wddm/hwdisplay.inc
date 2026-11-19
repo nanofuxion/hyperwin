@@ -18,6 +18,8 @@ static struct {
     PHYSICAL_ADDRESS source_addr;
     HANDLE source_alloc;
     UINT commits, source_sets, presents, vsyncs;
+    ULONG64 last_addr[4];          /* the last source addresses Windows set (read from outside) */
+    ULONG last_flags, last_context_count, last_alloc_ok;
 } d;
 
 static const struct hwd_mode hwd_extra[] = { { 1920, 1080 }, { 1600, 900 }, { 1366, 768 }, { 1280, 720 }, { 1024, 768 }, { 800, 600 } };
@@ -386,6 +388,10 @@ static NTSTATUS NTAPI HwdUpdateActiveVidPnPresentPath_impl(const HANDLE hAdapter
 static NTSTATUS NTAPI HwdSetVidPnSourceAddress_impl(const HANDLE hAdapter, const DXGKARG_SETVIDPNSOURCEADDRESS *arg)
 {
     (void)hAdapter;
+    d.last_addr[d.source_sets & 3] = (ULONG64)arg->PrimaryAddress.QuadPart;
+    d.last_flags = arg->Flags.Value;
+    d.last_context_count = arg->ContextCount;
+    d.last_alloc_ok = arg->hAllocation != NULL;
     d.source_addr = arg->PrimaryAddress;
     d.source_alloc = arg->hAllocation;
     d.source_sets++;

@@ -258,6 +258,14 @@ static void diag_write(void)
     report(L"T_Vsyncs", d.vsyncs);
     report(L"T_Presents", d.presents);
     report(L"T_SourceSets", d.source_sets);
+    for (int i = 0; i < 4; i++) {
+        WCHAR n[16] = L"T_Addr0";
+        n[6] = L'0' + i;
+        report(n, (ULONG)d.last_addr[i]);
+    }
+    report(L"T_SetFlags", d.last_flags);
+    report(L"T_SetCtx", d.last_context_count);
+    report(L"T_SetAllocOk", d.last_alloc_ok);
 }
 
 static VOID NTAPI guard_thread(PVOID context)
