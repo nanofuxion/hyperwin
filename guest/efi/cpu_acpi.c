@@ -250,10 +250,12 @@ int64_t HyperwinInstallCpuSsdt(void *system)
         if ((*(efi_fn *)protocol)((uint64_t)protocol, (uint64_t)osc, sizeof osc, (uint64_t)&key, 0, 0)) return -5;
         key = 0;
         if ((*(efi_fn *)protocol)((uint64_t)protocol, (uint64_t)pcct, n, (uint64_t)&key, 0, 0)) return -6;
+#ifdef HWGPU_ACPI_DEVICE   /* guest/efi/gpu_ssdt.asl: off until the driver takes that device (wddm/README.md) */
         static uint8_t gpu[sizeof HyperwinGpuSsdt];
         for (i = 0; i < sizeof gpu; ++i) gpu[i] = HyperwinGpuSsdt[i];
         key = 0;
         if ((*(efi_fn *)protocol)((uint64_t)protocol, (uint64_t)gpu, sizeof gpu, (uint64_t)&key, 0, 0)) return -7;
+#endif
     }
     return (int64_t)cpus;
 }
