@@ -11,6 +11,8 @@
 #include <initializer_list>
 #include <new>
 #include <vector>
+#include <map>
+#include <string>
 
 #include <d3d11.h>
 #include <d3d10umddi.h>
@@ -134,6 +136,8 @@ struct Dev {
     HANDLE kctx;          /* the kernel context the runtime wants a driver to have */
     UINT flags;
     struct Obj *pstage;   /* the staging copy a windowed present reads back, kept at the last size */
+    struct Obj *cur_vs, *cur_layout;  /* bound by the runtime: the phone gets the matching vertex shader variant */
+    uint32_t bound_vs;    /* the phone's vertex shader handle last bound */
 };
 
 struct Shadow {
@@ -162,7 +166,10 @@ struct Obj {
     uint32_t view_method, view_size;
     uint8_t view_desc[24];
     uint32_t qslot1, qseq, qflushed;  /* queries: slot + 1 in the query page (0: none), the End it waits for */
+    uint32_t xkind;        /* what extra points at: XK_VS or XK_LAYOUT */
+    void *extra;
 };
+enum { XK_NONE, XK_VS, XK_LAYOUT };
 
 static Dev *DV(D3D10DDI_HDEVICE h) { return static_cast<Dev *>(h.pDrvPrivate); }
 static Obj *OB(D3D10DDI_HRESOURCE h) { return static_cast<Obj *>(h.pDrvPrivate); }
@@ -175,8 +182,11 @@ static void fail(Dev *d, HRESULT hr)
     if (d && d->ucb && d->ucb->pfnSetErrorCb) d->ucb->pfnSetErrorCb(d->core, hr);
 }
 
+static void free_extra(Obj *o);
+
 static void release_obj(Obj *o)
 {
+    if (o && o->extra) free_extra(o);
     if (o && o->view_of) {
         for (Obj **p = &o->view_of->views; *p; p = &(*p)->next_view)
             if (*p == o) {
@@ -939,8 +949,16 @@ static void APIENTRY u_SetScissorRects(D3D10DDI_HDEVICE hd, UINT n, UINT, const 
 /* The runtime hands a shader as bare tokens plus its signatures. DXVK reads a DXBC container, so one is built:
  * the signatures (names made from the registers, since only registers cross this interface) and the code. */
 struct Sig {
-    uint32_t sys, reg, mask, type;
+    uint32_t sys, reg, mask, type;   /* type 0: the runtime did not say */
 };
+
+/* A vertex shader kept to be made again with typed inputs (vs_variant). */
+struct VsVar {
+    std::vector<UINT> code;
+    std::vector<Sig> in, out;
+    std::map<std::string, uint32_t> variants;
+};
+static uint32_t phone_shader(Dev *d, uint32_t method, const std::vector<uint8_t> &bc);
 
 static const char *sv_name(uint32_t sv, bool output)
 {
@@ -979,7 +997,7 @@ static std::vector<uint8_t> sig_chunk(const Sig *e, uint32_t n, bool output)
         put_u32(body, base + (uint32_t)names.size());
         put_u32(body, index);
         put_u32(body, (e[i].sys == 64 || e[i].sys == 65 || e[i].sys == 66 || e[i].sys == 67 || e[i].sys == 68) ? 0 : e[i].sys);
-        put_u32(body, e[i].type);
+        put_u32(body, e[i].type ? e[i].type : 3u);   /* unknown: float, unless a vertex layout says otherwise */
         put_u32(body, e[i].reg);
         uint32_t m = e[i].mask & 0xF;
         put_u32(body, m | (output ? ((~m & 0xF) << 8) : (m << 8)));
@@ -1094,7 +1112,7 @@ static std::vector<uint8_t> dxbc(const UINT *code, const std::vector<Sig> *in, c
 static std::vector<Sig> sigs_of(const D3D11_1DDIARG_SIGNATURE_ENTRY2 *e, UINT n)
 {
     std::vector<Sig> v;
-    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, e[i].RegisterComponentType ? (uint32_t)e[i].RegisterComponentType : 3u});
+    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, (uint32_t)e[i].RegisterComponentType});
     return v;
 }
 
@@ -1104,8 +1122,18 @@ static void make_shader_sigs(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *c
     Dev *d = DV(hd);
     Obj *o = new (hs.pDrvPrivate) Obj();
     std::vector<uint8_t> bc = dxbc(code, sin, sout);
+    if (calls_logged()) {
+        ulog("hwd3d_umd:   shader %p version 0x%08x, %u tokens\n", (void *)o, code[0], code[1]);
+        for (int k = 0; k < 2; k++) {
+            const std::vector<Sig> *v = k ? sout : sin;
+            for (size_t i = 0; v && i < v->size(); i++)
+                ulog("hwd3d_umd:     %s reg %u mask 0x%x sys %u type %u\n", k ? "out" : "in", (*v)[i].reg, (*v)[i].mask, (*v)[i].sys, (*v)[i].type);
+        }
+    }
     char dump[MAX_PATH];
     if (GetEnvironmentVariableA("HWD3D_DUMPSHADER", dump, sizeof dump)) {  /* the container built, for reading it */
+        size_t dn = strlen(dump);
+        if (dn && dump[dn - 1] == '\\') snprintf(dump + dn, sizeof dump - dn, "%p.dxbc", (void *)o);   /* a folder: one file each */
         HANDLE f = CreateFileA(dump, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             DWORD n;
@@ -1113,6 +1141,26 @@ static void make_shader_sigs(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *c
             CloseHandle(f);
         }
     }
+    o->h = phone_shader(d, method, bc);
+    /* A vertex shader whose inputs have no type from the runtime gets variants typed by the vertex layout
+     * bound with it (vs_bind). Direct2D reads integer vertex data, and as floats it drew wrong colours. */
+    if (method == HMX_ID3D11Device_CreateVertexShader && sin && sout) {
+        bool unknown = false;
+        for (const Sig &e : *sin) unknown |= e.sys == 0 && e.type == 0;
+        if (unknown) {
+            VsVar *v = new VsVar;
+            v->code.assign(code, code + code[1]);
+            v->in = *sin;
+            v->out = *sout;
+            o->xkind = XK_VS;
+            o->extra = v;
+        }
+    }
+}
+
+/* A shader on the phone, from a container: its handle, or 0. */
+static uint32_t phone_shader(Dev *d, uint32_t method, const std::vector<uint8_t> &bc)
+{
     struct wbuf *b = dc(d, method);
     put_arr(b, bc.data(), bc.size(), 1);
     uint64_t len = bc.size();
@@ -1121,12 +1169,85 @@ static void make_shader_sigs(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *c
     put32(b, 1);
     struct rd r;
     HRESULT hr = (HRESULT)call_wait(b, &r);
-    o->h = take32(&r);
+    uint32_t h = take32(&r);
     call_end(&r);
-    if (FAILED(hr) || !o->h) {
+    if (FAILED(hr) || !h) {
         ulog("hwd3d_umd: the phone refused a shader (0x%08lx)\n", (unsigned long)hr);
         fail(d, FAILED(hr) ? hr : E_FAIL);
+        return 0;
     }
+    return h;
+}
+
+/* The register type a vertex input gets from its format: 1 unsigned, 2 signed integer, 3 float. */
+static uint8_t format_reg_type(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R8_UINT:
+        return 1;
+    case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_SINT:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+/* The phone's vertex shader for the runtime's shader and layout: the shader itself, or a variant whose
+ * untyped inputs take their types from the layout. */
+static uint32_t vs_variant(Dev *d, Obj *vs, Obj *layout)
+{
+    if (!vs) return 0;
+    if (vs->xkind != XK_VS) return vs->h;
+    VsVar *v = static_cast<VsVar *>(vs->extra);
+    const uint8_t *types = layout && layout->xkind == XK_LAYOUT ? static_cast<const uint8_t *>(layout->extra) : nullptr;
+    std::string key;
+    std::vector<Sig> in = v->in;
+    for (Sig &e : in)
+        if (e.sys == 0 && e.type == 0) {
+            e.type = types && e.reg < 32 && types[e.reg] ? types[e.reg] : 3;
+            key.push_back((char)('0' + e.type));
+        }
+    if (key.find_first_not_of('3') == std::string::npos) return vs->h;   /* all floats: the shader as made */
+    auto it = v->variants.find(key);
+    if (it != v->variants.end()) return it->second;
+    uint32_t h = phone_shader(d, HMX_ID3D11Device_CreateVertexShader, dxbc(v->code.data(), &in, &v->out));
+    v->variants[key] = h;
+    return h;
+}
+
+static void vs_bind(Dev *d)
+{
+    uint32_t h = vs_variant(d, d->cur_vs, d->cur_layout);
+    if (h == d->bound_vs) return;
+    d->bound_vs = h;
+    struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_VSSetShader);
+    put32(b, h);
+    put32(b, 0);
+    put32(b, 0);
+    call_async(b);
+}
+
+static void free_extra(Obj *o)
+{
+    if (o->xkind == XK_VS) {
+        VsVar *v = static_cast<VsVar *>(o->extra);
+        for (auto &kv : v->variants) {
+            if (!kv.second) continue;
+            AcquireSRWLockExclusive(&g_lock);
+            struct hwd3d_call c = {{sizeof c, HWD3D_MAGIC, HWD3D_OP_RELEASE, HWD3D_NO_REPLY, ++g_seq}, kv.second, 0};
+            raw_send(&c, sizeof c);
+            ReleaseSRWLockExclusive(&g_lock);
+        }
+        delete v;
+    } else {
+        free(o->extra);
+    }
+    o->extra = nullptr;
+    o->xkind = XK_NONE;
 }
 
 static void make_shader(D3D10DDI_HDEVICE hd, uint32_t method, const UINT *code, D3D10DDI_HSHADER hs, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *sg)
@@ -1164,7 +1285,19 @@ static void APIENTRY u_CreateElementLayout(D3D10DDI_HDEVICE hd, const D3D10DDIAR
     Obj *o = new (hl.pDrvPrivate) Obj();
     std::vector<Sig> in;
     for (UINT i = 0; i < a->NumElements; i++) in.push_back({0, a->pVertexElements[i].InputRegister, 0xF, 3});
+    uint8_t *types = static_cast<uint8_t *>(calloc(32, 1));
+    for (UINT i = 0; types && i < a->NumElements; i++)
+        if (a->pVertexElements[i].InputRegister < 32)
+            types[a->pVertexElements[i].InputRegister] = format_reg_type(a->pVertexElements[i].Format);
+    o->xkind = XK_LAYOUT;
+    o->extra = types;
+    for (UINT i = 0; calls_logged() && i < a->NumElements; i++) {
+        const D3D10DDIARG_INPUT_ELEMENT_DESC &e = a->pVertexElements[i];
+        ulog("hwd3d_umd:   element reg %u format %u slot %u offset %u class %u step %u\n", e.InputRegister, (unsigned)e.Format, e.InputSlot,
+             e.AlignedByteOffset, (unsigned)e.InputSlotClass, e.InstanceDataStepRate);
+    }
     static const UINT vs[2] = {0x00010040, 2};  /* vs_4_0 with no instructions */
+    for (Sig &e : in) e.type = types && e.reg < 32 ? types[e.reg] : 3;
     std::vector<uint8_t> bc = dxbc(vs, &in, nullptr);
     struct wbuf *b = dc(d, HMX_ID3D11Device_CreateInputLayout);
     put32(b, a->NumElements);
@@ -1188,9 +1321,12 @@ static void APIENTRY u_CreateElementLayout(D3D10DDI_HDEVICE hd, const D3D10DDIAR
 static void APIENTRY u_SetInputLayout(D3D10DDI_HDEVICE hd, D3D10DDI_HELEMENTLAYOUT l)
 {
     ulog_call("SetInputLayout");
-    struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetInputLayout);
+    Dev *d = DV(hd);
+    struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_IASetInputLayout);
     put32(b, H(l));
     call_async(b);
+    d->cur_layout = static_cast<Obj *>(l.pDrvPrivate);
+    if (d->cur_vs && d->cur_vs->xkind == XK_VS) vs_bind(d);
 }
 
 template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
@@ -1207,6 +1343,12 @@ template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
 #define STAGE(Stage, S) \
     static void APIENTRY u_##Stage##SetShader(D3D10DDI_HDEVICE hd, D3D10DDI_HSHADER s) \
     { \
+        if (calls_logged()) ulog("hwd3d_umd: " #S "SetShader %p\n", s.pDrvPrivate); \
+        if (STAGE_##S == STAGE_VS) { \
+            DV(hd)->cur_vs = static_cast<Obj *>(s.pDrvPrivate); \
+            vs_bind(DV(hd)); \
+            return; \
+        } \
         struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetShader); \
         put32(b, H(s)); \
         put32(b, 0); \
@@ -1272,6 +1414,8 @@ static void APIENTRY u_SetTopology(D3D10DDI_HDEVICE hd, D3D10_DDI_PRIMITIVE_TOPO
 static void APIENTRY u_SetVertexBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HRESOURCE *v, const UINT *strides, const UINT *offsets)
 {
     ulog_call("SetVertexBuffers");
+    for (UINT i = 0; calls_logged() && i < n; i++)
+        ulog("hwd3d_umd:   slot %u buffer %p stride %u offset %u\n", start + i, v ? v[i].pDrvPrivate : nullptr, strides ? strides[i] : 0, offsets ? offsets[i] : 0);
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_IASetVertexBuffers);
     put32(b, start);
     put32(b, n);
@@ -1502,6 +1646,7 @@ static void APIENTRY u_CsSetUnorderedAccessViews(D3D10DDI_HDEVICE hd, UINT start
 static void APIENTRY u_Draw(D3D10DDI_HDEVICE hd, UINT count, UINT start)
 {
     ulog_call("Draw");
+    if (calls_logged()) ulog("hwd3d_umd:   count %u start %u\n", count, start);
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_Draw);
     put32(b, count);
     put32(b, start);
@@ -1852,7 +1997,7 @@ static void APIENTRY u10_CreateRasterizerState(D3D10DDI_HDEVICE hd, const D3D10_
 static std::vector<Sig> sigs10_of(const D3D10DDIARG_SIGNATURE_ENTRY *e, UINT n)
 {
     std::vector<Sig> v;
-    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, 3u});
+    for (UINT i = 0; e && i < n; i++) v.push_back({(uint32_t)e[i].SystemValue, e[i].Register, e[i].Mask, 0u});
     return v;
 }
 

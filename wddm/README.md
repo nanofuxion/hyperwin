@@ -796,10 +796,14 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
 - `XSSetConstantBuffers1` ranges (Direct3D 11.1) now reach DXVK (`HWD3D_OP_SET_CB1`).
 - Imported shared images are destroyed 2 s after their texture goes, with the device held until then,
   since DXVK may still have commands using them.
-- Still wrong: Direct2D drawing on the GPU. `guest/tools/d2dtest.cpp` draws a solid rectangle, gradients
-  and ellipses and reads them back. On WARP they come out right. On the HyperWin GPU solid colours are
-  wrong, gradients stay at their first colour and ellipses are missing. DWM draws the taskbar's Start,
-  Task View and Chat buttons this way, which is why they show as white shapes.
+- Direct2D drew wrong (solid colours off, gradients stuck at their first colour, ellipses missing), so
+  DWM showed the taskbar's Start, Task View and Chat buttons as white shapes. The runtime gives shader
+  signature entries with no component type, and the driver called every one a float. Direct2D's vertex
+  shader reads `R16G16_SINT` vertex data as integers (`itof v1.y`, `cb1[v1.x]`). Vertex shaders with
+  untyped inputs now keep their code, and the driver makes a variant whose input types follow the bound
+  vertex layout's formats (`vs_variant`). `guest/tools/d2dtest.cpp` matches WARP now, and the buttons
+  draw right. `HWD3D_DUMPSHADER` set to a folder ending in `\` writes each shader there, and the
+  translator's own `dxbc_disasm` (`gpu/work/dxvk-native/subprojects/dxbc-spirv`, tools on) reads them.
 - Explorer on the GPU (`HWD3D_SYSTEM` with `explorer.exe`) crashes Mali's driver in a layout barrier on
   an imported image during a copy (`find_crc_invalidate_transitions`), also with linear buffers. Explorer
   stays on Windows' software renderer.

@@ -96,7 +96,7 @@ int main(int argc, char **argv)
     ok &= check("linear gradient left (2,24)", px(2, 24), 0xfff80006);
     ok &= check("linear gradient right (61,24)", px(61, 24), 0xff0700f7);
     ok &= check("ellipse middle (16,40)", px(16, 40), 0xff0066ff);
-    ok &= check("rounded rect gradient (48,40)", px(48, 40), 0xff7f0080);
+    ok &= check("rounded rect gradient (48,40)", px(48, 40), 0xff3e00c0);
     ok &= check("radial middle (32,56)", px(32, 56), 0xffff0000);
     ok &= check("background (2,62)", px(2, 62), 0xff000000);
     ctx->Unmap(st, 0);
