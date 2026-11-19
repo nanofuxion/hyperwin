@@ -39,6 +39,8 @@
 #define HWD3D_OP_CREATE_SHARED  0x0015u   /* D3D11_TEXTURE2D_DESC (44 bytes) -> texture handle, share id */
 #define HWD3D_OP_OPEN_SHARED    0x0016u   /* share id -> texture handle, D3D11_TEXTURE2D_DESC */
 #define HWD3D_OP_SCANOUT        0x0017u   /* share id: put that surface on the phone's screen; no answer */
+#define HWD3D_OP_SET_CB1        0x0019u   /* object: context, method: stage (VS PS GS HS DS CS = 0-5); start, n,
+                                             handles, then n first constants and n counts: XSSetConstantBuffers1 */
 #define HWD3D_OP_FINISH         0x0018u   /* -> status once this channel's GPU work is done (before a shared surface is shown) */
 /* The screen driver's way to hand a frame over through the ordinary Direct3D 11 API: UpdateSubresource of a
  * shared surface with a 1x1 box at 0,0, row pitch HWD3D_SCANOUT_PITCH and depth pitch HWD3D_SCANOUT_SLICE.

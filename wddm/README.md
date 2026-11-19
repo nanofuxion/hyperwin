@@ -785,6 +785,25 @@ the screen driver drops a removed device and makes a new one, and the Direct3D d
 channel when the old one is dead (`reconnect_if_lost` in `wire.h`). The desktop came back on its own
 about 3 s after the restart, and `dxtest 11` passed afterwards.
 
+#### Speed and the taskbar (2026-11-19, spare machine)
+
+- The screen driver waited for about 21 answers from the phone per frame: its event queries were asked
+  of the phone on every poll. Queries the Direct3D driver makes now get a slot in the query page, as the
+  per-program DLL's do, so a poll is a memory read. Waits per screen frame dropped to about 3.
+- `HWD3D_UMDCALLS` writes a line per driver call and slows DWM a lot. Keep it off except to debug.
+- Direct2D offers its resources (`OfferResources`); the stub's error removed the device. Offer and
+  reclaim now succeed and nothing is ever discarded.
+- `XSSetConstantBuffers1` ranges (Direct3D 11.1) now reach DXVK (`HWD3D_OP_SET_CB1`).
+- Imported shared images are destroyed 2 s after their texture goes, with the device held until then,
+  since DXVK may still have commands using them.
+- Still wrong: Direct2D drawing on the GPU. `guest/tools/d2dtest.cpp` draws a solid rectangle, gradients
+  and ellipses and reads them back. On WARP they come out right. On the HyperWin GPU solid colours are
+  wrong, gradients stay at their first colour and ellipses are missing. DWM draws the taskbar's Start,
+  Task View and Chat buttons this way, which is why they show as white shapes.
+- Explorer on the GPU (`HWD3D_SYSTEM` with `explorer.exe`) crashes Mali's driver in a layout barrier on
+  an imported image during a copy (`find_crc_invalidate_transitions`), also with linear buffers. Explorer
+  stays on Windows' software renderer.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

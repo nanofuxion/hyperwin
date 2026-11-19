@@ -848,9 +848,53 @@ PFN_vkGetInstanceProcAddr vk_gipa() {
     return gipa;
 }
 
-// Destroys the VkImage and its memory when DXVK's texture goes (DXVK does not own an imported image).
+// An imported image whose texture has gone. DXVK may still have commands in flight that use it (it
+// does not own an imported image), so it is destroyed 2 s later, with its D3D11 device held until then.
+// Destroying it at once crashed Mali's driver in a later barrier.
+// IDXGIVkInteropDevice1's id, spelled out: DXVK's native headers only give __uuidof for their own types.
+const GUID kHwVkInteropGuid = {0xe2ef5fa5, 0xdc21, 0x4af7, {0x90, 0xc4, 0xf6, 0x7e, 0xf6, 0xa0, 0x93, 0x24}};
+uint64_t now_ns();
+
+struct DeadImage {
+    ID3D11Device* owner;   // held, so the Vulkan device outlives the image
+    VkDevice dev;
+    VkImage image;
+    VkDeviceMemory memory;
+    PFN_vkDestroyImage destroy_image;
+    PFN_vkFreeMemory free_memory;
+    uint64_t when;
+};
+std::mutex g_dead_lock;
+std::vector<DeadImage> g_dead;
+
+void destroy_dead(const DeadImage& d) {
+    d.destroy_image(d.dev, d.image, nullptr);
+    d.free_memory(d.dev, d.memory, nullptr);
+    d.owner->Release();
+}
+
+// Destroys the images that died long enough ago for their last commands to be done.
+void sweep_dead() {
+    std::vector<DeadImage> now;
+    {
+        std::lock_guard<std::mutex> g(g_dead_lock);
+        const uint64_t t = now_ns();
+        for (auto it = g_dead.begin(); it != g_dead.end();) {
+            if (t - it->when > 2000000000ull) {
+                now.push_back(*it);
+                it = g_dead.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& d : now) destroy_dead(d);
+}
+
+// Destroys the VkImage and its memory when DXVK's texture goes, later (see DeadImage).
 struct VkKeep final : IUnknown {
     LONG refs = 1;
+    ID3D11Device* owner = nullptr;  // a reference, handed to DeadImage
     VkDevice dev;
     VkImage image;
     VkDeviceMemory memory;
@@ -861,9 +905,12 @@ struct VkKeep final : IUnknown {
     ULONG STDMETHODCALLTYPE Release() override {
         LONG n = __atomic_sub_fetch(&refs, 1, __ATOMIC_ACQ_REL);
         if (!n) {
-            destroy_image(dev, image, nullptr);
-            free_memory(dev, memory, nullptr);
+            {
+                std::lock_guard<std::mutex> g(g_dead_lock);
+                g_dead.push_back({owner, dev, image, memory, destroy_image, free_memory, now_ns()});
+            }
             delete this;
+            sweep_dead();
         }
         return ULONG(n);
     }
@@ -892,10 +939,8 @@ uint32_t ahb_desc_format(AHardwareBuffer* ahb) {
 
 // The buffer as a texture of this device.
 HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_DESC& d, ID3D11Texture2D** out) {
-    // IDXGIVkInteropDevice1's id, spelled out: DXVK's native headers only give __uuidof for their own types.
-    static const GUID kInterop1 = {0xe2ef5fa5, 0xdc21, 0x4af7, {0x90, 0xc4, 0xf6, 0x7e, 0xf6, 0xa0, 0x93, 0x24}};
     HwVkInteropDevice1* interop = nullptr;
-    if (FAILED(dev->QueryInterface(kInterop1, reinterpret_cast<void**>(&interop))) || !interop) return E_NOINTERFACE;
+    if (FAILED(dev->QueryInterface(kHwVkInteropGuid, reinterpret_cast<void**>(&interop))) || !interop) return E_NOINTERFACE;
     VkInstance inst;
     VkPhysicalDevice phys;
     VkDevice vkd;
@@ -969,6 +1014,8 @@ HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_
         }
         auto* keep = new VkKeep;
         keep->dev = vkd;
+        keep->owner = dev;
+        dev->AddRef();
         keep->image = image;
         keep->memory = memory;
         keep->destroy_image = vkDestroyImage;
@@ -1042,6 +1089,37 @@ int32_t open_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     w.arr(&d, sizeof d);
     LOG("channel %u: opened shared surface %u", c.slot, id);
     return S_OK;
+}
+
+// XSSetConstantBuffers1: constant buffers bound from a first constant (Direct3D 11.1). Direct2D binds
+// slices of one big buffer this way; the whole buffer from 0 drew wrong colours and no shapes.
+int32_t set_cb1(Chan& c, const hwd3d_call& call, Rd& r) {
+    auto* ctx = static_cast<ID3D11DeviceContext*>(c.obj(call.object, HI_ID3D11DeviceContext));
+    if (!ctx || ctx == BAD) return E_INVALIDARG;
+    UINT start = 0, n = 0;
+    r.get(&start, 4);
+    r.get(&n, 4);
+    std::vector<ID3D11Buffer*> b;
+    bool bp = c.objs(r, b, HI_ID3D11Buffer);
+    if (!r.ok || !bp || n > D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT || (!b.empty() && b.size() != n))
+        return E_INVALIDARG;
+    std::vector<UINT> first(n), num(n);
+    for (UINT i = 0; i < n; i++) r.get(&first[i], 4);
+    for (UINT i = 0; i < n; i++) r.get(&num[i], 4);
+    if (!r.ok) return E_INVALIDARG;
+    ID3D11DeviceContext1* c1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&c1))) || !c1) return E_NOINTERFACE;
+    ID3D11Buffer* const* bufs = b.empty() ? nullptr : b.data();
+    switch (call.method) {
+    case 0: c1->VSSetConstantBuffers1(start, n, bufs, first.data(), num.data()); break;
+    case 1: c1->PSSetConstantBuffers1(start, n, bufs, first.data(), num.data()); break;
+    case 2: c1->GSSetConstantBuffers1(start, n, bufs, first.data(), num.data()); break;
+    case 3: c1->HSSetConstantBuffers1(start, n, bufs, first.data(), num.data()); break;
+    case 4: c1->DSSetConstantBuffers1(start, n, bufs, first.data(), num.data()); break;
+    case 5: c1->CSSetConstantBuffers1(start, n, bufs, first.data(), num.data()); break;
+    }
+    c1->Release();
+    return 0;
 }
 
 // Waits until this channel's GPU work is done, so a surface handed on to another program is whole.
@@ -1188,6 +1266,7 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
     case HWD3D_OP_CREATE_SHARED:
     case HWD3D_OP_OPEN_SHARED:
     case HWD3D_OP_SCANOUT:
+    case HWD3D_OP_SET_CB1:
     case HWD3D_OP_FINISH: {
         if (m.size() < sizeof(hwd3d_call)) return false;
         hwd3d_call call;
@@ -1233,6 +1312,8 @@ int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, 
             st = scanout(c, r);
         } else if (h.op == HWD3D_OP_FINISH) {
             st = finish(c);
+        } else if (h.op == HWD3D_OP_SET_CB1) {
+            st = set_cb1(c, call, r);
         } else if (call.method >= HM_COUNT || !hm_table[call.method].fn) {
             static bool told[HM_COUNT];
             if (call.method < HM_COUNT && !told[call.method]) {
@@ -1301,6 +1382,7 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
     }
     if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation)) LOG("channel %u: bad HwD3D stream, dropping it", slot);
     c.release_all();
+    sweep_dead();
     drop_shared(slot);
     LOG("channel %u: HwD3D ends after %llu messages", slot, (unsigned long long)c.received);
     if (c.presents) {

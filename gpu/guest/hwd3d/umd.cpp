@@ -161,11 +161,13 @@ struct Obj {
     struct Obj *view_of, *next_view;  /* views: the resource, and its next view */
     uint32_t view_method, view_size;
     uint8_t view_desc[24];
+    uint32_t qslot1, qseq, qflushed;  /* queries: slot + 1 in the query page (0: none), the End it waits for */
 };
 
 static Dev *DV(D3D10DDI_HDEVICE h) { return static_cast<Dev *>(h.pDrvPrivate); }
 static Obj *OB(D3D10DDI_HRESOURCE h) { return static_cast<Obj *>(h.pDrvPrivate); }
 static Obj *OB(D3D10DDI_HRENDERTARGETVIEW h) { return static_cast<Obj *>(h.pDrvPrivate); }
+static Obj *OB(D3D10DDI_HQUERY h) { return static_cast<Obj *>(h.pDrvPrivate); }
 
 static void fail(Dev *d, HRESULT hr)
 {
@@ -785,7 +787,12 @@ static uint32_t make_view(Dev *d, Obj *v, Obj *res, uint32_t method, const void 
         v->next_view = res->views;
         res->views = v;
     }
-    return phone_create(d, method, desc, size, res->h);
+    uint32_t handle = phone_create(d, method, desc, size, res->h);
+    if (calls_logged())
+        ulog("hwd3d_umd: ctx %u view %u object %p resource %p handle %u share %u size %ux%u resource format %u view format %u\n",
+             d->hctx, handle, (void *)v, (void *)res, res->h, res->share, res->r.width, res->r.height,
+             res->r.format, *(const DXGI_FORMAT *)desc);
+    return handle;
 }
 
 template <class T> static void APIENTRY u_destroy(D3D10DDI_HDEVICE, T h) { release_obj(O(h)); }
@@ -906,6 +913,9 @@ static void APIENTRY u_SetRasterizerState(D3D10DDI_HDEVICE hd, D3D10DDI_HRASTERI
 static void APIENTRY u_SetViewports(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D10_DDI_VIEWPORT *v)
 {
     ulog_call("SetViewports");
+    if (calls_logged())
+        for (UINT i = 0; i < n; ++i)
+            ulog("hwd3d_umd: ctx %u viewport %u xywh %g %g %g %g\n", DV(hd)->hctx, i, v[i].TopLeftX, v[i].TopLeftY, v[i].Width, v[i].Height);
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetViewports);
     put32(b, n);
     put_arr(b, v, n, sizeof *v);
@@ -915,6 +925,9 @@ static void APIENTRY u_SetViewports(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D
 static void APIENTRY u_SetScissorRects(D3D10DDI_HDEVICE hd, UINT n, UINT, const D3D10_DDI_RECT *r)
 {
     ulog_call("SetScissorRects");
+    if (calls_logged())
+        for (UINT i = 0; i < n; ++i)
+            ulog("hwd3d_umd: ctx %u scissor %u ltrb %ld %ld %ld %ld\n", DV(hd)->hctx, i, r[i].left, r[i].top, r[i].right, r[i].bottom);
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_RSSetScissorRects);
     put32(b, n);
     put_arr(b, r, n, sizeof *r);
@@ -1202,6 +1215,9 @@ template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
     } \
     static void APIENTRY u_##Stage##SetShaderResources(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HSHADERRESOURCEVIEW *v) \
     { \
+        if (calls_logged()) \
+            for (UINT i = 0; i < n; ++i) \
+                ulog("hwd3d_umd: ctx %u " #S " slot %u view %u\n", DV(hd)->hctx, start + i, v ? H(v[i]) : 0); \
         struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetShaderResources); \
         put32(b, start); \
         put32(b, n); \
@@ -1218,7 +1234,16 @@ template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
     } \
     static void APIENTRY u_##Stage##SetConstantBuffers(D3D10DDI_HDEVICE hd, UINT start, UINT n, const D3D10DDI_HRESOURCE *v, const UINT *first, const UINT *num) \
     { \
-        if (first || num) note_constant_ranges(first, num, n); \
+        if (first && num && n) { \
+            struct wbuf *b = begin(DV(hd)->hctx, STAGE_##S, HWD3D_OP_SET_CB1); \
+            put32(b, start); \
+            put32(b, n); \
+            put_handles(b, v, n); \
+            for (UINT i = 0; i < n; i++) put32(b, first[i]); \
+            for (UINT i = 0; i < n; i++) put32(b, num[i]); \
+            call_async(b); \
+            return; \
+        } \
         struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetConstantBuffers); \
         put32(b, start); \
         put32(b, n); \
@@ -1226,15 +1251,8 @@ template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
         call_async(b); \
     }
 
-/* The phone's Direct3D 11.0 context binds a whole buffer. A range of it (11.1) is noted, not honoured yet. */
-static void note_constant_ranges(const UINT *first, const UINT *num, UINT n)
-{
-    for (UINT i = 0; i < n; i++)
-        if ((first && first[i]) || (num && num[i] && num[i] != 4096)) {
-            ulog("hwd3d_umd: a constant buffer range is not done yet\n");
-            return;
-        }
-}
+/* Stage numbers of HWD3D_OP_SET_CB1. */
+enum { STAGE_VS, STAGE_PS, STAGE_GS, STAGE_HS, STAGE_DS, STAGE_CS };
 
 STAGE(Vs, VS)
 STAGE(Ps, PS)
@@ -1416,6 +1434,9 @@ static void APIENTRY u_SetRenderTargets(D3D10DDI_HDEVICE hd, const D3D10DDI_HREN
                                         const D3D11DDI_HUNORDEREDACCESSVIEW *uav, const UINT *counts, UINT uavStart, UINT nUav, UINT, UINT)
 {
     ulog_call("SetRenderTargets");
+    if (calls_logged())
+        for (UINT i = 0; i < n; ++i)
+            ulog("hwd3d_umd: ctx %u target %u view %u\n", DV(hd)->hctx, i, rtv ? H(rtv[i]) : 0);
     Dev *d = DV(hd);
     struct wbuf *b;
     if (!nUav) {
@@ -1674,6 +1695,25 @@ static void APIENTRY u_CreateQuery(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATE
     }
     D3D11_QUERY_DESC qd = {(D3D11_QUERY)t, a->MiscFlags};
     o->h = phone_create(DV(hd), HMX_ID3D11Device_CreateQuery, &qd, sizeof qd);
+    /* Results come back in the query page, so polling a query costs no wait on the phone. */
+    AcquireSRWLockExclusive(&g_lock);
+    ensure_staging();
+    if (g_qpage)
+        for (uint32_t i = 0; i < HWD3D_QUERY_SLOTS; i++)
+            if (!g_qused[i]) {
+                g_qused[i] = 1;
+                o->qslot1 = i + 1;
+                break;
+            }
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
+static void APIENTRY u_DestroyQuery(D3D10DDI_HDEVICE, D3D10DDI_HQUERY q)
+{
+    Obj *o = OB(q);
+    if (o->qslot1) g_qused[o->qslot1 - 1] = 0;
+    o->qslot1 = 0;
+    release_obj(o);
 }
 
 static void APIENTRY u_QueryBegin(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
@@ -1687,10 +1727,15 @@ static void APIENTRY u_QueryBegin(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
 static void APIENTRY u_QueryEnd(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q)
 {
     ulog_call("QueryEnd");
+    Obj *o = OB(q);
+    if (o->qslot1) {
+        if (!++o->qseq) o->qseq = 1;
+        o->qflushed = 0;
+    }
     struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_End);
     put32(b, H(q));
-    put32(b, 0);  /* no result slot: GetData asks the phone */
-    put32(b, 0);
+    put32(b, o->qslot1 ? o->qslot1 - 1 : 0);  /* without a slot GetData asks the phone */
+    put32(b, o->qslot1 ? o->qseq : 0);
     call_async(b);
 }
 
@@ -1698,6 +1743,21 @@ static void APIENTRY u_QueryGetData(D3D10DDI_HDEVICE hd, D3D10DDI_HQUERY q, void
 {
     ulog_call("QueryGetData");
     Dev *d = DV(hd);
+    Obj *o = OB(q);
+    if (o->qslot1 && o->qseq && g_qpage) {
+        volatile struct hwd3d_query_slot *slot = &g_qpage[o->qslot1 - 1];
+        if (__atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE) == o->qseq) {
+            uint32_t n = slot->size < size ? slot->size : size;
+            if (data && n) memcpy(data, (const void *)slot->data, n);
+            return;
+        }
+        if (!(flags & D3D10_DDI_GET_DATA_DO_NOT_FLUSH) && !o->qflushed) {
+            o->qflushed = 1;
+            call_async(cx(d, HMX_ID3D11DeviceContext_Flush));
+        }
+        fail(d, DXGI_DDI_ERR_WASSTILLDRAWING);
+        return;
+    }
     struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_GetData);
     put32(b, H(q));
     put32(b, data ? size : 0);
@@ -1878,7 +1938,7 @@ template <class Tbl> static void fill_device_funcs(Tbl *t)
     t->pfnDestroyShader = u_destroy<D3D10DDI_HSHADER>;
     t->pfnCreateQuery = u_CreateQuery;
     t->pfnCalcPrivateQuerySize = u_CalcPrivateQuerySize;
-    t->pfnDestroyQuery = u_destroy<D3D10DDI_HQUERY>;
+    t->pfnDestroyQuery = u_DestroyQuery;
     t->pfnQueryBegin = u_QueryBegin;
     t->pfnQueryEnd = u_QueryEnd;
     t->pfnQueryGetData = u_QueryGetData;
@@ -2002,7 +2062,7 @@ static void fill_device_funcs_10_1(D3D10_1DDI_DEVICEFUNCS *t)
     t->pfnCreatePixelShader = u10_CreatePixelShader;
     t->pfnDestroyShader = u_destroy<D3D10DDI_HSHADER>;
     t->pfnCreateQuery = u_CreateQuery;
-    t->pfnDestroyQuery = u_destroy<D3D10DDI_HQUERY>;
+    t->pfnDestroyQuery = u_DestroyQuery;
     t->pfnVsSetConstantBuffers = u10_VsSetConstantBuffers;
     t->pfnPsSetConstantBuffers = u10_PsSetConstantBuffers;
     t->pfnGsSetConstantBuffers = u10_GsSetConstantBuffers;
@@ -2187,6 +2247,9 @@ static HRESULT __stdcall u_dxgi_rotate(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *
         for (Obj *v = views[i]; v; v = v->next_view) {
             uint32_t old = v->h;
             v->h = phone_create(d, v->view_method, v->view_desc, v->view_size, res[i]->h);
+            if (calls_logged())
+                ulog("hwd3d_umd: ctx %u rotated view %u to %u resource %p handle %u share %u\n",
+                     d->hctx, old, v->h, (void *)res[i], res[i]->h, res[i]->share);
             if (old) {
                 AcquireSRWLockExclusive(&g_lock);
                 struct hwd3d_call c = {{sizeof c, HWD3D_MAGIC, HWD3D_OP_RELEASE, HWD3D_NO_REPLY, ++g_seq}, old, 0};
@@ -2211,6 +2274,15 @@ static HRESULT __stdcall u_dxgi_priority(DXGI_DDI_ARG_SETRESOURCEPRIORITY *) { r
  * the same buffer; the drawing program flushed before presenting. Nothing to do; an error here makes the
  * runtime drop the device (the screen driver saw DXGI_ERROR_DRIVER_INTERNAL_ERROR after its first frame). */
 static HRESULT __stdcall u_dxgi_resolve_shared(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *) { return S_OK; }
+
+/* Offering lets the kernel take a resource's memory while it is unused. Memory here is on the phone and
+ * is kept, so nothing is ever discarded. Direct2D offers its resources; an error removed the device. */
+static HRESULT __stdcall u_dxgi_offer(DXGI_DDI_ARG_OFFERRESOURCES *) { return S_OK; }
+static HRESULT __stdcall u_dxgi_reclaim(DXGI_DDI_ARG_RECLAIMRESOURCES *a)
+{
+    for (UINT i = 0; a->pDiscarded && i < a->Resources; i++) a->pDiscarded[i] = FALSE;
+    return S_OK;
+}
 
 /* The DXGI entries are all one shape, an answer and one pointer to arguments. Each table is the entries of
  * the one before it and more, so the table the runtime gave is filled to its size. */
@@ -2241,7 +2313,11 @@ static void fill_dxgi(DXGI_DDI_BASE_ARGS *a, UINT interface_version)
     t1->pfnQueryResourceResidency = u_dxgi_residency;
     t1->pfnSetResourcePriority = u_dxgi_priority;
     t1->pfnResolveSharedResource = u_dxgi_resolve_shared;
-    if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) a->pDXGIDDIBaseFunctions4->pfnPresent1 = u_dxgi_present1;
+    if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) {
+        a->pDXGIDDIBaseFunctions4->pfnPresent1 = u_dxgi_present1;
+        a->pDXGIDDIBaseFunctions4->pfnOfferResources = u_dxgi_offer;
+        a->pDXGIDDIBaseFunctions4->pfnReclaimResources = u_dxgi_reclaim;
+    }
 }
 
 /* ---- the adapter ---- */
