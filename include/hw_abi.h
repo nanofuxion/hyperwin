@@ -151,6 +151,16 @@ struct hw_header {
     char cpu_maker[32];
     char cpu_name[64];
     uint32_t cpu_mhz;
+    /* The Windows screen size, for the indirect display (gpu/guest/idd). The host sets want_* to the
+     * size chosen in the app and native_* to the phone's screen in pixels, and bumps screen_seq when
+     * want_* changes while Windows runs; the driver then gives Windows that size. screen_guest is 1
+     * while the indirect display writes the frames (and width/height then follow its mode). */
+    uint32_t screen_want_width;
+    uint32_t screen_want_height;
+    uint32_t screen_native_width;
+    uint32_t screen_native_height;
+    uint32_t screen_seq;
+    uint32_t screen_guest;
 };
 
 _Static_assert(sizeof(struct hw_header) < 0x1000, "header must fit in the first page");

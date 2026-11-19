@@ -77,6 +77,8 @@ object AvfPlan {
             android.os.Build.MANUFACTURER, android.os.Build.MODEL,
             soc.firstOrNull().orEmpty(), soc.joinToString(" "),
         )
+        val native = nativeScreen()
+        WindowBridge.nativeSetScreen(map, frameWidth, frameHeight, native.first, native.second, false)
         val pfd = fdOf(shm)
         val link = runCatching { Os.readlink("/proc/self/fd/${pfd.fd}") }.getOrDefault("?")
         // Zero until the renderer hands parts of it out; pages are only real once touched.
@@ -168,6 +170,12 @@ object AvfPlan {
         call("setRendererUseGles", false)
         call("setRendererUseSurfaceless", true)
         return cls.getMethod("build").invoke(g)!!
+    }
+
+    /** The phone's screen in pixels, landscape. */
+    fun nativeScreen(): Pair<Int, Int> {
+        val m = android.content.res.Resources.getSystem().displayMetrics
+        return maxOf(m.widthPixels, m.heightPixels) to minOf(m.widthPixels, m.heightPixels)
     }
 
     class SharedWindow(

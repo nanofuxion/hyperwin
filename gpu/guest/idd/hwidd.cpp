@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "hw_abi.h"
+#include "hwgpu_ioctl.h"
 
 // ---- a small log, readable by an administrator: C:\ProgramData\HyperWin\idd.log ----
 static CRITICAL_SECTION g_log_lock;
@@ -41,10 +43,56 @@ void hwidd_log(const char *fmt, ...)
     LeaveCriticalSection(&g_log_lock);
 }
 
-// ---- modes: the phone's screen size first, then a few common ones ----
+// ---- the shared window: header and frames, mapped by hwgpu.sys (IOCTL_HWGPU_SCREEN) ----
+static volatile hw_header *g_win;
+
+static void open_screen()
+{
+    HANDLE f = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        hwidd_log("no \\.\HwGpu: %lu", GetLastError());
+        return;
+    }
+    hwgpu_map_out out = {};
+    DWORD got = 0;
+    if (!DeviceIoControl(f, IOCTL_HWGPU_SCREEN, nullptr, 0, &out, sizeof out, &got, nullptr) || !out.user) {
+        hwidd_log("screen mapping refused: %lu", GetLastError());
+        CloseHandle(f);
+        return;
+    }
+    g_win = (volatile hw_header *)(ULONG_PTR)out.user;   // the handle stays open: closing it unmaps
+    hwidd_log("screen mapped, app size %ux%u, phone %ux%u", g_win->screen_want_width, g_win->screen_want_height,
+              g_win->screen_native_width, g_win->screen_native_height);
+}
+
+// ---- modes: the size chosen in the app first, then the phone's own screen, then common ones ----
 struct mode { UINT w, h, hz; };
-static const mode g_modes[] = { { 1280, 720, 60 }, { 1920, 1080, 60 }, { 1600, 900, 60 }, { 1024, 768, 60 } };
-static const UINT g_mode_count = sizeof g_modes / sizeof g_modes[0];
+static mode g_modes[10];
+static UINT g_mode_count;
+
+static bool size_ok(UINT w, UINT h)
+{
+    return w >= HW_MIN_WIDTH && w <= HW_MAX_WIDTH && h >= HW_MIN_HEIGHT && h <= HW_MAX_HEIGHT;
+}
+
+static void add_mode(UINT w, UINT h)
+{
+    if (!size_ok(w, h) || g_mode_count >= sizeof g_modes / sizeof g_modes[0]) return;
+    for (UINT i = 0; i < g_mode_count; i++)
+        if (g_modes[i].w == w && g_modes[i].h == h) return;
+    g_modes[g_mode_count++] = { w, h, 60 };
+}
+
+static void build_modes()
+{
+    g_mode_count = 0;
+    if (g_win) {
+        add_mode(g_win->screen_want_width, g_win->screen_want_height);
+        add_mode(g_win->screen_native_width, g_win->screen_native_height);
+    }
+    static const UINT common[][2] = { { 1280, 720 }, { 1920, 1080 }, { 1600, 900 }, { 1366, 768 }, { 1024, 768 } };
+    for (auto &c : common) add_mode(c[0], c[1]);
+}
 
 // IddCx wants the vsync divider 0 in a monitor mode and non-zero in a target mode.
 static void signal_info(DISPLAYCONFIG_VIDEO_SIGNAL_INFO *s, const mode &m, UINT divider)
@@ -61,6 +109,15 @@ static void signal_info(DISPLAYCONFIG_VIDEO_SIGNAL_INFO *s, const mode &m, UINT 
     s->videoStandard = 255 | (divider << 16);   // other standard
 }
 
+// The screen's size is the one chosen in the app, so that is the only mode the screen offers Windows.
+static void fill_target(IDDCX_TARGET_MODE *t, const mode &m)
+{
+    ZeroMemory(t, sizeof *t);
+    t->Size = sizeof *t;
+    signal_info(&t->TargetVideoSignalInfo.targetVideoSignalInfo, m, 1);
+    t->RequiredBandwidth = (UINT64)m.w * m.h * m.hz;
+}
+
 // ---- the frame thread: one per swap chain Windows gives the monitor ----
 struct frame_thread {
     IDDCX_SWAPCHAIN swapchain;
@@ -71,31 +128,52 @@ struct frame_thread {
 };
 static frame_thread *g_ft;
 
-static void save_frame(ID3D11Device *dev, ID3D11DeviceContext *ctx, IDXGIResource *res, UINT number)
+// The frame goes into the shared window's back buffer and becomes the front one: the app shows it
+// on the phone's screen as it does the boot screen. The frame was drawn by Windows' software
+// renderer, so this is a CPU copy; on the HyperWin GPU it will become a hand-over instead.
+static ID3D11Texture2D *g_stage;
+static D3D11_TEXTURE2D_DESC g_stage_desc;
+
+static void publish_frame(ID3D11Device *dev, ID3D11DeviceContext *ctx, IDXGIResource *res)
 {
+    volatile hw_header *h = g_win;
+    if (!h) return;
     ID3D11Texture2D *tex = nullptr;
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) return;
     D3D11_TEXTURE2D_DESC d;
     tex->GetDesc(&d);
-    d.Usage = D3D11_USAGE_STAGING;
-    d.BindFlags = 0;
-    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    d.MiscFlags = 0;
-    ID3D11Texture2D *stage = nullptr;
-    if (SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &stage))) {
-        ctx->CopyResource(stage, tex);
+    if (!g_stage || g_stage_desc.Width != d.Width || g_stage_desc.Height != d.Height || g_stage_desc.Format != d.Format) {
+        if (g_stage) g_stage->Release();
+        g_stage = nullptr;
+        g_stage_desc = d;
+        g_stage_desc.Usage = D3D11_USAGE_STAGING;
+        g_stage_desc.BindFlags = 0;
+        g_stage_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        g_stage_desc.MiscFlags = 0;
+        if (FAILED(dev->CreateTexture2D(&g_stage_desc, nullptr, &g_stage))) g_stage = nullptr;
+    }
+    if (g_stage && size_ok(d.Width, d.Height)) {
+        ctx->CopyResource(g_stage, tex);
         D3D11_MAPPED_SUBRESOURCE m;
-        if (SUCCEEDED(ctx->Map(stage, 0, D3D11_MAP_READ, 0, &m))) {
-            HANDLE f = CreateFileW(L"C:\\ProgramData\\HyperWin\\idd-frame.raw", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-            if (f != INVALID_HANDLE_VALUE) {
-                DWORD w;
-                for (UINT y = 0; y < d.Height; y++) WriteFile(f, (BYTE *)m.pData + (size_t)y * m.RowPitch, d.Width * 4, &w, nullptr);
-                CloseHandle(f);
+        if (SUCCEEDED(ctx->Map(g_stage, 0, D3D11_MAP_READ, 0, &m))) {
+            hw_header *hh = (hw_header *)h;
+            if (hh->width != d.Width || hh->height != d.Height || hh->stride != d.Width * 4 || hh->format != HW_FORMAT_BGRA) {
+                hh->width = d.Width;
+                hh->height = d.Height;
+                hh->stride = d.Width * 4;
+                hh->format = HW_FORMAT_BGRA;
             }
-            ctx->Unmap(stage, 0);
-            hwidd_log("frame %u saved: %ux%u format %u", number, d.Width, d.Height, (unsigned)d.Format);
+            hh->screen_guest = 1;
+            if (hw_mode_ok(hh)) {
+                uint32_t back = __atomic_load_n(&hh->front, __ATOMIC_ACQUIRE) == 0 ? 1 : 0;
+                BYTE *dst = (BYTE *)hh + hw_frame_off(hh, back);
+                for (UINT y = 0; y < d.Height; y++)
+                    memcpy(dst + (size_t)y * hh->stride, (const BYTE *)m.pData + (size_t)y * m.RowPitch, (size_t)d.Width * 4);
+                __atomic_store_n(&hh->front, back, __ATOMIC_RELEASE);
+                __atomic_add_fetch(&hh->seq, 1, __ATOMIC_RELEASE);
+            }
+            ctx->Unmap(g_stage, 0);
         }
-        stage->Release();
     }
     tex->Release();
 }
@@ -139,7 +217,7 @@ static DWORD WINAPI frame_loop(void *arg)
         if (FAILED(hr)) break;
         frames++;
         if (frames == 1) hwidd_log("first frame, %u dirty rects", buf.MetaData.DirtyRectCount);
-        if (frames == 30) save_frame(dev, ctx, buf.MetaData.pSurface, buf.MetaData.PresentationFrameNumber);
+        publish_frame(dev, ctx, buf.MetaData.pSurface);
         if (frames % 600 == 0) {
             ULONGLONG ms = GetTickCount64() - started;
             hwidd_log("%u frames in %llu ms", frames, ms);
@@ -148,6 +226,8 @@ static DWORD WINAPI frame_loop(void *arg)
         if (WaitForSingleObject(ft->stop, 0) == WAIT_OBJECT_0) break;
     }
     hwidd_log("frame loop ends after %u frames: %08lx", frames, (unsigned long)hr);
+    if (g_stage) g_stage->Release();
+    g_stage = nullptr;
     if (dxgi) dxgi->Release();
     if (ctx) ctx->Release();
     if (dev) dev->Release();
@@ -169,9 +249,10 @@ static void stop_frames()
     delete ft;
 }
 
-// An EDID for the monitor: Windows refuses an arrival without one. Manufacturer "HWN", 1280x720 at 60 Hz
-// preferred, named "HyperWin". Built here rather than kept as bytes, so the timing is readable.
-static void make_edid(BYTE e[128])
+// An EDID for the monitor: Windows refuses an arrival without one. Manufacturer "HWN", named "HyperWin",
+// preferring the size chosen in the app at 60 Hz. The serial stays the same, so Windows keeps one
+// monitor and its place in the desktop layout whatever the size.
+static void make_edid(BYTE e[128], UINT ha, UINT va)
 {
     ZeroMemory(e, 128);
     static const BYTE header[8] = { 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
@@ -193,10 +274,10 @@ static void make_edid(BYTE e[128])
     static const BYTE chroma[10] = { 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54 };   // sRGB
     memcpy(e + 25, chroma, 10);
     for (int i = 38; i < 54; i += 2) { e[i] = 0x01; e[i + 1] = 0x01; }   // no standard timings
-    // Detailed timing: 1280x720 at 60 Hz, CEA-861 blanking (74.25 MHz).
+    // Detailed timing at 60 Hz with reduced blanking; the pixel clock follows from it.
     BYTE *d = e + 54;
-    UINT clock = 7425;       // 10 kHz units
-    UINT ha = 1280, hb = 370, va = 720, vb = 30, hso = 110, hsw = 40, vso = 5, vsw = 5;
+    UINT hb = 160, vb = 30, hso = 48, hsw = 32, vso = 3, vsw = 5;
+    UINT clock = (UINT)(((UINT64)(ha + hb) * (va + vb) * 60 + 5000) / 10000);   // 10 kHz units
     d[0] = (BYTE)clock;
     d[1] = (BYTE)(clock >> 8);
     d[2] = (BYTE)ha;
@@ -217,10 +298,10 @@ static void make_edid(BYTE e[128])
     BYTE *n = e + 72;
     n[3] = 0xfc;
     memcpy(n + 5, "HyperWin\n   ", 13);
-    // Range limits: 24-75 Hz vertical, 30-80 kHz horizontal, 170 MHz.
+    // Range limits: 24-75 Hz vertical, 15-255 kHz horizontal, 660 MHz.
     BYTE *r = e + 90;
     r[3] = 0xfd;
-    r[5] = 24; r[6] = 75; r[7] = 30; r[8] = 80; r[9] = 17; r[10] = 0x00; r[11] = 0x0a;
+    r[5] = 24; r[6] = 75; r[7] = 15; r[8] = 255; r[9] = 66; r[10] = 0x00; r[11] = 0x0a;
     for (int i = 12; i < 18; i++) r[i] = 0x20;
     // Unused descriptor.
     e[108 + 3] = 0x10;
@@ -256,11 +337,10 @@ static void choose_render_adapter(IDDCX_ADAPTER adapter)
     f->Release();
 }
 
-static NTSTATUS adapter_init_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED *in)
+// Connects the monitor with the modes and EDID for the current app size.
+static NTSTATUS connect_monitor(IDDCX_ADAPTER adapter)
 {
-    hwidd_log("adapter init finished: %08lx", (unsigned long)in->AdapterInitStatus);
-    if (!NT_SUCCESS(in->AdapterInitStatus)) return STATUS_SUCCESS;
-    choose_render_adapter(adapter);
+    build_modes();
     IDDCX_MONITOR_INFO info = {};
     info.Size = sizeof info;
     info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;   // a connector type: the indirect ones are refused here
@@ -268,7 +348,7 @@ static NTSTATUS adapter_init_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAP
     info.MonitorDescription.Size = sizeof info.MonitorDescription;
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
     static BYTE edid[128];
-    make_edid(edid);
+    make_edid(edid, g_modes[0].w, g_modes[0].h);
     info.MonitorDescription.DataSize = sizeof edid;
     info.MonitorDescription.pData = edid;
     // {7b4a1d52-9f3e-4c51-a8a2-6f1e0c3b5d21}: the same container on every boot, so Windows keeps its settings.
@@ -280,13 +360,49 @@ static NTSTATUS adapter_init_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAP
     mc.pMonitorInfo = &info;
     IDARG_OUT_MONITORCREATE mo = {};
     NTSTATUS ns = IddCxMonitorCreate(adapter, &mc, &mo);
-    hwidd_log("monitor create: %08lx", (unsigned long)ns);
+    hwidd_log("monitor create %ux%u: %08lx", g_modes[0].w, g_modes[0].h, (unsigned long)ns);
     if (!NT_SUCCESS(ns)) return ns;
     g_monitor = mo.MonitorObject;
     IDARG_OUT_MONITORARRIVAL ma = {};
     ns = IddCxMonitorArrival(g_monitor, &ma);
     hwidd_log("monitor arrival: %08lx, adapter %08lx:%08lx target %u", (unsigned long)ns, (unsigned long)ma.OsAdapterLuid.HighPart,
               (unsigned long)ma.OsAdapterLuid.LowPart, ma.OsTargetId);
+    return ns;
+}
+
+// The app's screen size setting, while Windows runs: the screen then offers only the new size, and
+// Windows switches to it without the desktop layout changing.
+static HANDLE g_watch;
+static DWORD WINAPI watch_size(void *)
+{
+    UINT32 seen = g_win ? g_win->screen_seq : 0;
+    for (;;) {
+        Sleep(250);
+        if (!g_win || g_win->screen_seq == seen) continue;
+        seen = g_win->screen_seq;
+        UINT w = g_win->screen_want_width, h = g_win->screen_want_height;
+        hwidd_log("app asks for %ux%u", w, h);
+        if (!size_ok(w, h) || !g_monitor || (g_mode_count && g_modes[0].w == w && g_modes[0].h == h)) continue;
+        build_modes();
+        IDDCX_TARGET_MODE t;
+        fill_target(&t, g_modes[0]);
+        IDARG_IN_UPDATEMODES in = {};
+        in.Reason = IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS;
+        in.TargetModeCount = 1;
+        in.pTargetModes = &t;
+        NTSTATUS ns = IddCxMonitorUpdateModes(g_monitor, &in);
+        hwidd_log("modes now %ux%u: %08lx", g_modes[0].w, g_modes[0].h, (unsigned long)ns);
+    }
+    return 0;
+}
+
+static NTSTATUS adapter_init_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED *in)
+{
+    hwidd_log("adapter init finished: %08lx", (unsigned long)in->AdapterInitStatus);
+    if (!NT_SUCCESS(in->AdapterInitStatus)) return STATUS_SUCCESS;
+    choose_render_adapter(adapter);
+    NTSTATUS ns = connect_monitor(adapter);
+    if (!g_watch) g_watch = CreateThread(nullptr, 0, watch_size, nullptr, 0, nullptr);
     return ns;
 }
 
@@ -322,16 +438,9 @@ static NTSTATUS default_modes(IDDCX_MONITOR, const IDARG_IN_GETDEFAULTDESCRIPTIO
 static NTSTATUS query_target_modes(IDDCX_MONITOR, const IDARG_IN_QUERYTARGETMODES *in, IDARG_OUT_QUERYTARGETMODES *out)
 {
     hwidd_log("target modes, room for %u", in->TargetModeBufferInputCount);
-    out->TargetModeBufferOutputCount = g_mode_count;
+    out->TargetModeBufferOutputCount = 1;
     if (in->TargetModeBufferInputCount == 0) return STATUS_SUCCESS;
-    if (in->TargetModeBufferInputCount < g_mode_count) return STATUS_BUFFER_TOO_SMALL;
-    for (UINT i = 0; i < g_mode_count; i++) {
-        IDDCX_TARGET_MODE *t = &in->pTargetModes[i];
-        ZeroMemory(t, sizeof *t);
-        t->Size = sizeof *t;
-        signal_info(&t->TargetVideoSignalInfo.targetVideoSignalInfo, g_modes[i], 1);
-        t->RequiredBandwidth = (UINT64)g_modes[i].w * g_modes[i].h * g_modes[i].hz;
-    }
+    fill_target(&in->pTargetModes[0], g_modes[0]);
     return STATUS_SUCCESS;
 }
 
@@ -424,6 +533,8 @@ static NTSTATUS device_add(WDFDRIVER, PWDFDEVICE_INIT init)
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 {
     hwidd_log("driver entry");
+    open_screen();
+    build_modes();
     WDF_DRIVER_CONFIG cfg;
     WDF_DRIVER_CONFIG_INIT(&cfg, device_add);
     NTSTATUS ns = WdfDriverCreate(driver, registry, WDF_NO_OBJECT_ATTRIBUTES, &cfg, WDF_NO_HANDLE);

@@ -22,6 +22,11 @@
  * SYSTEM, which is what hwfiles.exe runs as: they reach every file the phone shares. */
 #define IOCTL_HWGPU_FILES 0x0022240Cu
 
+/* The shared window's header and frames ([0, HW_FRAME_END), include/hw_abi.h) mapped into the caller
+ * (out: hwgpu_map_out), for the indirect display driver that writes the screen. Only services and
+ * elevated administrators may ask (SeImpersonatePrivilege); closing the handle unmaps it. */
+#define IOCTL_HWGPU_SCREEN 0x00222410u
+
 struct hwgpu_map_in {
     uint64_t offset;      /* from the start of the heap */
     uint64_t size;

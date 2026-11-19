@@ -675,6 +675,23 @@ send them to the phone's screen, make this screen the main one, and the steps ab
 Install by hand for now: put `build/hwidd/pkg` in `C:\HyperWin\gpu\hwidd` and run
 `install-driver.ps1 hwidd Root\HwIdd`. Log: `C:\ProgramData\HyperWin\idd.log`.
 
+#### Frames to the phone, and the app's screen size (2026-11-19)
+
+- The driver maps the shared window's header and frames through `hwgpu.sys` (`IOCTL_HWGPU_SCREEN`, for
+  callers with SeImpersonatePrivilege: services such as WUDFHost.exe, and elevated administrators). Each
+  frame goes into the back buffer and becomes the front one, with the header's size set to the frame's;
+  the app shows it as it showed the boot screen. With the HyperWin screen as the only display
+  (`dispinfo only \\.\DISPLAYn`), the phone shows Windows through it.
+- The header now carries the screen size chosen in the app (`screen_want_*`), the phone's own size
+  (`screen_native_*`) and `screen_seq`. The driver's modes start with the app's size, then the phone's,
+  then common ones. When the size is changed in the app while Windows runs, the app bumps `screen_seq`;
+  the driver then offers only the new size (`IddCxMonitorUpdateModes`) and Windows switches to it at once,
+  keeping the layout. Checked: 1280x720, 2340x1080 and 1950x900 on the spare machine.
+- Reconnecting the monitor with a different EDID also switched sizes, but Windows treated it as a new
+  monitor and extended the desktop onto Basic Display again. The EDID serial stays fixed for that reason.
+- Still to do: make the HyperWin screen the main display without the manual step, install it by default,
+  and then the zero-copy steps above. The boot screen and recovery still come from Basic Display.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

@@ -42,7 +42,7 @@ class HomeScreen(
     private val primary: MaterialButton = Ui.button(ctx, "Start Windows", icon = R.drawable.ic_play) { actions.startOrReturn() }
     private val shutDown: MaterialButton = Ui.button(ctx, "Shut down", M.attr.materialButtonOutlinedStyle, R.drawable.ic_power) { actions.shutDown() }
     private val restartNote = Ui.text(ctx, M.attr.textAppearanceBodySmall, M.attr.colorOnSurfaceVariant,
-        "Screen size, cores and memory apply the next time Windows starts.")
+        "Cores and memory apply the next time Windows starts. Screen size changes at once with the HyperWin screen driver, otherwise at the next start.")
     private val settings = Ui.column(ctx)
 
     val view: View = LinearLayout(ctx).apply {
@@ -104,6 +104,12 @@ class HomeScreen(
                     sizes.indexOfFirst { it.first == machine.screenSize }) { dialog, which ->
                     machine.screenSize = sizes[which].first
                     machine.save()
+                    // With the HyperWin screen driver, a running Windows switches at once.
+                    if (AvfLaunch.machine != null && Machine.active(ctx)?.dir == machine.dir) AvfLaunch.sharedWindow?.let { w ->
+                        val (sw, sh) = machine.frameSize()
+                        val native = AvfPlan.nativeScreen()
+                        WindowBridge.nativeSetScreen(w.buffer, sw, sh, native.first, native.second, true)
+                    }
                     row.setSummary(sizeLabel(machine))
                     showSpecs(machine)
                     dialog.dismiss()

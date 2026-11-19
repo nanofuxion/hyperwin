@@ -58,6 +58,27 @@ int main(int argc, char **argv)
         r = ChangeDisplaySettingsExA(NULL, NULL, NULL, 0, NULL);
         say("apply: %ld\n", r);
     }
+    if (argc > 2 && !strcmp(argv[1], "only")) {
+        /* dispinfo only \\.\DISPLAYn: that display becomes the main one at 0,0 and the others leave the desktop. */
+        DEVMODEA dm = { 0 };
+        dm.dmSize = sizeof dm;
+        dm.dmFields = DM_POSITION;
+        LONG r = ChangeDisplaySettingsExA(argv[2], &dm, NULL, CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+        say("primary %s: %ld\n", argv[2], r);
+        DISPLAY_DEVICEA o;
+        for (DWORD i = 0; ; i++) {
+            o.cb = sizeof o;
+            if (!EnumDisplayDevicesA(NULL, i, &o, 0)) break;
+            if (!strcmp(o.DeviceName, argv[2]) || !(o.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            DEVMODEA off = { 0 };
+            off.dmSize = sizeof off;
+            off.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+            r = ChangeDisplaySettingsExA(o.DeviceName, &off, NULL, CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+            say("detach %s: %ld\n", o.DeviceName, r);
+        }
+        r = ChangeDisplaySettingsExA(NULL, NULL, NULL, 0, NULL);
+        say("apply: %ld\n", r);
+    }
     DISPLAY_DEVICEA dd;
     for (DWORD i = 0; ; i++) {
         dd.cb = sizeof dd;

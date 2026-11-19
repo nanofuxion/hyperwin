@@ -16,6 +16,8 @@ object WindowBridge {
         cpuMaker: String,
         cpuName: String,
     )
+    /** The Windows screen size for the indirect display: the app's choice and the phone's own size. */
+    external fun nativeSetScreen(buffer: ByteBuffer, width: Int, height: Int, nativeWidth: Int, nativeHeight: Int, ask: Boolean)
     external fun nativePoll(buffer: ByteBuffer): Int
     external fun nativeCopyFrame(buffer: ByteBuffer, frame: ByteBuffer): Int
     /** Where [nativePresent] draws. Null stops drawing and waits for a draw in flight. */

@@ -37,11 +37,13 @@ struct open_ctx {
     PEPROCESS process;
     struct view views[MAX_VIEWS];
     struct view files;  /* the storage slots, IOCTL_HWGPU_FILES */
+    struct view screen; /* header and frames, IOCTL_HWGPU_SCREEN */
 };
 
 static PVOID g_ring;    /* kernel mapping of the ring area, offset HWGPU_RING_OFF in the window */
 static PVOID g_heap;    /* kernel mapping of the shared heap, HW_HEAP_PA, or NULL */
 static PVOID g_files;   /* kernel mapping of the storage slots, HWF_OFF in the window */
+static PVOID g_screen;  /* kernel mapping of the header and frames, [0, HW_FRAME_END) */
 static FAST_MUTEX g_lock;
 
 /* The window base the ring helpers expect, so offsets inside hwgpu_ring.h line up. */
@@ -146,6 +148,7 @@ static NTSTATUS on_cleanup(PDEVICE_OBJECT dev, PIRP irp)
     struct open_ctx *c = IoGetCurrentIrpStackLocation(irp)->FileObject->FsContext;
     ExAcquireFastMutex(&g_lock);
     if (c && c->files.user) unmap_view(c, &c->files);
+    if (c && c->screen.user) unmap_view(c, &c->screen);
     if (c && c->slot >= 0) {
         /* Heap views first: the phone may hand their memory to someone else once the channel is free. */
         for (uint32_t i = 0; i < MAX_VIEWS; i++)
@@ -207,6 +210,15 @@ static NTSTATUS open_channel(struct open_ctx *c, struct hwgpu_open_out *out)
     return STATUS_SUCCESS;
 }
 
+/* The screen is for services (WUDFHost.exe runs indirect display drivers as LocalService) and for
+ * elevated administrators, who could reach it anyway: callers holding SeImpersonatePrivilege. A
+ * normal program does not have it. */
+static BOOLEAN screen_caller_ok(void)
+{
+    LUID impersonate = {29, 0};  /* SE_IMPERSONATE_PRIVILEGE */
+    return SeSinglePrivilegeCheck(impersonate, UserMode);
+}
+
 static NTSTATUS on_ioctl(PDEVICE_OBJECT dev, PIRP irp)
 {
     (void)dev;
@@ -241,6 +253,22 @@ static NTSTATUS on_ioctl(PDEVICE_OBJECT dev, PIRP irp)
         else if (!(c->files.user = map_user(g_files, HWF_BYTES, &c->files.mdl))) st = STATUS_INSUFFICIENT_RESOURCES;
         else c->process = PsGetCurrentProcess();
         out.user = (uint64_t)(ULONG_PTR)c->files.user;
+        ExReleaseFastMutex(&g_lock);
+        if (!NT_SUCCESS(st)) return done(irp, st, 0);
+        RtlCopyMemory(buf, &out, sizeof(out));
+        return done(irp, STATUS_SUCCESS, sizeof(out));
+    }
+    if (code == IOCTL_HWGPU_SCREEN) {
+        if (out_len < sizeof(struct hwgpu_map_out)) return done(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        if (!screen_caller_ok()) return done(irp, STATUS_ACCESS_DENIED, 0);
+        struct hwgpu_map_out out;
+        NTSTATUS st = STATUS_SUCCESS;
+        ExAcquireFastMutex(&g_lock);
+        if (!g_screen) st = STATUS_DEVICE_NOT_READY;
+        else if (c->screen.user) st = STATUS_DEVICE_BUSY;
+        else if (!(c->screen.user = map_user(g_screen, HW_FRAME_END, &c->screen.mdl))) st = STATUS_INSUFFICIENT_RESOURCES;
+        else c->process = PsGetCurrentProcess();
+        out.user = (uint64_t)(ULONG_PTR)c->screen.user;
         ExReleaseFastMutex(&g_lock);
         if (!NT_SUCCESS(st)) return done(irp, st, 0);
         RtlCopyMemory(buf, &out, sizeof(out));
@@ -281,6 +309,7 @@ static void unload(PDRIVER_OBJECT driver)
     if (g_ring) MmUnmapIoSpace(g_ring, HWGPU_RING_BYTES);
     if (g_heap) MmUnmapIoSpace(g_heap, (SIZE_T)HW_HEAP_SIZE);
     if (g_files) MmUnmapIoSpace(g_files, HWF_BYTES);
+    if (g_screen) MmUnmapIoSpace(g_screen, HW_FRAME_END);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
@@ -296,6 +325,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     g_heap = MmMapIoSpace(pa, (SIZE_T)HW_HEAP_SIZE, MmCached);
     pa.QuadPart = (LONGLONG)(HW_WINDOW_PA + HWF_OFF);
     g_files = MmMapIoSpace(pa, HWF_BYTES, MmCached);
+    pa.QuadPart = (LONGLONG)HW_WINDOW_PA;
+    g_screen = MmMapIoSpace(pa, HW_FRAME_END, MmCached);
     ExInitializeFastMutex(&g_lock);
 
     UNICODE_STRING name, link;

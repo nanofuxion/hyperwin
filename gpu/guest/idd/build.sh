@@ -24,7 +24,7 @@ cp -R "$WORK/Windows-Driver-Frameworks/src/publicinc/wdf/umdf/2.33" "$WORK/wdf-u
 mkdir -p "$OUT/pkg"
 FLAGS=(-O2 -std=c++17 -fms-extensions -Wno-everything -include "$HERE/mingw-shim.h" -DUMDF_VERSION_MAJOR=2 -DUMDF_VERSION_MINOR=33
        -DUMDF_MINIMUM_VERSION_REQUIRED=25 -DIDDCX_VERSION_MAJOR=1 -DIDDCX_VERSION_MINOR=${IDDV#1.} -DIDDCX_MINIMUM_VERSION_REQUIRED=4
-       -I"$WORK/wdf-umdf" -I"$IDD" -I"$HERE")
+       -I"$WORK/wdf-umdf" -I"$IDD" -I"$HERE" -I"$ROOT/include" -I"$ROOT/gpu/include")
 for f in fxstub hwidd; do "$T/aarch64-w64-mingw32-clang++" "${FLAGS[@]}" -c "$HERE/$f.cpp" -o "$OUT/$f.o"; done
 "$T/aarch64-w64-mingw32-clang++" -shared -static -o "$OUT/pkg/hwidd.dll" "$OUT/fxstub.o" "$OUT/hwidd.o" -ld3d11 -ldxgi \
   -Wl,--exclude-all-symbols -Wl,--export-all-symbols:no 2>/dev/null || \

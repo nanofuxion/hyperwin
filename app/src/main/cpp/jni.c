@@ -54,6 +54,22 @@ Java_dev_hyperwin_app_WindowBridge_nativeConfigure(JNIEnv *env, jclass cls, jobj
     put_text(env, h->cpu_name, sizeof h->cpu_name, cpu_name);
 }
 
+/* The Windows screen size for the indirect display (hw_abi.h): the size chosen in the app and the phone's
+ * own. ask != 0 means Windows is running and should switch to it now. */
+JNIEXPORT void JNICALL
+Java_dev_hyperwin_app_WindowBridge_nativeSetScreen(JNIEnv *env, jclass cls, jobject buffer, jint width, jint height,
+                                                   jint native_width, jint native_height, jboolean ask)
+{
+    struct hw_header *h = (*env)->GetDirectBufferAddress(env, buffer);
+    (void)cls;
+    if (!h) return;
+    h->screen_native_width = (uint32_t)native_width;
+    h->screen_native_height = (uint32_t)native_height;
+    h->screen_want_width = (uint32_t)width;
+    __atomic_store_n(&h->screen_want_height, (uint32_t)height, __ATOMIC_RELEASE);
+    if (ask) __atomic_add_fetch(&h->screen_seq, 1, __ATOMIC_RELEASE);
+}
+
 JNIEXPORT jint JNICALL
 Java_dev_hyperwin_app_WindowBridge_nativePoll(JNIEnv *env, jclass cls, jobject buffer)
 {
@@ -117,7 +133,7 @@ Java_dev_hyperwin_app_WindowBridge_nativeCopyFrame(JNIEnv *env, jclass cls,
 static pthread_mutex_t present_lock = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *present_window;
 static uint8_t *present_last;        /* the frame on screen, as the guest wrote it */
-static uint32_t present_bytes;
+static uint32_t present_bytes, present_width, present_height;
 static int present_bgra;             /* the surface takes BGRA, so rows need no swap */
 
 /* surface null: stop drawing. Returns only when no draw is in flight, as surfaceDestroyed needs. */
@@ -174,7 +190,9 @@ Java_dev_hyperwin_app_WindowBridge_nativePresent(JNIEnv *env, jclass cls, jobjec
     src = (const uint8_t *)h + hw_frame_off(h, front);
     pthread_mutex_lock(&present_lock);
     if (!present_window) goto out;
-    if (bytes != present_bytes) {
+    if (bytes != present_bytes || h->width != present_width || h->height != present_height) {
+        present_width = h->width;
+        present_height = h->height;
         uint8_t *grown = realloc(present_last, bytes);
         if (!grown) goto out;
         present_last = grown;
