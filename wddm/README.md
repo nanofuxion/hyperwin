@@ -962,7 +962,7 @@ desktop session; results land in `C:\HyperWin\AIO Results\Benchmark` as `avg|min
 | Direct3D 10 | 217 avg, 91 min, 296 max |
 | Direct3D 11 | 215 avg, 87 min, 289 max |
 | Direct3D 9 | "could not create Direct3D9 device" (the `NOTAVAILABLE` above) |
-| Direct3D 7 | fails to start (DirectDraw sits on Direct3D 9 here) |
+| Direct3D 7 | fails to start (DirectDraw sits on Direct3D 9 here); works since the DirectDraw fix below |
 | Direct3D 8, 12 | not run to a result: 8 needs Direct3D 9, 12 needs phase 8 |
 
 #### OpenGL: two programs corrupt each other (2026-11-19)
@@ -1085,8 +1085,7 @@ our Direct3D 9 driver part with interface 8.
 - DirectDraw and Direct3D 7: `ddraw.dll` opens the driver with interface 7, asks `GetCaps` 1, 2, 3, 4 and 8
   (DirectDraw caps, mode caps, formats, Direct3D 3 caps) and then crashes inside
   `DdQueryDirectDrawObject` (+0x8c5, writing a texture format count through a null pointer). The driver
-  answers those older caps with zeros today. Next: fill `D3DDDICAPS_DDRAW`, `_DDRAW_MODE_SPECIFIC` and the
-  Direct3D 3, 5, 6 and 7 caps (the 32-bit `ddraw.pdb` and `ddraw.dll` come from Microsoft's symbol server
+  answered those older caps with zeros then (fixed below). The symbols: (the 32-bit `ddraw.pdb` and `ddraw.dll` come from Microsoft's symbol server
   by GUID and by time stamp + size).
 
 #### Checklist run on the rebuilt spare (2026-11-19, nothing beside the programs)
@@ -1103,6 +1102,20 @@ our Direct3D 9 driver part with interface 8.
 | dxdiag | "HyperWin GPU" and "HyperWin screen", WDDM 1.3 |
 | AIO cubes (x64): Vulkan, OpenGL, Direct3D 11, Direct3D 9 | 485, 190, 240, 240 FPS average |
 | GPU process killed | desktop back in about 6 s, dxtest 11 passes after |
+- DirectDraw and Direct3D 7 work (2026-11-19, later). The cause of the crash: `DirectDrawObjectCreate`
+  calls `DdQueryDirectDrawObject` twice. The first call hands `GetCaps` 8 (`D3DDDICAPS_GETD3D3CAPS`, 192
+  bytes) a Direct3D 3 device record. When its first field (the size) comes back zero, DirectDraw takes
+  the driver to have no 3D part and makes the second call with null pointers, which the WDDM path of
+  that function then writes through. So the driver now fills that record (size 0xc0, the 172-byte
+  device description from the Direct3D 9 caps) and the Direct3D 7 record (`GetCaps` 11, 116 bytes:
+  texture sizes, guard band, stencil, FVF and texture-op caps, lights, clip planes). With those,
+  DirectDraw offers its hardware devices and `IDirect3D7::CreateDevice` gives the T&L HAL device.
+  Also: a plain off-screen surface in video memory was made in system memory on the phone, where
+  `ColorFill` fails without a word. It is a default-pool surface now. Results on the spare machine,
+  32-bit AIO, nothing beside it: `--cube dx7` 164 FPS, `--cube ddraw2d` 80 FPS (18 fills and a present
+  per frame), Direct3D 9 188 FPS in the same minute (the phone was hot). `d3d9test` on ARM64, x64 and
+  x86 and `d3d8test hw` still pass. `HWD3D_UMDCALLS` makes these runs about ten times slower, so
+  measure with it off.
 - DirectDraw crash, what the debugger shows (2026-11-19): `DdQueryDirectDrawObject` is called with every
   optional pointer null (the re-query `ddraw.dll` makes after `DdReenableDirectDrawObject` reports a new
   display mode, the `mySetMode` path), and on the WDDM path that function writes the texture format count

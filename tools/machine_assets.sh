@@ -53,7 +53,7 @@ for d in hwaudio hwhid; do
 done
 # The render-only GPU adapter's package (wddm/README.md): driver, INF, and the Vulkan driver the INF
 # registers. Built here when its sources changed (the WDK headers are fetched into gpu/work, never kept).
-for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROOT"/gpu/guest/wddm/hwdisplay.inc "$ROOT"/include/hw_wddm.h "$ROOT"/gpu/include/hwgpu_ring.h "$ROOT"/gpu/guest/hwd3d/umd.cpp "$ROOT"/gpu/guest/hwd3d/wire.h; do
+for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROOT"/gpu/guest/wddm/hwdisplay.inc "$ROOT"/include/hw_wddm.h "$ROOT"/gpu/include/hwgpu_ring.h "$ROOT"/gpu/guest/hwd3d/umd.cpp "$ROOT"/gpu/guest/hwd3d/umd9.inc "$ROOT"/gpu/guest/hwd3d/wire.h; do
   [ "$ROOT/build/hwgpuw/pkg/hwgpuw.sys" -nt "$f" ] || { sh "$ROOT/gpu/guest/wddm/build.sh" >/dev/null; break; }
 done
 mkdir -p "$OUT/guest/gpu/hwgpuw"

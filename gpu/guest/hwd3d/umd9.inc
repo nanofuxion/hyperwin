@@ -238,8 +238,56 @@ static HRESULT APIENTRY GetCaps(HANDLE ha, const D3DDDIARG_GETCAPS *g)
         }
         return S_OK;
     }
+    case D3DDDICAPS_GETD3D3CAPS: {
+        /* DirectDraw asks this first. A zero size here means "no 3D part" and DirectDraw then crashes
+           on its own null pointer, so the Direct3D 3 device record is always filled:
+           size, device description (172 bytes), two vertex counts, then DirectDraw's own format list. */
+        load_caps(a);
+        if (!a->caps_ok || g->DataSize < 0xc0) return E_FAIL;
+        const D3DCAPS9 &c = a->caps;
+        DWORD prim[14] = { 56, c.PrimitiveMiscCaps, c.RasterCaps, c.ZCmpCaps, c.SrcBlendCaps, c.DestBlendCaps, c.AlphaCmpCaps, c.ShadeCaps,
+                           c.TextureCaps, c.TextureFilterCaps | 0x3f, 0xff, c.TextureAddressCaps, 0, 0 };
+        DWORD *o = static_cast<DWORD *>(g->pData);
+        o[0] = 0xc0;
+        o[1] = 172;                      /* description size */
+        o[2] = 0x7ff;                    /* every field below is valid */
+        o[3] = 2;                        /* RGB colour model */
+        o[4] = c.DevCaps | 0x1 | 0x400 | 0x2000 | 0x8000;   /* float TL vertices, DrawPrimitive, DrawPrimitives2(Ex) */
+        o[5] = 8; o[6] = 1;              /* transform: clips */
+        o[7] = 1;                        /* clipping */
+        o[8] = 16; o[9] = 7; o[10] = 1; o[11] = c.MaxActiveLights;   /* point, spot and directional lights, RGB model */
+        memcpy(o + 12, prim, sizeof prim);   /* lines */
+        memcpy(o + 26, prim, sizeof prim);   /* triangles */
+        o[40] = 0x500;                   /* draws to 16 and 32 bit */
+        o[41] = 0x700;                   /* depth of 16, 24 and 32 bit */
+        o[42] = 0;
+        o[43] = 0xffff;                  /* most vertices in one buffer */
+        return S_OK;
+    }
+    case D3DDDICAPS_GETD3D7CAPS: {
+        /* The Direct3D 7 extended record, 116 bytes. A zero size makes DirectDraw offer only its software devices. */
+        load_caps(a);
+        if (!a->caps_ok || g->DataSize < 116) return E_FAIL;
+        const D3DCAPS9 &c = a->caps;
+        DWORD *o = static_cast<DWORD *>(g->pData);
+        float *f = static_cast<float *>(g->pData);
+        WORD *w = static_cast<WORD *>(g->pData);
+        o[0] = 116;
+        o[1] = 1; o[2] = c.MaxTextureWidth; o[3] = 1; o[4] = c.MaxTextureHeight;
+        o[9] = c.MaxTextureRepeat; o[10] = c.MaxTextureAspectRatio; o[11] = c.MaxAnisotropy;
+        f[12] = c.GuardBandLeft; f[13] = c.GuardBandTop; f[14] = c.GuardBandRight; f[15] = c.GuardBandBottom;
+        f[16] = c.ExtentsAdjust;
+        o[17] = c.StencilCaps; o[18] = c.FVFCaps; o[19] = c.TextureOpCaps;
+        w[40] = (WORD)(c.MaxTextureBlendStages > 8 ? 8 : c.MaxTextureBlendStages);
+        w[41] = (WORD)(c.MaxSimultaneousTextures > 8 ? 8 : c.MaxSimultaneousTextures);
+        o[21] = c.MaxActiveLights;
+        f[22] = c.MaxVertexW;
+        w[46] = (WORD)c.MaxUserClipPlanes; w[47] = (WORD)c.MaxVertexBlendMatrices;
+        o[24] = c.VertexProcessingCaps;
+        return S_OK;
+    }
     default:
-        /* The rest (DirectDraw, older Direct3D, video) answer with nothing for now. */
+        /* The rest (other DirectDraw records, video) answer with nothing for now. */
         return S_OK;
     }
 }
@@ -290,8 +338,7 @@ static HRESULT APIENTRY CreateResource(HANDLE hd, D3DDDIARG_CREATERESOURCE *a)
     } else if (a->Flags.RenderTarget || a->Flags.Primary) {
         q.kind = HWD3D9_RTSURF;
     } else {
-        q.kind = HWD3D9_PLAIN;
-        q.pool = D3DPOOL_SYSTEMMEM;
+        q.kind = HWD3D9_PLAIN;   /* stays in the default pool: ColorFill and StretchRect only take those */
     }
     o->kind = q.kind;
     o->subs.resize(a->SurfCount);
