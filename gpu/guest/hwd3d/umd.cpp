@@ -147,6 +147,7 @@ struct Obj {
     uint32_t subs, samples, array, usage;
     Shadow *shadows;
     uint32_t share;        /* shared surfaces: the phone's share id (HWD3D_OP_CREATE_SHARED) */
+    uint32_t swap_rb;      /* a BGRA surface the phone keeps as RGBA (see rgba_of): its views are swapped too */
     D3DKMT_HANDLE kalloc;  /* and the kernel allocation that carries it to other programs */
     HANDLE rtres;          /* the runtime's resource, for freeing that allocation */
 };
@@ -201,13 +202,28 @@ static UINT misc11(UINT m) { return m & 0xF5u; }
 
 static SIZE_T APIENTRY u_CalcPrivateResourceSize(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATERESOURCE *) { return sizeof(Obj); }
 
+/* Shared BGRA surfaces are RGBA on the phone: the phone's screen reads its buffers as RGBA, and Mali has no
+ * BGRA buffer the GPU writes in BGRA order. Their views then name the RGBA format, so shaders still see
+ * (r, g, b, a) and the bytes are what the screen expects. */
+static DXGI_FORMAT rgba_of(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    default: return f;
+    }
+}
+
 /* A texture another program will open (DWM's surfaces for the screen driver, a game's shared ones): the
  * phone backs it with an Android hardware buffer, and a kernel allocation carries the share id to the
  * other program (include/hw_wddm.h, struct hww_alloc). False: make an ordinary texture instead. */
 static bool create_shared(Dev *d, const D3D11DDIARG_CREATERESOURCE *a, D3D10DDI_HRTRESOURCE rt, Obj *o, const D3D11_TEXTURE2D_DESC *t2)
 {
+    D3D11_TEXTURE2D_DESC phone = *t2;
+    phone.Format = rgba_of(t2->Format);
     struct wbuf *b = begin(d->hdev, 0, HWD3D_OP_CREATE_SHARED);
-    put(b, t2, sizeof *t2);
+    put(b, &phone, sizeof phone);
     struct rd r;
     HRESULT hr = (HRESULT)call_wait(b, &r);
     uint32_t h = take32(&r), id = take32(&r);
@@ -218,6 +234,7 @@ static bool create_shared(Dev *d, const D3D11DDIARG_CREATERESOURCE *a, D3D10DDI_
     }
     o->h = h;
     o->share = id;
+    o->swap_rb = phone.Format != t2->Format;
     struct hww_alloc al = {};
     al.magic = HWW_ALLOC_MAGIC;
     al.kind = a->pPrimaryDesc ? HWW_ALLOC_PRIMARY : HWW_ALLOC_UMD;
@@ -386,6 +403,7 @@ static void APIENTRY u_OpenResource(D3D10DDI_HDEVICE hd, const D3D10DDIARG_OPENR
         return;
     }
     o->share = (uint32_t)al->id;
+    o->swap_rb = al->format != (uint32_t)t2.Format;   /* made as BGRA, kept as RGBA */
     o->dim = 3;
     o->r = {3, (uint32_t)t2.Format, t2.Width, t2.Height, 1, 1};
     o->subs = 1;
@@ -410,7 +428,7 @@ static void APIENTRY u_CreateRenderTargetView(D3D10DDI_HDEVICE hd, const D3D10DD
     Obj *res = OB(a->hDrvResource);
     D3D11_RENDER_TARGET_VIEW_DESC vd;
     memset(&vd, 0, sizeof vd);
-    vd.Format = a->Format;
+    vd.Format = res->swap_rb ? rgba_of(a->Format) : a->Format;
     switch (a->ResourceDimension) {
     case D3D10DDIRESOURCE_BUFFER:
         vd.ViewDimension = D3D11_RTV_DIMENSION_BUFFER;
@@ -1231,7 +1249,7 @@ static void APIENTRY u_CreateShaderResourceView(D3D10DDI_HDEVICE hd, const D3D11
     Obj *res = O(a->hDrvResource);
     D3D11_SHADER_RESOURCE_VIEW_DESC vd;
     memset(&vd, 0, sizeof vd);
-    vd.Format = a->Format;
+    vd.Format = res->swap_rb ? rgba_of(a->Format) : a->Format;
     switch (a->ResourceDimension) {
     case D3D10DDIRESOURCE_BUFFER:
         if (a->BufferEx.Flags & D3D11_DDI_BUFFEREX_SRV_FLAG_RAW) {
@@ -1293,7 +1311,7 @@ static void APIENTRY u_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D11DD
     Obj *res = O(a->hDrvResource);
     D3D11_DEPTH_STENCIL_VIEW_DESC vd;
     memset(&vd, 0, sizeof vd);
-    vd.Format = a->Format;
+    vd.Format = res->swap_rb ? rgba_of(a->Format) : a->Format;
     vd.Flags = a->Flags;
     if (a->ResourceDimension == D3D10DDIRESOURCE_TEXTURE1D) {
         if (res->array > 1) {
@@ -1328,7 +1346,7 @@ static void APIENTRY u_CreateUnorderedAccessView(D3D10DDI_HDEVICE hd, const D3D1
     Obj *res = O(a->hDrvResource);
     D3D11_UNORDERED_ACCESS_VIEW_DESC vd;
     memset(&vd, 0, sizeof vd);
-    vd.Format = a->Format;
+    vd.Format = res->swap_rb ? rgba_of(a->Format) : a->Format;
     switch (a->ResourceDimension) {
     case D3D10DDIRESOURCE_BUFFER:
         vd.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
@@ -1542,6 +1560,15 @@ static void update_subresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT 
 static void APIENTRY u_ResourceUpdateSubresourceUP(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT p, UINT sp, UINT)
 {
     ulog_call("ResourceUpdateSubresourceUP");
+    if (p == HWD3D_SCANOUT_PITCH && sp == HWD3D_SCANOUT_SLICE) {   /* the screen driver hands a frame to the phone */
+        Obj *o = OB(r);
+        if (o && o->share) {
+            struct wbuf *b = begin(DV(hd)->hdev, 0, HWD3D_OP_SCANOUT);
+            put32(b, o->share);
+            call_async(b);
+            return;
+        }
+    }
     update_subresource(hd, r, sub, box, src, p, sp);
 }
 
@@ -1986,8 +2013,10 @@ static HRESULT present_surface(Dev *d, Obj *src);
 static HRESULT kernel_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
 {
     if (!d->dxcb || !d->dxcb->pfnPresentCb) return E_FAIL;
-    struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_Flush);   /* the frame is drawn before anyone takes it */
-    call_async(b);
+    struct rd r;   /* the frame is drawn on the phone's GPU before anyone takes it */
+    call_wait(begin(d->hdev, 0, HWD3D_OP_FINISH), &r);
+    call_end(&r);
+    ulog_call("kernel present");
     DXGIDDICB_PRESENT p = {};
     p.hSrcAllocation = src->kalloc;
     p.hDstAllocation = dst ? dst->kalloc : 0;
@@ -2116,6 +2145,12 @@ static HRESULT __stdcall u_dxgi_residency(DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *a
 
 static HRESULT __stdcall u_dxgi_priority(DXGI_DDI_ARG_SETRESOURCEPRIORITY *) { return S_OK; }
 
+/* Makes a shared surface's contents whole before another program reads it (multisample resolve and the
+ * like). The surfaces here are single-sample and live on the phone, where the other program's device reads
+ * the same buffer; the drawing program flushed before presenting. Nothing to do; an error here makes the
+ * runtime drop the device (the screen driver saw DXGI_ERROR_DRIVER_INTERNAL_ERROR after its first frame). */
+static HRESULT __stdcall u_dxgi_resolve_shared(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *) { return S_OK; }
+
 /* The DXGI entries are all one shape, an answer and one pointer to arguments. Each table is the entries of
  * the one before it and more, so the table the runtime gave is filled to its size. */
 template <int N> static HRESULT __stdcall dxgi_stub(void *)
@@ -2144,6 +2179,7 @@ static void fill_dxgi(DXGI_DDI_BASE_ARGS *a, UINT interface_version)
     t1->pfnRotateResourceIdentities = u_dxgi_rotate;
     t1->pfnQueryResourceResidency = u_dxgi_residency;
     t1->pfnSetResourcePriority = u_dxgi_priority;
+    t1->pfnResolveSharedResource = u_dxgi_resolve_shared;
     if (interface_version >= D3DWDDM1_3_DDI_INTERFACE_VERSION) a->pDXGIDDIBaseFunctions4->pfnPresent1 = u_dxgi_present1;
 }
 

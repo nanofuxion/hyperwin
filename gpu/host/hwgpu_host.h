@@ -42,6 +42,8 @@ void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
 void hwgpu_host_heap_free(void* p);
 // How many scanout frames went to the layer so far.
 uint64_t hwgpu_host_scanout_frames(void);
+/* A frame from Windows' screen driver, an AHardwareBuffer, onto the scanout layer. */
+void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height);
 
 #ifdef __cplusplus
 }

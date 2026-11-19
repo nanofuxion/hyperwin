@@ -9,6 +9,7 @@
 #include <string.h>
 #include "hw_abi.h"
 #include "hwgpu_ioctl.h"
+#include "hw_d3d.h"
 
 // ---- a small log, readable by an administrator: C:\ProgramData\HyperWin\idd.log ----
 static CRITICAL_SECTION g_log_lock;
@@ -50,7 +51,8 @@ static void open_screen()
 {
     HANDLE f = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
-        hwidd_log("no \\.\HwGpu: %lu", GetLastError());
+        static DWORD told;
+        if (GetLastError() != told) hwidd_log("no \\.\HwGpu: %lu", told = GetLastError());
         return;
     }
     hwgpu_map_out out = {};
@@ -121,6 +123,7 @@ static void fill_target(IDDCX_TARGET_MODE *t, const mode &m)
 // ---- the frame thread: one per swap chain Windows gives the monitor ----
 struct frame_thread {
     IDDCX_SWAPCHAIN swapchain;
+    volatile LONG abandoned;   // unassign gave up waiting: the swap chain is no longer ours to delete
     HANDLE available;   // set by IddCx when a new frame is there
     HANDLE stop;
     HANDLE thread;
@@ -210,7 +213,7 @@ static HRESULT get_device(LUID luid, render_dev **out)
         if (SUCCEEDED(hr)) {
             DXGI_ADAPTER_DESC1 ad;
             adapter->GetDesc1(&ad);
-            hwidd_log("render adapter: %ls", ad.Description);
+            hwidd_log("render adapter: %ls (%08lx:%08lx)", ad.Description, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart);
             hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
                                    D3D11_SDK_VERSION, &dev, nullptr, &ctx);
         }
@@ -244,6 +247,7 @@ static DWORD WINAPI frame_loop(void *arg)
     HRESULT hr = get_device(ft->luid, &rd);
     ID3D11Device *dev = rd ? rd->dev : nullptr;
     ID3D11DeviceContext *ctx = rd ? rd->ctx : nullptr;
+    if (SUCCEEDED(hr) && WaitForSingleObject(ft->stop, 0) == WAIT_OBJECT_0) hr = E_ABORT;   // taken back meanwhile
     if (SUCCEEDED(hr)) {
         IDARG_IN_SWAPCHAINSETDEVICE in = {};
         in.pDevice = rd->dxgi;
@@ -252,9 +256,23 @@ static DWORD WINAPI frame_loop(void *arg)
     hwidd_log("swap chain device: %08lx", (unsigned long)hr);
     UINT frames = 0;
     ULONGLONG started = GetTickCount64();
+    // On the HyperWin GPU the frames are phone buffers and go to the phone's screen layer; on another
+    // GPU they are read back and written to the shared window.
+    bool gpu_frames = false;
+    if (SUCCEEDED(hr)) {
+        IDXGIAdapter *a = nullptr;
+        DXGI_ADAPTER_DESC ad = {};
+        if (SUCCEEDED(rd->dxgi->GetAdapter(&a))) {
+            a->GetDesc(&ad);
+            a->Release();
+        }
+        gpu_frames = !wcsncmp(ad.Description, L"HyperWin GPU", 12);
+    }
     while (SUCCEEDED(hr)) {
         IDARG_OUT_RELEASEANDACQUIREBUFFER buf = {};
+        if (frames <= 3) hwidd_log("acquire after frame %u", frames);
         hr = IddCxSwapChainReleaseAndAcquireBuffer(ft->swapchain, &buf);
+        if (frames <= 3 && hr != E_PENDING) hwidd_log("acquire: %08lx", (unsigned long)hr);
         if (hr == E_PENDING) {
             HANDLE wait[2] = { ft->available, ft->stop };
             DWORD r = WaitForMultipleObjects(2, wait, FALSE, 100);
@@ -264,32 +282,51 @@ static DWORD WINAPI frame_loop(void *arg)
         }
         if (FAILED(hr)) break;
         frames++;
-        if (frames == 1) hwidd_log("first frame, %u dirty rects", buf.MetaData.DirtyRectCount);
-        publish_frame(dev, ctx, buf.MetaData.pSurface);
+        if (frames == 1) hwidd_log("first frame, %u dirty rects, %s", buf.MetaData.DirtyRectCount, gpu_frames ? "handed to the phone's screen" : "read back");
+        if (gpu_frames) {
+            // The frame is a shared surface on the phone: ask for it to be shown there as it is.
+            ID3D11Resource *res = nullptr;
+            HRESULT qr = buf.MetaData.pSurface->QueryInterface(__uuidof(ID3D11Resource), (void **)&res);
+            if (SUCCEEDED(qr)) {
+                static const UINT32 pixel = 0;
+                D3D11_BOX one = { 0, 0, 0, 1, 1, 1 };
+                ctx->UpdateSubresource(res, 0, &one, &pixel, HWD3D_SCANOUT_PITCH, HWD3D_SCANOUT_SLICE);
+                ctx->Flush();
+                res->Release();
+            }
+        } else {
+            publish_frame(dev, ctx, buf.MetaData.pSurface);
+        }
         if (frames % 600 == 0) {
             ULONGLONG ms = GetTickCount64() - started;
             hwidd_log("%u frames in %llu ms", frames, ms);
         }
+        if (frames <= 3) hwidd_log("frame %u processed, device state %08lx", frames, (unsigned long)dev->GetDeviceRemovedReason());
         hr = IddCxSwapChainFinishedProcessingFrame(ft->swapchain);
+        if (frames <= 3) hwidd_log("frame %u finished: %08lx", frames, (unsigned long)hr);
         if (WaitForSingleObject(ft->stop, 0) == WAIT_OBJECT_0) break;
     }
     hwidd_log("frame loop ends after %u frames: %08lx", frames, (unsigned long)hr);
     if (g_stage) g_stage->Release();
     g_stage = nullptr;
-    WdfObjectDelete((WDFOBJECT)ft->swapchain);
+    if (!InterlockedCompareExchange(&ft->abandoned, 0, 0)) WdfObjectDelete((WDFOBJECT)ft->swapchain);
+    // The record stays (a few bytes per swap chain): stop_frames may still signal it.
     return 0;
 }
 
+// Ends the frame thread and waits for it: IddCx expects the swap chain deleted when the unassign callback
+// returns. Only the first swap chain on a GPU waits for its device (get_device keeps it); the wait has a
+// bound all the same, as a hang here makes WUDFHost restart.
 static void stop_frames()
 {
     frame_thread *ft = g_ft;
     g_ft = nullptr;
     if (!ft) return;
     SetEvent(ft->stop);
-    WaitForSingleObject(ft->thread, INFINITE);
-    CloseHandle(ft->thread);
-    CloseHandle(ft->stop);
-    delete ft;
+    if (WaitForSingleObject(ft->thread, 4000) == WAIT_TIMEOUT) {
+        InterlockedExchange(&ft->abandoned, 1);
+        hwidd_log("frame thread still busy after 4 s (making the device): left to finish alone");
+    }
 }
 
 // An EDID for the monitor: Windows refuses an arrival without one. Manufacturer "HWN", named "HyperWin",
@@ -378,10 +415,7 @@ static void choose_render_adapter(IDDCX_ADAPTER adapter)
             in.PreferredRenderAdapter = d.AdapterLuid;
             IddCxAdapterSetRenderAdapter(adapter, &in);
             hwidd_log("render adapter set to %ls", d.Description);
-            // Make the device now, so the first swap chain does not wait for it.
-            static LUID warm;
-            warm = d.AdapterLuid;
-            CloseHandle(CreateThread(nullptr, 0, [](void *) -> DWORD { render_dev *r; get_device(warm, &r); return 0; }, nullptr, 0, nullptr));
+
             break;
         }
     }
@@ -427,8 +461,12 @@ static HANDLE g_watch;
 static DWORD WINAPI watch_size(void *)
 {
     UINT32 seen = g_win ? g_win->screen_seq : 0;
-    for (;;) {
+    for (unsigned n = 1;; n++) {
         Sleep(250);
+        if (!g_win && n % 8 == 0) {
+            open_screen();
+            if (g_win) seen = g_win->screen_seq - 1;
+        }
         if (!g_win || g_win->screen_seq == seen) continue;
         seen = g_win->screen_seq;
         UINT w = g_win->screen_want_width, h = g_win->screen_want_height;
@@ -452,6 +490,13 @@ static NTSTATUS adapter_init_finished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAP
     hwidd_log("adapter init finished: %08lx", (unsigned long)in->AdapterInitStatus);
     if (!NT_SUCCESS(in->AdapterInitStatus)) return STATUS_SUCCESS;
     choose_render_adapter(adapter);
+    /* hwgpu.sys can start a second or two after the screen driver. Waiting for it here lets the monitor
+     * arrive at the app's size. The monitor must arrive in this callback: arriving later from another
+     * thread, Windows attached it but never gave it a swap chain. */
+    for (int i = 0; !g_win && i < 20; i++) {
+        Sleep(250);
+        open_screen();
+    }
     NTSTATUS ns = connect_monitor(adapter);
     if (!g_watch) g_watch = CreateThread(nullptr, 0, watch_size, nullptr, 0, nullptr);
     return ns;

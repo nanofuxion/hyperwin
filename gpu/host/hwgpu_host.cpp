@@ -1244,6 +1244,23 @@ void hwgpu_host_set_layer_size(int view_width, int view_height) {
     g_scan.view_h = view_height;
 }
 
+// A frame from Windows' screen driver (gpu/guest/idd): a shared surface's Android hardware buffer, shown
+// on the scanout layer as it is. The layer takes its own reference.
+void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height) {
+#ifdef __ANDROID__
+    if (!ahb) return;
+    AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahb));
+    Frame f;
+    f.ahb = ahb;
+    f.slot = HWGPU_CHANNELS;   // not a guest channel's buffer: nothing to tell when it is free
+    f.width = width;
+    f.height = height;
+    scan_submit(f);
+#else
+    (void)ahb; (void)width; (void)height;
+#endif
+}
+
 uint64_t hwgpu_host_scanout_frames(void) {
     std::lock_guard<std::mutex> l(g_scan.lock);
     return g_scan.frames;

@@ -18,6 +18,7 @@
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <vulkan/vulkan.h>
 #include <sched.h>
+#include <chrono>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -54,6 +55,7 @@ Dxvk g_dxvk;
 }  // namespace
 extern "C" void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
 extern "C" void hwgpu_host_heap_free(void* p);
+extern "C" void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height);
 
 namespace {
 
@@ -871,9 +873,6 @@ const GUID kVkKeepGuid = {0x5c1e2b7a, 0x3f0d, 0x4a8e, {0x9b, 0x61, 0x0d, 0x2f, 0
 
 uint32_t ahb_format(DXGI_FORMAT f) {
     switch (f) {
-    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-        return 5;   // HAL_PIXEL_FORMAT_BGRA_8888: no public AHARDWAREBUFFER_FORMAT name, but gralloc takes it
     case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
         return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_R10G10B10A2_UNORM:
@@ -883,6 +882,12 @@ uint32_t ahb_format(DXGI_FORMAT f) {
     default:
         return 0;
     }
+}
+
+uint32_t ahb_desc_format(AHardwareBuffer* ahb) {
+    AHardwareBuffer_Desc d{};
+    AHardwareBuffer_describe(ahb, &d);
+    return d.format;
 }
 
 // The buffer as a texture of this device.
@@ -919,6 +924,11 @@ HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_
         if (vr != VK_SUCCESS || fp.format == VK_FORMAT_UNDEFINED) {
             LOG("shared surface: buffer properties %d, format %d", int(vr), int(fp.format));
             break;
+        }
+        static bool told;
+        if (!told) {
+            told = true;
+            LOG("shared surface: Android buffer format %u is Vulkan format %d", unsigned(ahb_desc_format(ahb)), int(fp.format));
         }
         VkExternalMemoryImageCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, nullptr,
                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
@@ -1034,6 +1044,58 @@ int32_t open_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     return S_OK;
 }
 
+// Waits until this channel's GPU work is done, so a surface handed on to another program is whole.
+int32_t finish(Chan& c) {
+    if (!c.immediate) return 0;
+    ID3D11Device* dev = nullptr;
+    c.immediate->GetDevice(&dev);
+    D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+    ID3D11Query* q = nullptr;
+    HRESULT hr = dev ? dev->CreateQuery(&qd, &q) : E_FAIL;
+    if (dev) dev->Release();
+    if (FAILED(hr)) return hr;
+    c.immediate->End(q);
+    c.immediate->Flush();
+    BOOL done = FALSE;
+    auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while ((hr = c.immediate->GetData(q, &done, sizeof done, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE &&
+           std::chrono::steady_clock::now() < give_up)
+        sched_yield();
+    q->Release();
+    if (hr == S_FALSE) {
+        static bool told;
+        if (!told) {
+            told = true;
+            LOG("channel %u: GPU work not done after 1 s; the surface is shown anyway", c.slot);
+        }
+        hr = S_OK;
+    }
+    return SUCCEEDED(hr) ? 0 : hr;
+}
+
+int32_t scanout(Chan& c, Rd& r) {
+    uint32_t id = r.u32();
+    AHardwareBuffer* ahb = nullptr;
+    uint32_t w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> g(g_shared_lock);
+        auto it = g_shared.find(id);
+        if (it == g_shared.end()) return E_INVALIDARG;
+        ahb = it->second.ahb;
+        w = it->second.desc.Width;
+        h = it->second.desc.Height;
+        AHardwareBuffer_acquire(ahb);
+    }
+    // The program that drew it waited for its GPU work before presenting (HWD3D_OP_FINISH).
+    bool tell = c.presents < 3 || !(c.presents % 600);
+    if (tell) LOG("channel %u: screen frame %llu from shared surface %u", c.slot, (unsigned long long)c.presents + 1, id);
+    hwgpu_host_show_buffer(ahb, w, h);
+    AHardwareBuffer_release(ahb);
+    if (tell) LOG("channel %u: screen frame %llu on the layer", c.slot, (unsigned long long)c.presents + 1);
+    c.presents++;
+    return S_OK;
+}
+
 void drop_shared(uint32_t slot) {
     std::lock_guard<std::mutex> g(g_shared_lock);
     for (auto it = g_shared.begin(); it != g_shared.end();) {
@@ -1124,7 +1186,9 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
     case HWD3D_OP_CREATE_FACTORY:
     case HWD3D_OP_CREATE_DEVICE:
     case HWD3D_OP_CREATE_SHARED:
-    case HWD3D_OP_OPEN_SHARED: {
+    case HWD3D_OP_OPEN_SHARED:
+    case HWD3D_OP_SCANOUT:
+    case HWD3D_OP_FINISH: {
         if (m.size() < sizeof(hwd3d_call)) return false;
         hwd3d_call call;
         memcpy(&call, m.data(), sizeof call);
@@ -1165,6 +1229,10 @@ int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, 
             st = create_shared(c, call.object, r, w);
         } else if (h.op == HWD3D_OP_OPEN_SHARED) {
             st = open_shared(c, call.object, r, w);
+        } else if (h.op == HWD3D_OP_SCANOUT) {
+            st = scanout(c, r);
+        } else if (h.op == HWD3D_OP_FINISH) {
+            st = finish(c);
         } else if (call.method >= HM_COUNT || !hm_table[call.method].fn) {
             static bool told[HM_COUNT];
             if (call.method < HM_COUNT && !told[call.method]) {

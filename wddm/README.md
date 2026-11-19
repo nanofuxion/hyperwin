@@ -732,6 +732,37 @@ ask for the HyperWin GPU.
 - libhwd3d.so must link libandroid (Android hardware buffers); a missing symbol stops it loading and every
   Direct3D program then falls back. DXVK's native headers give `__uuidof` only for their own types.
 
+#### The desktop on the phone with no copies (2026-11-19, spare machine)
+
+DWM draws on the phone's GPU, and its frames go to the phone's screen layer as they are. No pixel crosses
+to Windows and back.
+
+- The screen driver opens DWM's surface and hands it on with `UpdateSubresource` of a 1x1 box whose row and
+  slice pitch are `HWD3D_SCANOUT_PITCH`/`HWD3D_SCANOUT_SLICE`. The Direct3D driver sends
+  `HWD3D_OP_SCANOUT` (the share id) instead, and libhwd3d gives the Android buffer to
+  `hwgpu_host_show_buffer`, the same layer as Vulkan scanout. `SetResourceMinLOD` was tried first: the
+  runtime never passed the odd values on, and a negative one crashed WUDFHost (`c0000409`).
+- Before presenting a shared surface, DWM's driver waits for `HWD3D_OP_FINISH` (an event query on the
+  phone), so the screen never shows a half-drawn frame. Without it, taskbar icons came up half drawn.
+- DXGI calls `ResolveSharedResource` after each present to a shared surface. The stub's `E_NOTIMPL`
+  made DXGI remove the device after one frame (`887a0020`). It now returns `S_OK`.
+- Red and blue: Mali takes Android buffer format 5 (BGRA) as an RGBA image. A BGRA VkImage with
+  `MUTABLE_FORMAT` over it came out black. Shared BGRA surfaces are now made as RGBA buffers, and the
+  Direct3D driver swaps the format of every view of them (`Obj::swap_rb`).
+- `HWD3D_OP_FINISH` is a waited call, so it must end with `call_end`. Without it the driver's lock stayed
+  taken, DWM stopped after one frame, and shutdown hung. `guest/tools/stacks.c` found it: it prints
+  where each thread of a process waits.
+- The screen driver waits up to 5 s for hwgpu.sys in its adapter callback, so the monitor arrives at the
+  app's size. Arriving later from another thread, Windows attached the monitor but never gave it a swap
+  chain.
+- Windows keeps the Basic Display as main screen until `dispinfo only \\.\DISPLAYn` makes ours the only one.
+- Not working yet: windows of programs that draw with GDI or on another GPU (Notepad, winver) do not
+  show. DWM gets those through surfaces that the kernel or another adapter fills, and ours are tokens.
+- Left: those surfaces, a sync fence instead of the wait, the cursor, the screen layer hidden when not
+  used, the HyperWin screen made the main one and installed by default, and `IddRender`/`HWD3D_SYSTEM` on
+  by default. A crash in `call_async`/`call_wait` when a channel goes away (TabTip, DWM restart) and one
+  in `release_obj` at WUDFHost shutdown are still open.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
