@@ -123,6 +123,7 @@ struct Dev {
     D3D10DDI_HRTCORELAYER core;
     const D3D11DDI_CORELAYER_DEVICECALLBACKS *ucb;
     const D3DDDI_DEVICECALLBACKS *kcb;
+    const DXGI_DDI_BASE_CALLBACKS *dxcb;  /* DXGI's: the kernel present of a shared surface */
     uint32_t hdev, hctx;  /* the phone's device and immediate context */
     HANDLE kctx;          /* the kernel context the runtime wants a driver to have */
     UINT flags;
@@ -145,6 +146,9 @@ struct Obj {
     struct hwd3d_res r;
     uint32_t subs, samples, array, usage;
     Shadow *shadows;
+    uint32_t share;        /* shared surfaces: the phone's share id (HWD3D_OP_CREATE_SHARED) */
+    D3DKMT_HANDLE kalloc;  /* and the kernel allocation that carries it to other programs */
+    HANDLE rtres;          /* the runtime's resource, for freeing that allocation */
 };
 
 static Dev *DV(D3D10DDI_HDEVICE h) { return static_cast<Dev *>(h.pDrvPrivate); }
@@ -197,7 +201,55 @@ static UINT misc11(UINT m) { return m & 0xF5u; }
 
 static SIZE_T APIENTRY u_CalcPrivateResourceSize(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATERESOURCE *) { return sizeof(Obj); }
 
-static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATERESOURCE *a, D3D10DDI_HRESOURCE hr, D3D10DDI_HRTRESOURCE)
+/* A texture another program will open (DWM's surfaces for the screen driver, a game's shared ones): the
+ * phone backs it with an Android hardware buffer, and a kernel allocation carries the share id to the
+ * other program (include/hw_wddm.h, struct hww_alloc). False: make an ordinary texture instead. */
+static bool create_shared(Dev *d, const D3D11DDIARG_CREATERESOURCE *a, D3D10DDI_HRTRESOURCE rt, Obj *o, const D3D11_TEXTURE2D_DESC *t2)
+{
+    struct wbuf *b = begin(d->hdev, 0, HWD3D_OP_CREATE_SHARED);
+    put(b, t2, sizeof *t2);
+    struct rd r;
+    HRESULT hr = (HRESULT)call_wait(b, &r);
+    uint32_t h = take32(&r), id = take32(&r);
+    call_end(&r);
+    if (FAILED(hr) || !h) {
+        ulog("hwd3d_umd: no shared surface on the phone for %ux%u format %u (0x%08lx)\n", t2->Width, t2->Height, (unsigned)t2->Format, (unsigned long)hr);
+        return false;
+    }
+    o->h = h;
+    o->share = id;
+    struct hww_alloc al = {};
+    al.magic = HWW_ALLOC_MAGIC;
+    al.kind = a->pPrimaryDesc ? HWW_ALLOC_PRIMARY : HWW_ALLOC_UMD;
+    al.width = t2->Width;
+    al.height = t2->Height;
+    al.format = (uint32_t)t2->Format;
+    al.source = a->pPrimaryDesc ? a->pPrimaryDesc->VidPnSourceId : 0;
+    al.id = id;
+    D3DDDI_ALLOCATIONINFO ai = {};
+    ai.pPrivateDriverData = &al;
+    ai.PrivateDriverDataSize = sizeof al;
+    if (a->pPrimaryDesc) {
+        ai.Flags.Primary = 1;
+        ai.VidPnSourceId = a->pPrimaryDesc->VidPnSourceId;
+    }
+    D3DDDICB_ALLOCATE cb = {};
+    cb.hResource = rt.handle;
+    cb.NumAllocations = 1;
+    cb.pAllocationInfo = &ai;
+    hr = d->kcb && d->kcb->pfnAllocateCb ? d->kcb->pfnAllocateCb(d->rt.handle, &cb) : E_FAIL;
+    if (FAILED(hr)) {
+        ulog("hwd3d_umd: the kernel refused the shared surface's allocation (0x%08lx)\n", (unsigned long)hr);
+        release_obj(o);
+        return false;
+    }
+    o->kalloc = ai.hAllocation;
+    o->rtres = rt.handle;
+    ulog("hwd3d_umd: shared surface %u, %ux%u format %u%s\n", id, t2->Width, t2->Height, (unsigned)t2->Format, a->pPrimaryDesc ? ", primary" : "");
+    return true;
+}
+
+static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATERESOURCE *a, D3D10DDI_HRESOURCE hr, D3D10DDI_HRTRESOURCE rt)
 {
     ulog_call("CreateResource");
     Dev *d = DV(hd);
@@ -261,6 +313,9 @@ static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CRE
     o->array = layers;
     o->usage = a->Usage;
     o->subs = mips * layers;
+    if (o->dim == 3 && ((a->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) || a->pPrimaryDesc) && o->subs == 1 && o->samples <= 1 &&
+        !a->pInitialDataUP && create_shared(d, a, rt, o, &desc.t2))
+        return;
     struct wbuf *b = dc(d, method);
     put_arr(b, &desc, 1, desc_size);
     const D3D10_DDIARG_SUBRESOURCE_UP *init = a->pInitialDataUP;
@@ -288,7 +343,57 @@ static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CRE
     }
 }
 
-static void APIENTRY u_DestroyResource(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE h) { release_obj(OB(h)); }
+static void APIENTRY u_DestroyResource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE h)
+{
+    Obj *o = OB(h);
+    Dev *d = DV(hd);
+    if (o->kalloc && d->kcb && d->kcb->pfnDeallocateCb) {
+        D3DDDICB_DEALLOCATE cb = {};
+        cb.hResource = o->rtres;
+        cb.NumAllocations = 1;
+        cb.HandleList = &o->kalloc;
+        d->kcb->pfnDeallocateCb(d->rt.handle, &cb);
+        o->kalloc = 0;
+    }
+    release_obj(o);
+}
+
+/* Another program's shared surface: the share id rides in the allocation's private data. */
+static SIZE_T APIENTRY u_CalcPrivateOpenedResourceSize(D3D10DDI_HDEVICE, const D3D10DDIARG_OPENRESOURCE *) { return sizeof(Obj); }
+
+static void APIENTRY u_OpenResource(D3D10DDI_HDEVICE hd, const D3D10DDIARG_OPENRESOURCE *a, D3D10DDI_HRESOURCE hr, D3D10DDI_HRTRESOURCE)
+{
+    ulog_call("OpenResource");
+    Dev *d = DV(hd);
+    Obj *o = new (hr.pDrvPrivate) Obj();
+    const struct hww_alloc *al = a->NumAllocations && a->pOpenAllocationInfo ? (const struct hww_alloc *)a->pOpenAllocationInfo[0].pPrivateDriverData : NULL;
+    if (!al || a->pOpenAllocationInfo[0].PrivateDriverDataSize < sizeof *al || al->magic != HWW_ALLOC_MAGIC || !al->id) {
+        ulog("hwd3d_umd: OpenResource of a surface that is not ours\n");
+        fail(d, E_INVALIDARG);
+        return;
+    }
+    struct wbuf *b = begin(d->hdev, 0, HWD3D_OP_OPEN_SHARED);
+    put32(b, (uint32_t)al->id);
+    struct rd r;
+    HRESULT res = (HRESULT)call_wait(b, &r);
+    o->h = take32(&r);
+    D3D11_TEXTURE2D_DESC t2 = {};
+    take(&r, &t2, sizeof t2);
+    call_end(&r);
+    if (FAILED(res) || !o->h) {
+        ulog("hwd3d_umd: the phone could not open shared surface %u (0x%08lx)\n", (unsigned)al->id, (unsigned long)res);
+        fail(d, FAILED(res) ? res : E_FAIL);
+        return;
+    }
+    o->share = (uint32_t)al->id;
+    o->dim = 3;
+    o->r = {3, (uint32_t)t2.Format, t2.Width, t2.Height, 1, 1};
+    o->subs = 1;
+    o->samples = 1;
+    o->array = 1;
+    o->usage = t2.Usage;
+    ulog("hwd3d_umd: opened shared surface %u, %ux%u\n", o->share, t2.Width, t2.Height);
+}
 
 /* ---- views ---- */
 
@@ -1761,6 +1866,8 @@ template <class Tbl> static void fill_device_funcs(Tbl *t)
     if constexpr (Same<Tbl, D3DWDDM1_3DDI_DEVICEFUNCS>::v) {
         t->pfnCalcPrivateResourceSize = u_CalcPrivateResourceSize;
         t->pfnCreateResource = u_CreateResource;
+        t->pfnCalcPrivateOpenedResourceSize = u_CalcPrivateOpenedResourceSize;
+        t->pfnOpenResource = u_OpenResource;
         t->pfnCreateShaderResourceView = u_CreateShaderResourceView;
         t->pfnCreateDepthStencilView = u_CreateDepthStencilView;
         t->pfnCreateUnorderedAccessView = u_CreateUnorderedAccessView;
@@ -1874,10 +1981,30 @@ static BOOL CALLBACK find_win(HWND w, LPARAM lp)
 
 static HRESULT present_surface(Dev *d, Obj *src);
 
+/* A surface with a kernel allocation (shared, or a screen's) goes to Windows' own present: DXGI hands it on
+ * to whoever shows it, such as the screen driver, and its pixels stay on the phone. */
+static HRESULT kernel_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
+{
+    if (!d->dxcb || !d->dxcb->pfnPresentCb) return E_FAIL;
+    struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_Flush);   /* the frame is drawn before anyone takes it */
+    call_async(b);
+    DXGIDDICB_PRESENT p = {};
+    p.hSrcAllocation = src->kalloc;
+    p.hDstAllocation = dst ? dst->kalloc : 0;
+    p.pDXGIContext = dxgi_context;
+    p.hContext = d->kctx;
+    HRESULT hr = d->dxcb->pfnPresentCb(d->rt.handle, &p);
+    if (FAILED(hr)) ulog("hwd3d_umd: kernel present of shared surface %u: 0x%08lx\n", src->share, (unsigned long)hr);
+    return hr;
+}
+
 static HRESULT __stdcall u_dxgi_present(DXGI_DDI_ARG_PRESENT *a)
 {
     ulog_call("dxgi Present");
-    return present_surface(reinterpret_cast<Dev *>(a->hDevice), reinterpret_cast<Obj *>(a->hSurfaceToPresent));
+    Dev *d = reinterpret_cast<Dev *>(a->hDevice);
+    Obj *src = reinterpret_cast<Obj *>(a->hSurfaceToPresent);
+    if (src && src->kalloc) return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
+    return present_surface(d, src);
 }
 
 /* The same with a list of surfaces: the first one is the frame. */
@@ -1885,7 +2012,10 @@ static HRESULT __stdcall u_dxgi_present1(DXGI_DDI_ARG_PRESENT1 *a)
 {
     ulog_call("dxgi Present1");
     if (!a->SurfacesToPresent) return S_OK;
-    return present_surface(reinterpret_cast<Dev *>(a->hDevice), reinterpret_cast<Obj *>(a->phSurfacesToPresent[0].hSurface));
+    Dev *d = reinterpret_cast<Dev *>(a->hDevice);
+    Obj *src = reinterpret_cast<Obj *>(a->phSurfacesToPresent[0].hSurface);
+    if (src && src->kalloc) return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
+    return present_surface(d, src);
 }
 
 static HRESULT present_surface(Dev *d, Obj *src)
@@ -2107,6 +2237,7 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
             if (!t[i]) ulog("hwd3d_umd: device table entry %u is empty\n", (unsigned)i);
     }
     fill_dxgi(&a->DXGIBaseDDI, a->Interface);
+    d->dxcb = a->DXGIBaseDDI.pDXGIBaseCallbacks;
     ulog("hwd3d_umd: device %u, context %u\n", d->hdev, d->hctx);
     return S_OK;
 }

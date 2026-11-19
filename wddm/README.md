@@ -712,6 +712,26 @@ ask for the HyperWin GPU.
   own device) and one Vulkan device under all programs' D3D11 devices (DXVK's `importImage`, as its D3D11on12
   path does). Not decided yet.
 
+#### Shared surfaces, first slice (2026-11-19)
+
+- Phone: `HWD3D_OP_CREATE_SHARED` makes an Android hardware buffer (format 5, BGRA, for B8G8R8A8; usage
+  sampled, colour output and composer overlay), imports it as a VkImage into the calling program's Vulkan
+  device and wraps it with DXVK's `CreateTexture2DFromVkImage`; `HWD3D_OP_OPEN_SHARED` imports the same
+  buffer into another program's device. The share table lives in libhwd3d.so; a buffer goes when the
+  channel that made it ends. dxvk-android.patch turns on `VK_ANDROID_external_memory_android_hardware_buffer`
+  and `VK_EXT_queue_family_foreign` when the driver has them (Mali does).
+- Windows: the Direct3D driver makes a shared (or primary) 2D texture that way and gives it a kernel
+  allocation (`pfnAllocateCb`, `struct hww_alloc` with the share id), opens other programs' with
+  `pfnOpenResource`, and presents them through DXGI's `pfnPresentCb` instead of the window read-back. The
+  kernel driver keeps allocation records and the no-op present in render-only mode too.
+- Seen on the spare machine: DWM on the HyperWin GPU makes its screen surfaces as shared buffers on the
+  phone (1950x900, BGRA) and presents them to Windows. The screen driver's swap chain was taken away
+  before it had a device (making one costs a second and more over the phone link); it now keeps one
+  device per render GPU and makes it as soon as the render GPU is known. Not yet seen: the screen
+  driver opening DWM's surfaces, and then the buffer going to the phone's screen layer.
+- libhwd3d.so must link libandroid (Android hardware buffers); a missing symbol stops it loading and every
+  Direct3D program then falls back. DXVK's native headers give `__uuidof` only for their own types.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

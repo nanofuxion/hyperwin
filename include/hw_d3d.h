@@ -34,6 +34,10 @@
 #define HWD3D_OP_CREATE_FACTORY 0x0012u   /* CreateDXGIFactory1: riid -> handle, interface */
 #define HWD3D_OP_CREATE_DEVICE  0x0013u   /* D3D11CreateDevice -> device, level, context */
 #define HWD3D_OP_STAGING        0x0014u   /* hwd3d_msg only -> hwd3d_hello_reply with the staging area, when the guest first needs one */
+/* Surfaces shared between programs (DWM and the screen driver): an Android hardware buffer under each
+ * program's texture. object = the device; the answer's status is an HRESULT. */
+#define HWD3D_OP_CREATE_SHARED  0x0015u   /* D3D11_TEXTURE2D_DESC (44 bytes) -> texture handle, share id */
+#define HWD3D_OP_OPEN_SHARED    0x0016u   /* share id -> texture handle, D3D11_TEXTURE2D_DESC */
 
 /* hwd3d_msg arrays: inline, or in the staging area. */
 #define HWD3D_INLINE 1u

@@ -178,27 +178,75 @@ static void publish_frame(ID3D11Device *dev, ID3D11DeviceContext *ctx, IDXGIReso
     tex->Release();
 }
 
+// One Direct3D device per render GPU, kept for the driver's life: making one on the HyperWin GPU takes a
+// second or more (every format question crosses to the phone), and Windows replaces swap chains often.
+struct render_dev {
+    LUID luid;
+    ID3D11Device *dev;
+    ID3D11DeviceContext *ctx;
+    IDXGIDevice *dxgi;
+};
+static render_dev g_rdev[4];
+static CRITICAL_SECTION g_rdev_lock;
+
+static HRESULT get_device(LUID luid, render_dev **out)
+{
+    EnterCriticalSection(&g_rdev_lock);
+    HRESULT hr = S_OK;
+    render_dev *slot = nullptr;
+    for (auto &r : g_rdev)
+        if (r.dev && r.luid.LowPart == luid.LowPart && r.luid.HighPart == luid.HighPart) slot = &r;
+    if (!slot) {
+        for (auto &r : g_rdev)
+            if (!r.dev) { slot = &r; break; }
+        if (!slot) slot = &g_rdev[0];
+        IDXGIFactory4 *factory = nullptr;
+        IDXGIAdapter1 *adapter = nullptr;
+        hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&factory);
+        if (SUCCEEDED(hr)) hr = factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void **)&adapter);
+        ID3D11Device *dev = nullptr;
+        ID3D11DeviceContext *ctx = nullptr;
+        IDXGIDevice *dxgi = nullptr;
+        if (SUCCEEDED(hr)) {
+            DXGI_ADAPTER_DESC1 ad;
+            adapter->GetDesc1(&ad);
+            hwidd_log("render adapter: %ls", ad.Description);
+            hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                   D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+        }
+        if (SUCCEEDED(hr)) hr = dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi);
+        if (adapter) adapter->Release();
+        if (factory) factory->Release();
+        if (SUCCEEDED(hr)) {
+            if (slot->dev) {   // all four slots in use: the oldest goes
+                slot->dxgi->Release();
+                slot->ctx->Release();
+                slot->dev->Release();
+            }
+            *slot = { luid, dev, ctx, dxgi };
+            hwidd_log("device for the render GPU made");
+        } else {
+            if (dxgi) dxgi->Release();
+            if (ctx) ctx->Release();
+            if (dev) dev->Release();
+            slot = nullptr;
+        }
+    }
+    LeaveCriticalSection(&g_rdev_lock);
+    *out = slot;
+    return slot ? S_OK : (FAILED(hr) ? hr : E_FAIL);
+}
+
 static DWORD WINAPI frame_loop(void *arg)
 {
     frame_thread *ft = (frame_thread *)arg;
-    IDXGIFactory4 *factory = nullptr;
-    IDXGIAdapter1 *adapter = nullptr;
-    ID3D11Device *dev = nullptr;
-    ID3D11DeviceContext *ctx = nullptr;
-    IDXGIDevice *dxgi = nullptr;
-    HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&factory);
-    if (SUCCEEDED(hr)) hr = factory->EnumAdapterByLuid(ft->luid, __uuidof(IDXGIAdapter1), (void **)&adapter);
-    if (SUCCEEDED(hr)) {
-        DXGI_ADAPTER_DESC1 ad;
-        adapter->GetDesc1(&ad);
-        hwidd_log("render adapter: %ls", ad.Description);
-        hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                               D3D11_SDK_VERSION, &dev, nullptr, &ctx);
-    }
-    if (SUCCEEDED(hr)) hr = dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi);
+    render_dev *rd = nullptr;
+    HRESULT hr = get_device(ft->luid, &rd);
+    ID3D11Device *dev = rd ? rd->dev : nullptr;
+    ID3D11DeviceContext *ctx = rd ? rd->ctx : nullptr;
     if (SUCCEEDED(hr)) {
         IDARG_IN_SWAPCHAINSETDEVICE in = {};
-        in.pDevice = dxgi;
+        in.pDevice = rd->dxgi;
         hr = IddCxSwapChainSetDevice(ft->swapchain, &in);
     }
     hwidd_log("swap chain device: %08lx", (unsigned long)hr);
@@ -228,11 +276,6 @@ static DWORD WINAPI frame_loop(void *arg)
     hwidd_log("frame loop ends after %u frames: %08lx", frames, (unsigned long)hr);
     if (g_stage) g_stage->Release();
     g_stage = nullptr;
-    if (dxgi) dxgi->Release();
-    if (ctx) ctx->Release();
-    if (dev) dev->Release();
-    if (adapter) adapter->Release();
-    if (factory) factory->Release();
     WdfObjectDelete((WDFOBJECT)ft->swapchain);
     return 0;
 }
@@ -335,6 +378,10 @@ static void choose_render_adapter(IDDCX_ADAPTER adapter)
             in.PreferredRenderAdapter = d.AdapterLuid;
             IddCxAdapterSetRenderAdapter(adapter, &in);
             hwidd_log("render adapter set to %ls", d.Description);
+            // Make the device now, so the first swap chain does not wait for it.
+            static LUID warm;
+            warm = d.AdapterLuid;
+            CloseHandle(CreateThread(nullptr, 0, [](void *) -> DWORD { render_dev *r; get_device(warm, &r); return 0; }, nullptr, 0, nullptr));
             break;
         }
     }
@@ -537,6 +584,7 @@ static NTSTATUS device_add(WDFDRIVER, PWDFDEVICE_INIT init)
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
 {
     hwidd_log("driver entry");
+    InitializeCriticalSection(&g_rdev_lock);
     open_screen();
     build_modes();
     WDF_DRIVER_CONFIG cfg;

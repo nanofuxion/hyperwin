@@ -6,13 +6,17 @@
 // channel's table, checked for type and generation on every use. The generated thunks
 // (gen_thunks.py) read the arguments of most methods; the rest are below.
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_3.h>
 #include <dxgi.h>
 
 #include <hw_d3d.h>
 #include <hwgpu_ring.h>
 
 #include <dlfcn.h>
+#include <mutex>
+#include <android/hardware_buffer.h>
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#include <vulkan/vulkan.h>
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
@@ -800,6 +804,248 @@ int32_t create_device(Chan& c, uint32_t adapter_h, Rd& r, Wr& w) {
     return hr;
 }
 
+
+// ---- shared surfaces (wddm/README.md, "Shared resources and DWM") ----
+// A texture two programs use (DWM draws the desktop, the screen driver takes it) is an Android hardware
+// buffer, imported as a VkImage into each program's own Vulkan device and handed to DXVK. The same buffer
+// can later go to the phone's screen as it is.
+
+// DXVK's interop interface (its dxgi_interfaces.h), declared here in the same order.
+MIDL_INTERFACE("e2ef5fa5-dc21-4af7-90c4-f67ef6a09323")
+HwVkInteropDevice : public IUnknown {
+    virtual void STDMETHODCALLTYPE GetVulkanHandles(VkInstance*, VkPhysicalDevice*, VkDevice*) = 0;
+    virtual void STDMETHODCALLTYPE GetSubmissionQueue(VkQueue*, uint32_t*) = 0;
+    virtual void STDMETHODCALLTYPE TransitionSurfaceLayout(void*, const VkImageSubresourceRange*, VkImageLayout, VkImageLayout) = 0;
+    virtual void STDMETHODCALLTYPE FlushRenderingCommands() = 0;
+    virtual void STDMETHODCALLTYPE LockSubmissionQueue() = 0;
+    virtual void STDMETHODCALLTYPE ReleaseSubmissionQueue() = 0;
+};
+MIDL_INTERFACE("e2ef5fa5-dc21-4af7-90c4-f67ef6a09324")
+HwVkInteropDevice1 : public HwVkInteropDevice {
+    virtual void STDMETHODCALLTYPE GetSubmissionQueue1(VkQueue*, uint32_t*, uint32_t*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateTexture2DFromVkImage(const D3D11_TEXTURE2D_DESC1*, VkImage, ID3D11Texture2D**) = 0;
+};
+
+struct Shared {
+    AHardwareBuffer* ahb = nullptr;
+    D3D11_TEXTURE2D_DESC desc{};
+    uint32_t owner = 0;   // the channel slot that made it; it goes when that channel ends
+};
+std::mutex g_shared_lock;
+std::map<uint32_t, Shared> g_shared;
+uint32_t g_next_share = 1;
+
+// The Vulkan entry DXVK itself uses (vulkan_loader.cpp in dxvk-android.patch).
+PFN_vkGetInstanceProcAddr vk_gipa() {
+    static PFN_vkGetInstanceProcAddr gipa;
+    if (gipa) return gipa;
+    if (const char* wrapper = getenv("HWGPU_VK_LOADER"))
+        if (void* l = dlopen(wrapper, RTLD_NOW)) gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(l, "vk_icdGetInstanceProcAddr"));
+    if (!gipa)
+        if (void* l = dlopen("libvulkan.so", RTLD_NOW)) gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(l, "vkGetInstanceProcAddr"));
+    return gipa;
+}
+
+// Destroys the VkImage and its memory when DXVK's texture goes (DXVK does not own an imported image).
+struct VkKeep final : IUnknown {
+    LONG refs = 1;
+    VkDevice dev;
+    VkImage image;
+    VkDeviceMemory memory;
+    PFN_vkDestroyImage destroy_image;
+    PFN_vkFreeMemory free_memory;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override { *out = nullptr; return E_NOINTERFACE; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ULONG(__atomic_add_fetch(&refs, 1, __ATOMIC_ACQ_REL)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG n = __atomic_sub_fetch(&refs, 1, __ATOMIC_ACQ_REL);
+        if (!n) {
+            destroy_image(dev, image, nullptr);
+            free_memory(dev, memory, nullptr);
+            delete this;
+        }
+        return ULONG(n);
+    }
+};
+// {5c1e2b7a-3f0d-4a8e-9b61-0d2f7c4e8a13}: the private data slot VkKeep rides in.
+const GUID kVkKeepGuid = {0x5c1e2b7a, 0x3f0d, 0x4a8e, {0x9b, 0x61, 0x0d, 0x2f, 0x7c, 0x4e, 0x8a, 0x13}};
+
+uint32_t ahb_format(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+        return 5;   // HAL_PIXEL_FORMAT_BGRA_8888: no public AHARDWAREBUFFER_FORMAT name, but gralloc takes it
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT;
+    default:
+        return 0;
+    }
+}
+
+// The buffer as a texture of this device.
+HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_DESC& d, ID3D11Texture2D** out) {
+    // IDXGIVkInteropDevice1's id, spelled out: DXVK's native headers only give __uuidof for their own types.
+    static const GUID kInterop1 = {0xe2ef5fa5, 0xdc21, 0x4af7, {0x90, 0xc4, 0xf6, 0x7e, 0xf6, 0xa0, 0x93, 0x24}};
+    HwVkInteropDevice1* interop = nullptr;
+    if (FAILED(dev->QueryInterface(kInterop1, reinterpret_cast<void**>(&interop))) || !interop) return E_NOINTERFACE;
+    VkInstance inst;
+    VkPhysicalDevice phys;
+    VkDevice vkd;
+    interop->GetVulkanHandles(&inst, &phys, &vkd);
+    PFN_vkGetInstanceProcAddr gipa = vk_gipa();
+    auto gdpa = gipa ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(inst, "vkGetDeviceProcAddr")) : nullptr;
+#define VKF(name) auto name = gdpa ? reinterpret_cast<PFN_##name>(gdpa(vkd, #name)) : nullptr
+    VKF(vkGetAndroidHardwareBufferPropertiesANDROID);
+    VKF(vkCreateImage);
+    VKF(vkAllocateMemory);
+    VKF(vkBindImageMemory);
+    VKF(vkDestroyImage);
+    VKF(vkFreeMemory);
+#undef VKF
+    HRESULT hr = E_FAIL;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    do {
+        if (!vkGetAndroidHardwareBufferPropertiesANDROID || !vkCreateImage || !vkAllocateMemory || !vkBindImageMemory) {
+            LOG("shared surface: the phone's Vulkan device has no Android hardware buffer import");
+            break;
+        }
+        VkAndroidHardwareBufferFormatPropertiesANDROID fp{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
+        VkAndroidHardwareBufferPropertiesANDROID props{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, &fp};
+        VkResult vr = vkGetAndroidHardwareBufferPropertiesANDROID(vkd, ahb, &props);
+        if (vr != VK_SUCCESS || fp.format == VK_FORMAT_UNDEFINED) {
+            LOG("shared surface: buffer properties %d, format %d", int(vr), int(fp.format));
+            break;
+        }
+        VkExternalMemoryImageCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, nullptr,
+                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = fp.format;
+        ci.extent = {d.Width, d.Height, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if ((vr = vkCreateImage(vkd, &ci, nullptr, &image)) != VK_SUCCESS) {
+            LOG("shared surface: vkCreateImage %d", int(vr));
+            break;
+        }
+        VkImportAndroidHardwareBufferInfoANDROID imp{VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, nullptr, ahb};
+        VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &imp, image, VK_NULL_HANDLE};
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded, props.allocationSize, 0};
+        while (ai.memoryTypeIndex < 32 && !(props.memoryTypeBits & (1u << ai.memoryTypeIndex))) ai.memoryTypeIndex++;
+        if ((vr = vkAllocateMemory(vkd, &ai, nullptr, &memory)) != VK_SUCCESS || (vr = vkBindImageMemory(vkd, image, memory, 0)) != VK_SUCCESS) {
+            LOG("shared surface: import %d", int(vr));
+            break;
+        }
+        D3D11_TEXTURE2D_DESC1 d1{};
+        memcpy(&d1, &d, sizeof d);
+        d1.MipLevels = 1;
+        d1.ArraySize = 1;
+        d1.MiscFlags &= ~UINT(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                              D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
+        hr = interop->CreateTexture2DFromVkImage(&d1, image, out);
+        if (FAILED(hr)) {
+            LOG("shared surface: DXVK refused the image (0x%x)", unsigned(hr));
+            break;
+        }
+        auto* keep = new VkKeep;
+        keep->dev = vkd;
+        keep->image = image;
+        keep->memory = memory;
+        keep->destroy_image = vkDestroyImage;
+        keep->free_memory = vkFreeMemory;
+        (*out)->SetPrivateDataInterface(kVkKeepGuid, keep);
+        keep->Release();
+        image = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+    } while (false);
+    if (memory && vkFreeMemory) vkFreeMemory(vkd, memory, nullptr);
+    if (image && vkDestroyImage) vkDestroyImage(vkd, image, nullptr);
+    interop->Release();
+    return hr;
+}
+
+int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
+    D3D11_TEXTURE2D_DESC d;
+    r.get(&d, sizeof d);   // zeroes past the end
+    auto* dev = static_cast<ID3D11Device*>(c.obj(device, HI_ID3D11Device));
+    if (!r.ok || !dev || dev == BAD || !d.Width || !d.Height || d.Width > 16384 || d.Height > 16384) return E_INVALIDARG;
+    uint32_t fmt = ahb_format(d.Format);
+    if (!fmt || d.SampleDesc.Count > 1 || d.MipLevels > 1 || d.ArraySize > 1) return E_NOTIMPL;   // the guest makes an ordinary texture
+    AHardwareBuffer_Desc ad{d.Width, d.Height, 1, fmt,
+                            AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                                AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY, 0, 0, 0};
+    AHardwareBuffer* ahb = nullptr;
+    if (AHardwareBuffer_allocate(&ad, &ahb) != 0) {
+        ad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
+        if (AHardwareBuffer_allocate(&ad, &ahb) != 0) {
+            LOG("channel %u: no Android hardware buffer for a %ux%u shared surface", c.slot, d.Width, d.Height);
+            return E_OUTOFMEMORY;
+        }
+    }
+    ID3D11Texture2D* tex = nullptr;
+    HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
+    if (FAILED(hr)) {
+        AHardwareBuffer_release(ahb);
+        return hr;
+    }
+    uint32_t id;
+    {
+        std::lock_guard<std::mutex> g(g_shared_lock);
+        id = g_next_share++;
+        g_shared[id] = Shared{ahb, d, c.slot};
+    }
+    w.u32(c.put(tex, HI_ID3D11Texture2D));
+    w.u32(id);
+    LOG("channel %u: shared surface %u, %ux%u format %u", c.slot, id, d.Width, d.Height, unsigned(d.Format));
+    return S_OK;
+}
+
+int32_t open_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
+    uint32_t id = r.u32();
+    auto* dev = static_cast<ID3D11Device*>(c.obj(device, HI_ID3D11Device));
+    if (!r.ok || !dev || dev == BAD) return E_INVALIDARG;
+    AHardwareBuffer* ahb = nullptr;
+    D3D11_TEXTURE2D_DESC d{};
+    {
+        std::lock_guard<std::mutex> g(g_shared_lock);
+        auto it = g_shared.find(id);
+        if (it == g_shared.end()) return E_INVALIDARG;
+        ahb = it->second.ahb;
+        d = it->second.desc;
+        AHardwareBuffer_acquire(ahb);
+    }
+    ID3D11Texture2D* tex = nullptr;
+    HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
+    AHardwareBuffer_release(ahb);   // the imported memory holds its own reference
+    if (FAILED(hr)) return hr;
+    w.u32(c.put(tex, HI_ID3D11Texture2D));
+    w.arr(&d, sizeof d);
+    LOG("channel %u: opened shared surface %u", c.slot, id);
+    return S_OK;
+}
+
+void drop_shared(uint32_t slot) {
+    std::lock_guard<std::mutex> g(g_shared_lock);
+    for (auto it = g_shared.begin(); it != g_shared.end();) {
+        if (it->second.owner == slot) {
+            AHardwareBuffer_release(it->second.ahb);
+            it = g_shared.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 bool send(Chan& c, const void* msg, size_t size) { return hwgpu_write_all(c.chan, c.generation, 0, msg, size) != 0; }
 
 bool answer(Chan& c, const hwd3d_msg& req, int32_t status, const Wr& w) {
@@ -876,7 +1122,9 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
     case HWD3D_OP_RELEASE:
     case HWD3D_OP_CALL:
     case HWD3D_OP_CREATE_FACTORY:
-    case HWD3D_OP_CREATE_DEVICE: {
+    case HWD3D_OP_CREATE_DEVICE:
+    case HWD3D_OP_CREATE_SHARED:
+    case HWD3D_OP_OPEN_SHARED: {
         if (m.size() < sizeof(hwd3d_call)) return false;
         hwd3d_call call;
         memcpy(&call, m.data(), sizeof call);
@@ -913,6 +1161,10 @@ int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, 
             st = create_factory(c, r, w);
         } else if (h.op == HWD3D_OP_CREATE_DEVICE) {
             st = create_device(c, call.object, r, w);
+        } else if (h.op == HWD3D_OP_CREATE_SHARED) {
+            st = create_shared(c, call.object, r, w);
+        } else if (h.op == HWD3D_OP_OPEN_SHARED) {
+            st = open_shared(c, call.object, r, w);
         } else if (call.method >= HM_COUNT || !hm_table[call.method].fn) {
             static bool told[HM_COUNT];
             if (call.method < HM_COUNT && !told[call.method]) {
@@ -981,6 +1233,7 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
     }
     if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation)) LOG("channel %u: bad HwD3D stream, dropping it", slot);
     c.release_all();
+    drop_shared(slot);
     LOG("channel %u: HwD3D ends after %llu messages", slot, (unsigned long long)c.received);
     if (c.presents) {
         double f = double(c.presents);

@@ -560,7 +560,10 @@ static NTSTATUS NTAPI HwdCreateAllocation_impl(const HANDLE hAdapter, DXGKARG_CR
         al->refresh.Numerator = HWD_REFRESH_N;
         al->refresh.Denominator = HWD_REFRESH_D;
         ai->Alignment = 0;
-        ai->Size = ((SIZE_T)in->width * in->height * 4 + 0xfff) & ~(SIZE_T)0xfff;
+        /* A surface the Direct3D driver made lives on the phone: Windows only needs a token of memory for it.
+         * Windows' own surfaces (primary, shadow, staging) are drawn by the CPU and need their pixels. */
+        ai->Size = in->kind == HWW_ALLOC_UMD ? 0x10000
+                                             : (((SIZE_T)in->width * in->height * 4 + 0xfff) & ~(SIZE_T)0xfff);
         ai->PitchAlignedSize = 0;
         ai->HintedBank.Value = 0;
         ai->PreferredSegment.Value = 0;
@@ -744,6 +747,12 @@ static void hwd_stop(void)
 /* Called from DriverEntry: read the switch, and fill the display entries only when it is on. */
 static void hwd_setup(DRIVER_INITIALIZATION_DATA *init)
 {
+    /* Allocations whatever the switch: shared surfaces (DWM's, for the screen driver) need them. */
+    init->DxgkDdiCreateAllocation = HwdCreateAllocation;
+    init->DxgkDdiDestroyAllocation = HwdDestroyAllocation;
+    init->DxgkDdiDescribeAllocation = HwdDescribeAllocation;
+    init->DxgkDdiOpenAllocation = HwdOpenAllocation;
+    init->DxgkDdiPresent = HwdPresent;   /* a shared surface's present: a fenced no-op, the phone shows it */
     d.on = hwd_reg_dword(L"Display", 0) != 0;
     if (!d.on) return;
     d.native_w = hwd_reg_dword(L"DisplayWidth", 1280);
@@ -768,9 +777,4 @@ static void hwd_setup(DRIVER_INITIALIZATION_DATA *init)
     init->DxgkDdiSetPointerPosition = HwdSetPointerPosition;
     init->DxgkDdiSetPointerShape = HwdSetPointerShape;
     init->DxgkDdiGetStandardAllocationDriverData = HwdGetStandardData;
-    init->DxgkDdiCreateAllocation = HwdCreateAllocation;
-    init->DxgkDdiDestroyAllocation = HwdDestroyAllocation;
-    init->DxgkDdiDescribeAllocation = HwdDescribeAllocation;
-    init->DxgkDdiOpenAllocation = HwdOpenAllocation;
-    init->DxgkDdiPresent = HwdPresent;
 }
