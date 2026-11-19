@@ -349,6 +349,103 @@ uint32_t zero_divisor(VkDevice dev) {
     return v;
 }
 
+// Mali has no clip distances (shaderClipDistance 0), but Vortek reports them so DXVK starts, and Mali's
+// shader compiler crashes (null read in spir2lir::evaluate_address) on any access to gl_ClipDistance.
+// DXVK's fixed-function Direct3D 9 vertex shader writes it in a loop. Every access chain into the
+// ClipDistance member of an output block is pointed at a private array instead, so the built-in is
+// declared but never touched. User clip planes then do not clip, as before on this GPU.
+static bool drop_clip_distance(std::vector<uint32_t>& w) {
+    if (w.size() < 5) return false;
+    struct Ins { size_t at; uint32_t wc, op; };
+    std::vector<Ins> ins;
+    for (size_t i = 5; i < w.size();) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > w.size()) return false;
+        ins.push_back({i, wc, op});
+        i += wc;
+    }
+    uint32_t S = 0, m = 0;
+    bool found = false;
+    for (auto& x : ins)
+        if (x.op == 72 && x.wc >= 5 && w[x.at + 3] == 11 /*BuiltIn*/ && w[x.at + 4] == 3 /*ClipDistance*/) S = w[x.at + 1], m = w[x.at + 2], found = true;
+    if (!found) return false;
+    auto def = [&](uint32_t id, uint32_t op, size_t idw) -> const Ins* {   // the instruction of that opcode whose result is id
+        for (auto& x : ins)
+            if (x.op == op && x.wc > idw && w[x.at + idw] == id) return &x;
+        return nullptr;
+    };
+    const Ins* st = def(S, 30, 1);                         // OpTypeStruct
+    if (!st || st->wc < 3 + m) return false;
+    uint32_t A = w[st->at + 2 + m];
+    const Ins* arr = def(A, 28, 1);                        // OpTypeArray
+    if (!arr) return false;
+    uint32_t F = w[arr->at + 2];
+    auto const_value = [&](uint32_t id, uint32_t* v) {
+        const Ins* c = def(id, 43, 2);                     // OpConstant
+        if (!c || c->wc < 4) return false;
+        *v = w[c->at + 3];
+        return true;
+    };
+    std::vector<uint32_t> vars;                            // output variables of that block type
+    for (auto& x : ins)
+        if (x.op == 59 && w[x.at + 3] == 3) {
+            const Ins* p = def(w[x.at + 1], 32, 1);
+            if (p && w[p->at + 2] == 3 && w[p->at + 3] == S) vars.push_back(w[x.at + 2]);
+        }
+    auto is_clip_chain = [&](const Ins& x) {
+        if ((x.op != 65 && x.op != 66) || x.wc < 5) return false;
+        uint32_t v;
+        bool ours = false;
+        for (uint32_t id : vars) ours |= id == w[x.at + 3];
+        return ours && const_value(w[x.at + 4], &v) && v == m;
+    };
+    bool any = false;
+    for (auto& x : ins) any |= is_clip_chain(x);
+    if (!any) return false;
+    uint32_t bound = w[3];
+    std::vector<uint32_t> decl;
+    auto pointer = [&](uint32_t sc, uint32_t t) {
+        for (auto& x : ins)
+            if (x.op == 32 && w[x.at + 2] == sc && w[x.at + 3] == t) return w[x.at + 1];
+        uint32_t p = bound++;
+        decl.insert(decl.end(), {(4u << 16) | 32, p, sc, t});
+        return p;
+    };
+    uint32_t pPA = pointer(6 /*Private*/, A), pPF = pointer(6, F);
+    uint32_t nul = bound++, var = bound++;
+    decl.insert(decl.end(), {(3u << 16) | 46, A, nul});            // OpConstantNull
+    decl.insert(decl.end(), {(5u << 16) | 59, pPA, var, 6, nul});  // OpVariable Private, zeroed
+    std::vector<uint32_t> out(w.begin(), w.begin() + 5);
+    bool declared = false;
+    for (auto& x : ins) {
+        const uint32_t* p = &w[x.at];
+        if (x.op == 15) {                                  // OpEntryPoint: the new variable joins the interface
+            out.push_back(((x.wc + 1) << 16) | 15);
+            out.insert(out.end(), p + 1, p + x.wc);
+            out.push_back(var);
+            continue;
+        }
+        if (x.op == 54 && !declared) {                     // before the first function
+            out.insert(out.end(), decl.begin(), decl.end());
+            declared = true;
+        }
+        if (is_clip_chain(x)) {
+            if (x.wc == 5) {
+                out.insert(out.end(), {(4u << 16) | 65, pPA, p[2], var});
+            } else {
+                out.push_back(((x.wc - 1) << 16) | x.op);
+                out.insert(out.end(), {pPF, p[2], var});
+                out.insert(out.end(), p + 5, p + x.wc);
+            }
+            continue;
+        }
+        out.insert(out.end(), p, p + x.wc);
+    }
+    out[3] = bound;
+    w.swap(out);
+    return true;
+}
+
 VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderStageCreateInfo* in, uint32_t n,
                     const VkPipelineVertexInputStateCreateInfo* vi, StageFix* fix) {
     fix->stages.assign(in, in + n);
@@ -409,8 +506,10 @@ VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderSta
             }
         }
         if (!t.module) {
+            std::vector<uint32_t> words(code, code + size / 4);
+            if (s.stage != VK_SHADER_STAGE_FRAGMENT_BIT && drop_clip_distance(words)) size = words.size() * 4;
             t.code = static_cast<uint32_t*>(malloc(size));
-            memcpy(t.code, code, size);
+            memcpy(t.code, words.data(), size);
             t.codeSize = size;
         }
         s.module = reinterpret_cast<VkShaderModule>(&t);

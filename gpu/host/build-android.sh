@@ -98,6 +98,10 @@ glslc -mfmt=num "$HERE/icd/scaled.vert" -o "$SHD/scaled.vert.inc"
 glslc -mfmt=num "$HERE/icd/scaled.frag" -o "$SHD/scaled.frag.inc"
 "$CXX" -std=c++17 -O1 -fPIE -pie -Wall -Wno-missing-field-initializers -DVK_NO_PROTOTYPES -I"$MESA_INC" -I"$SHD" \
   "$HERE/icd/scaledtest.cpp" -ldl -nostdlib++ -lc++_shared -o "$OUT/scaledtest"
+# spvtest: builds one pipeline from two SPIR-V files on the phone's own driver (adb shell), to find what a
+# driver's shader compiler crashes on. ./spvtest libvulkan.so vertex.spv fragment.spv
+"$CXX" -std=c++17 -O1 -fPIE -pie -Wall -Wno-missing-field-initializers -DVK_NO_PROTOTYPES -I"$MESA_INC" \
+  "$HERE/icd/spvtest.cpp" -ldl -static-libstdc++ -o "$OUT/spvtest"
 # A stand-in libhardware.so (icd/libhardware_stub.c), so drivers built as HAL modules load from the app.
 "$CC" -O2 -fPIC -shared -Wall -Wl,-soname,libhardware.so -Wl,-z,max-page-size=16384 \
   "$HERE/icd/libhardware_stub.c" -o "$OUT/libhardware.so"

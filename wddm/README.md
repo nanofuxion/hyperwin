@@ -1043,3 +1043,19 @@ screen the only one once (`dispinfo only \\.\DISPLAYn` or `dispset` from the des
   chain (seen after DWM had crashed in a loop): set `IddRender` = 0, `pnputil /restart-device
   ROOT\DISPLAY\0000` (frames come back, read back by the CPU), then `IddRender` = 1 and restart the device
   again (frames go to the phone's screen directly). Restarts of Windows alone did not help.
+
+#### Direct3D 9 draws (2026-11-19)
+
+- Mali has no clip distances (`shaderClipDistance` 0, `maxClipDistances` 0). Vortek reports them so DXVK
+  starts, and Mali's shader compiler crashes on any access to `gl_ClipDistance`. DXVK's fixed-function
+  Direct3D 9 vertex shader writes it in a loop, which Vortek's own inspector does not take out. Found
+  with `gpu/host/icd/spvtest.cpp` (builds a pipeline from two SPIR-V files on the phone's driver, run from
+  `adb shell`) as the test for `spirv-reduce`: the shader came down to one access chain into the
+  built-in. `drop_clip_distance` in `gpu/host/icd/vortek.cpp` now points every such access chain at a
+  private array before the shader is built. User clip planes do not clip on this GPU.
+- Result on the rebuilt spare, nothing beside the programs, the indirect display as the screen:
+  `d3d9test` PASS as ARM64, x64 and x86 (green triangle on red, read back). AIO `--cube dx9` (x64) draws
+  its cube at 240 FPS average.
+- Open: the 32-bit AIO Direct3D 9 window stays empty (3,000 FPS, so nothing is drawn or shown);
+  Direct3D 8 says "could not create a Direct3D 8 device" (32-bit; there is no 64-bit `d3d8.dll` on this
+  Windows); the Direct3D 7 and DirectDraw runs show no window.
