@@ -111,12 +111,24 @@ static LONG CALLBACK hww_fault(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static PVOID hww_veh;
+
+/* The handler lives in this module: a DLL removes it before it unloads (DllMain, or the destructor for
+ * DLLs started by the C runtime). */
+__attribute__((destructor, unused)) static void hww_unguard(void)
+{
+    PVOID h = InterlockedExchangePointer(&hww_veh, NULL);
+    if (h) RemoveVectoredExceptionHandler(h);
+}
+
 static inline void hww_guard(uint64_t user)
 {
     MEMORY_BASIC_INFORMATION mi;
     if (!user || !VirtualQuery((void *)(uintptr_t)user, &mi, sizeof mi)) return;
-    static LONG installed;
-    if (!InterlockedExchange(&installed, 1)) AddVectoredExceptionHandler(1, hww_fault);
+    if (!hww_veh) {
+        PVOID h = AddVectoredExceptionHandler(1, hww_fault);
+        if (InterlockedCompareExchangePointer(&hww_veh, h, NULL)) RemoveVectoredExceptionHandler(h);
+    }
     LONG i = InterlockedIncrement(&hww_nguarded) - 1;
     if (i >= HWW_GUARDED) return;
     hww_guarded[i].base = (uintptr_t)mi.AllocationBase;

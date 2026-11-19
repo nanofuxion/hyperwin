@@ -2691,11 +2691,22 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *p)
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
 {
     char v[8];
-    if (reason == DLL_PROCESS_ATTACH && log_path(v, sizeof v)) SetUnhandledExceptionFilter(on_crash);
-    if (reason == DLL_PROCESS_DETACH && g_chan) {
-        const struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
-        ulog("hwd3d_umd: submits to the phone %llu, to Windows %llu\n", (unsigned long long)c->submits_to_phone,
-             (unsigned long long)c->submits_to_guest);
+    static LPTOP_LEVEL_EXCEPTION_FILTER before;
+    static bool filtered;
+    if (reason == DLL_PROCESS_ATTACH && log_path(v, sizeof v)) {
+        before = SetUnhandledExceptionFilter(on_crash);
+        filtered = true;
+    }
+    if (reason == DLL_PROCESS_DETACH) {
+        if (g_chan) {
+            const struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
+            ulog("hwd3d_umd: submits to the phone %llu, to Windows %llu\n", (unsigned long long)c->submits_to_phone,
+                 (unsigned long long)c->submits_to_guest);
+        }
+        /* The runtime unloads this driver on a driver update while the process lives on: nothing of ours
+         * may stay hooked into it. */
+        if (filtered) SetUnhandledExceptionFilter(before);
+        hww_unguard();
     }
     return TRUE;
 }
