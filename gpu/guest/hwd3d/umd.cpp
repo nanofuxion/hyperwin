@@ -110,7 +110,8 @@ static void stub_note(int n)
 
 template <class R> static R stub_ret() { return R(); }
 template <> long stub_ret<long>() { return E_NOTIMPL; }
-template <> unsigned long long stub_ret<unsigned long long>() { return 192; }
+template <> unsigned long long stub_ret<unsigned long long>() { return 192; }   /* SIZE_T, 64-bit: a Calc entry */
+template <> unsigned long stub_ret<unsigned long>() { return 192; }             /* SIZE_T in the i686 build */
 
 template <int N, class F> struct Stub;
 template <int N, class R, class... A> struct Stub<N, R(APIENTRY *)(A...)> {
