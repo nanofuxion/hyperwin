@@ -756,9 +756,14 @@ to Windows and back.
   app's size. Arriving later from another thread, Windows attached the monitor but never gave it a swap
   chain.
 - Windows keeps the Basic Display as main screen until `dispinfo only \\.\DISPLAYn` makes ours the only one.
-- Not working yet: windows of programs that draw with GDI or on another GPU (Notepad, winver) do not
-  show. DWM gets those through surfaces that the kernel or another adapter fills, and ours are tokens.
-- Left: those surfaces, a sync fence instead of the wait, the cursor, the screen layer hidden when not
+- DXGI rotates the back buffers' identities after each present (`RotateResourceIdentities`). The
+  driver swapped the surfaces under the resources but left each view on its old surface, so DWM kept
+  drawing into one surface and presented the others: the screen froze on an old frame and new windows
+  never showed. Views of shared surfaces are now remembered and remade on the rotated surface.
+- The touch keyboard (TabTip.exe, under `Common Files\microsoft shared`) made a device every few
+  seconds. It is now treated as Windows' own program and gets the software renderer.
+- Seen working: the desktop, taskbar, Registry Editor and winver, all drawn by DWM on the phone.
+- Left: a sync fence instead of the wait, the cursor, the screen layer hidden when not
   used, the HyperWin screen made the main one and installed by default, and `IddRender`/`HWD3D_SYSTEM` on
   by default. A crash in `call_async`/`call_wait` when a channel goes away (TabTip, DWM restart) and one
   in `release_obj` at WUDFHost shutdown are still open.

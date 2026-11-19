@@ -85,12 +85,17 @@ static void ulog(const char *fmt, ...)
 }
 
 /* One line per call of an entry written here, when HWD3D_UMDLOG asks for the log. */
-static void ulog_call(const char *name)
+static bool calls_logged()
 {
     static int on = -1;
     char v[16];
     if (on < 0) on = setting("HWD3D_UMDCALLS", v, sizeof v) ? 1 : 0;
-    if (on) ulog("hwd3d_umd: %s\n", name);
+    return on;
+}
+
+static void ulog_call(const char *name)
+{
+    if (calls_logged()) ulog("hwd3d_umd: %s\n", name);
 }
 
 /* ---- stubs: every table entry has one ---- */
@@ -105,7 +110,7 @@ static void stub_note(int n)
 
 template <class R> static R stub_ret() { return R(); }
 template <> long stub_ret<long>() { return E_NOTIMPL; }
-template <> unsigned long long stub_ret<unsigned long long>() { return 128; }
+template <> unsigned long long stub_ret<unsigned long long>() { return 192; }
 
 template <int N, class F> struct Stub;
 template <int N, class R, class... A> struct Stub<N, R(APIENTRY *)(A...)> {
@@ -150,6 +155,11 @@ struct Obj {
     uint32_t swap_rb;      /* a BGRA surface the phone keeps as RGBA (see rgba_of): its views are swapped too */
     D3DKMT_HANDLE kalloc;  /* and the kernel allocation that carries it to other programs */
     HANDLE rtres;          /* the runtime's resource, for freeing that allocation */
+    /* Views of shared surfaces are remade when DXGI rotates the surfaces (u_dxgi_rotate). */
+    struct Obj *views;     /* resources: their views */
+    struct Obj *view_of, *next_view;  /* views: the resource, and its next view */
+    uint32_t view_method, view_size;
+    uint8_t view_desc[24];
 };
 
 static Dev *DV(D3D10DDI_HDEVICE h) { return static_cast<Dev *>(h.pDrvPrivate); }
@@ -164,6 +174,14 @@ static void fail(Dev *d, HRESULT hr)
 
 static void release_obj(Obj *o)
 {
+    if (o && o->view_of) {
+        for (Obj **p = &o->view_of->views; *p; p = &(*p)->next_view)
+            if (*p == o) {
+                *p = o->next_view;
+                break;
+            }
+        o->view_of = NULL;
+    }
     if (!o || !o->h) return;
     AcquireSRWLockExclusive(&g_lock);
     struct hwd3d_call c = {{sizeof c, HWD3D_MAGIC, HWD3D_OP_RELEASE, HWD3D_NO_REPLY, ++g_seq}, o->h, 0};
@@ -330,6 +348,10 @@ static void APIENTRY u_CreateResource(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CRE
     o->array = layers;
     o->usage = a->Usage;
     o->subs = mips * layers;
+    if (calls_logged())
+        ulog("hwd3d_umd:   %p dim %u %ux%ux%u format %u usage %u bind 0x%x map 0x%x misc 0x%x primary %d init %d\n", (void *)o,
+             (unsigned)a->ResourceDimension, o->r.width, o->r.height, o->r.depth, (unsigned)a->Format, (unsigned)a->Usage, a->BindFlags,
+             a->MapFlags, a->MiscFlags, a->pPrimaryDesc != NULL, a->pInitialDataUP != NULL);
     if (o->dim == 3 && ((a->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) || a->pPrimaryDesc) && o->subs == 1 && o->samples <= 1 &&
         !a->pInitialDataUP && create_shared(d, a, rt, o, &desc.t2))
         return;
@@ -417,6 +439,9 @@ static void APIENTRY u_OpenResource(D3D10DDI_HDEVICE hd, const D3D10DDIARG_OPENR
 
 static SIZE_T APIENTRY u_CalcPrivateRenderTargetViewSize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATERENDERTARGETVIEW *) { return sizeof(Obj); }
 
+static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first = 0);
+static uint32_t make_view(Dev *d, Obj *v, Obj *res, uint32_t method, const void *desc, uint32_t size);
+
 static void APIENTRY u_CreateRenderTargetView(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATERENDERTARGETVIEW *a,
                                               D3D10DDI_HRENDERTARGETVIEW hv, D3D10DDI_HRTRENDERTARGETVIEW)
 {
@@ -465,15 +490,7 @@ static void APIENTRY u_CreateRenderTargetView(D3D10DDI_HDEVICE hd, const D3D10DD
         }
         break;
     }
-    struct wbuf *b = dc(d, HMX_ID3D11Device_CreateRenderTargetView);
-    put32(b, res->h);
-    put_arr(b, &vd, 1, sizeof vd);
-    put32(b, 1);
-    struct rd r;
-    HRESULT hr = (HRESULT)call_wait(b, &r);
-    v->h = take32(&r);
-    call_end(&r);
-    if (FAILED(hr) || !v->h) fail(d, FAILED(hr) ? hr : E_FAIL);
+    v->h = make_view(d, v, res, HMX_ID3D11Device_CreateRenderTargetView, &vd, sizeof vd);
 }
 
 static void APIENTRY u_DestroyRenderTargetView(D3D10DDI_HDEVICE, D3D10DDI_HRENDERTARGETVIEW h) { release_obj(OB(h)); }
@@ -587,6 +604,7 @@ static void APIENTRY u_ResourceMap(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, U
                                    D3D10DDI_MAPPED_SUBRESOURCE *out)
 {
     ulog_call("ResourceMap");
+    if (calls_logged()) ulog("hwd3d_umd:   %p sub %u type %u flags 0x%x\n", hr.pDrvPrivate, sub, (unsigned)type, flags);
     memset(out, 0, sizeof *out);
     if (type == D3D10_DDI_MAP_WRITE_DISCARD || type == D3D10_DDI_MAP_WRITE_NOOVERWRITE) map_local(hd, hr, sub, type, out);
     else map_phone(hd, hr, sub, type, flags, out);
@@ -726,7 +744,7 @@ static void APIENTRY u_DestroyDevice(D3D10DDI_HDEVICE hd)
 
 /* ---- the rest of the device: states, shaders, views, draws ---- */
 
-static_assert(sizeof(Obj) <= 128, "the stubs of the Calc entries answer 128");
+static_assert(sizeof(Obj) <= 192, "the stubs of the Calc entries answer 192");
 
 template <class T> static uint32_t H(T t)
 {
@@ -737,7 +755,7 @@ template <class T> static uint32_t H(T t)
 template <class T> static Obj *O(T t) { return static_cast<Obj *>(t.pDrvPrivate); }
 
 /* A create on the phone's device with one description in and one object out. */
-static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first = 0)
+static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first)
 {
     struct wbuf *b = dc(d, method);
     if (first) put32(b, first);
@@ -752,6 +770,20 @@ static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t
         return 0;
     }
     return h;
+}
+
+/* A view on the phone. Views of shared surfaces are remembered, to be remade on rotation. */
+static uint32_t make_view(Dev *d, Obj *v, Obj *res, uint32_t method, const void *desc, uint32_t size)
+{
+    if (res->kalloc && size <= sizeof v->view_desc) {
+        v->view_of = res;
+        v->view_method = method;
+        v->view_size = size;
+        memcpy(v->view_desc, desc, size);
+        v->next_view = res->views;
+        res->views = v;
+    }
+    return phone_create(d, method, desc, size, res->h);
 }
 
 template <class T> static void APIENTRY u_destroy(D3D10DDI_HDEVICE, T h) { release_obj(O(h)); }
@@ -1300,7 +1332,7 @@ static void APIENTRY u_CreateShaderResourceView(D3D10DDI_HDEVICE hd, const D3D11
         }
         break;
     }
-    v->h = phone_create(d, HMX_ID3D11Device_CreateShaderResourceView, &vd, sizeof vd, res->h);
+    v->h = make_view(d, v, res, HMX_ID3D11Device_CreateShaderResourceView, &vd, sizeof vd);
 }
 
 static void APIENTRY u_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *a, D3D10DDI_HDEPTHSTENCILVIEW hv, D3D10DDI_HRTDEPTHSTENCILVIEW)
@@ -1335,7 +1367,7 @@ static void APIENTRY u_CreateDepthStencilView(D3D10DDI_HDEVICE hd, const D3D11DD
         vd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
         vd.Texture2D.MipSlice = a->Tex2D.MipSlice;
     }
-    v->h = phone_create(d, HMX_ID3D11Device_CreateDepthStencilView, &vd, sizeof vd, res->h);
+    v->h = make_view(d, v, res, HMX_ID3D11Device_CreateDepthStencilView, &vd, sizeof vd);
 }
 
 static void APIENTRY u_CreateUnorderedAccessView(D3D10DDI_HDEVICE hd, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *a, D3D11DDI_HUNORDEREDACCESSVIEW hv, D3D11DDI_HRTUNORDEREDACCESSVIEW)
@@ -1375,7 +1407,7 @@ static void APIENTRY u_CreateUnorderedAccessView(D3D10DDI_HDEVICE hd, const D3D1
         }
         break;
     }
-    v->h = phone_create(d, HMX_ID3D11Device_CreateUnorderedAccessView, &vd, sizeof vd, res->h);
+    v->h = make_view(d, v, res, HMX_ID3D11Device_CreateUnorderedAccessView, &vd, sizeof vd);
 }
 
 static void APIENTRY u_SetRenderTargets(D3D10DDI_HDEVICE hd, const D3D10DDI_HRENDERTARGETVIEW *rtv, UINT n, UINT, D3D10DDI_HDEPTHSTENCILVIEW dsv,
@@ -1560,6 +1592,7 @@ static void update_subresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT 
 static void APIENTRY u_ResourceUpdateSubresourceUP(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE r, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT p, UINT sp, UINT)
 {
     ulog_call("ResourceUpdateSubresourceUP");
+    if (calls_logged()) ulog("hwd3d_umd:   %p sub %u box %d pitch %u\n", r.pDrvPrivate, sub, box != NULL, p);
     if (p == HWD3D_SCANOUT_PITCH && sp == HWD3D_SCANOUT_SLICE) {   /* the screen driver hands a frame to the phone */
         Obj *o = OB(r);
         if (o && o->share) {
@@ -2129,11 +2162,29 @@ static HRESULT __stdcall u_dxgi_rotate(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *
 {
     ulog_call("dxgi Rotate");
     if (a->Resources < 2) return S_OK;
-    Obj *first = reinterpret_cast<Obj *>(a->pResources[0]);
-    Obj keep = *first;
-    for (UINT i = 0; i + 1 < a->Resources; i++)
-        *reinterpret_cast<Obj *>(a->pResources[i]) = *reinterpret_cast<Obj *>(a->pResources[i + 1]);
-    *reinterpret_cast<Obj *>(a->pResources[a->Resources - 1]) = keep;
+    Obj *const *res = reinterpret_cast<Obj *const *>(a->pResources);
+    Obj *views[16];
+    UINT n = a->Resources < 16 ? a->Resources : 16;
+    for (UINT i = 0; i < n; i++) views[i] = res[i]->views;   /* views stay with the runtime's resource */
+    Obj keep = *res[0];
+    for (UINT i = 0; i + 1 < a->Resources; i++) *res[i] = *res[i + 1];
+    *res[a->Resources - 1] = keep;
+    /* The program's views name the resource, not the surface under it, so each is remade on the surface
+     * the resource now holds. Without this DWM kept drawing into one surface and presenting the others. */
+    Dev *d = reinterpret_cast<Dev *>(a->hDevice);
+    for (UINT i = 0; i < n; i++) {
+        res[i]->views = views[i];
+        for (Obj *v = views[i]; v; v = v->next_view) {
+            uint32_t old = v->h;
+            v->h = phone_create(d, v->view_method, v->view_desc, v->view_size, res[i]->h);
+            if (old) {
+                AcquireSRWLockExclusive(&g_lock);
+                struct hwd3d_call c = {{sizeof c, HWD3D_MAGIC, HWD3D_OP_RELEASE, HWD3D_NO_REPLY, ++g_seq}, old, 0};
+                raw_send(&c, sizeof c);
+                ReleaseSRWLockExclusive(&g_lock);
+            }
+        }
+    }
     return S_OK;
 }
 
@@ -2203,7 +2254,16 @@ static bool windows_own_program()
     WCHAR exe[MAX_PATH], win[MAX_PATH];
     UINT n = GetWindowsDirectoryW(win, MAX_PATH);
     DWORD m = GetModuleFileNameW(NULL, exe, MAX_PATH);
-    if (!(n && m > n && !_wcsnicmp(exe, win, n))) return false;
+    if (!(n && m > n && !_wcsnicmp(exe, win, n))) {
+        /* Windows' own parts outside its folder, such as the touch keyboard (TabTip.exe), which made a
+         * device every few seconds and ran the phone out of channels. */
+        WCHAR shared[MAX_PATH];
+        DWORD k = GetEnvironmentVariableW(L"CommonProgramFiles", shared, MAX_PATH - 20);
+        if (!k || k >= MAX_PATH - 20) return false;
+        wcscat(shared, L"\\microsoft shared\\");
+        n = (UINT)wcslen(shared);
+        if (!(m > n && !_wcsnicmp(exe, shared, n))) return false;
+    }
     char allow[256];
     if (!setting("HWD3D_SYSTEM", allow, sizeof allow)) return true;
     if (!strcmp(allow, "1")) return false;
