@@ -157,6 +157,12 @@ static void load_formats(Adapter *a)
         FORMATOP f = {};
         f.Format = (D3DDDIFORMAT)cand[i];
         f.Operations = ops;
+        if (ops & (FORMATOP_OFFSCREEN_RENDERTARGET | FORMATOP_DISPLAYMODE)) {
+            f.FlipMsTypes = 1u << D3DDDIMULTISAMPLE_NONE;   /* the multisample types each can flip and blt with */
+            f.BltMsTypes = 1u << D3DDDIMULTISAMPLE_NONE;
+        }
+        if (cand[i] == 21 || cand[i] == 22 || cand[i] == 35) f.PrivateFormatBitCount = 32;
+        else if (cand[i] == 23 || cand[i] == 25 || cand[i] == 80) f.PrivateFormatBitCount = 16;
         a->formats.push_back(f);
     }
 }
