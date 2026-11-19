@@ -1103,3 +1103,11 @@ our Direct3D 9 driver part with interface 8.
 | dxdiag | "HyperWin GPU" and "HyperWin screen", WDDM 1.3 |
 | AIO cubes (x64): Vulkan, OpenGL, Direct3D 11, Direct3D 9 | 485, 190, 240, 240 FPS average |
 | GPU process killed | desktop back in about 6 s, dxtest 11 passes after |
+- DirectDraw crash, what the debugger shows (2026-11-19): `DdQueryDirectDrawObject` is called with every
+  optional pointer null (the re-query `ddraw.dll` makes after `DdReenableDirectDrawObject` reports a new
+  display mode, the `mySetMode` path), and on the WDDM path that function writes the texture format count
+  through the null `pD3dDriverData` without a check. So the crash follows from Windows believing the
+  mode changed while DirectDraw is being created; whether that comes from our answers (the mode caps,
+  `GetCaps` 2) or from this spare's display state after today's experiments is not known yet. Tools: the
+  32-bit `ddraw.dll` and `ddraw.pdb` from the symbol server, `llvm-objdump`, and `dbgrun-x86` with
+  command files (`$$<file`) instead of quoted commands.
