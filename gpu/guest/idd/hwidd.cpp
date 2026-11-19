@@ -199,6 +199,13 @@ static HRESULT get_device(LUID luid, render_dev **out)
     render_dev *slot = nullptr;
     for (auto &r : g_rdev)
         if (r.dev && r.luid.LowPart == luid.LowPart && r.luid.HighPart == luid.HighPart) slot = &r;
+    if (slot && slot->dev->GetDeviceRemovedReason() != S_OK) {
+        /* The phone's GPU process restarted (a driver swap): this device is gone for good. A new one is
+         * made. The old one is left alone, since a frame thread that gave up on it may still hold it. */
+        hwidd_log("device for the render GPU was removed: %08lx", (unsigned long)slot->dev->GetDeviceRemovedReason());
+        slot->dev = nullptr;
+        slot = nullptr;
+    }
     if (!slot) {
         for (auto &r : g_rdev)
             if (!r.dev) { slot = &r; break; }

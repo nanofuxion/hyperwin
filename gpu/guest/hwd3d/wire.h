@@ -83,20 +83,18 @@ static void send_program(void)
     free(m);
 }
 
-static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
+static void connect_channel(void)
 {
-    (void)once; (void)param; (void)ctx;
-    if (getenv("HWD3D_OFF")) return TRUE;
     /* The WDDM adapter first (include/hw_wddm.h), the legacy \\.\HwGpu device without it. */
     struct hwgpu_open_out o;
     DWORD got = 0;
     HANDLE dev = INVALID_HANDLE_VALUE;
     static struct hww adapter;
-    if (hww_open(&adapter)) {
+    if (g_adapter || hww_open(&adapter)) {
         struct hww_open wo;
         if (hww_open_channel(&adapter, &wo) < 0) {
-            hww_close(&adapter);
-            return TRUE;
+            if (!g_adapter) hww_close(&adapter);
+            return;
         }
         o.chan = wo.chan;
         o.slot = wo.slot;
@@ -104,10 +102,10 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
         g_adapter = &adapter;
     } else {
         dev = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-        if (dev == INVALID_HANDLE_VALUE) return TRUE;
+        if (dev == INVALID_HANDLE_VALUE) return;
         if (!DeviceIoControl(dev, IOCTL_HWGPU_OPEN, NULL, 0, &o, sizeof o, &got, NULL) || got != sizeof o) {
             CloseHandle(dev);
-            return TRUE;
+            return;
         }
     }
     /* The handle stays open for the life of the process: closing it frees the channel. */
@@ -132,12 +130,39 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
     } else
         hlog("hwd3d: the phone has no HwD3D %u (status 0x%lx), using Windows' Direct3D\n", HWD3D_VERSION,
              (unsigned long)r.r.status);
+}
+
+static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    if (!getenv("HWD3D_OFF")) connect_channel();
     return TRUE;
+}
+
+/* The phone's GPU process restarted (a driver swap, or it was stopped): every object on the old
+ * channel is gone and the devices on it are removed. A program that makes a new device, such as the
+ * screen driver or DWM rebuilding, gets a new channel. The old one stays mapped, unused. */
+static void reconnect_if_lost(void)
+{
+    if (!g_ok || hwgpu_alive(hwgpu_chan_ctl(g_chan), g_gen)) return;
+    AcquireSRWLockExclusive(&g_lock);
+    if (!hwgpu_alive(hwgpu_chan_ctl(g_chan), g_gen)) {
+        hlog("hwd3d: the phone's GPU restarted, opening a new channel\n");
+        g_ok = 0;
+        g_stage = NULL;
+        g_stage_cap = g_stage_pos = 0;
+        g_qpage = NULL;
+        memset(g_qused, 0, sizeof g_qused);
+        g_stage_tried = 0;
+        connect_channel();
+    }
+    ReleaseSRWLockExclusive(&g_lock);
 }
 
 static int ready(void)
 {
     InitOnceExecuteOnce(&g_once, open_channel, NULL, NULL);
+    reconnect_if_lost();
     return g_ok;
 }
 

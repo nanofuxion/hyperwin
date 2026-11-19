@@ -776,6 +776,15 @@ to Windows and back.
   by default. A crash in `call_async`/`call_wait` when a channel goes away (TabTip, DWM restart) and one
   in `release_obj` at WUDFHost shutdown are still open.
 
+#### Driver swap with the GPU desktop (2026-11-19, spare machine)
+
+Killing the phone's GPU process (what a driver swap does) while DWM draws on it: DWM restarts on the
+new process by itself. The screen driver kept its old Direct3D device and failed every swap chain with
+`887a0005`, and the Direct3D driver in WUDFHost kept its dead channel, so new devices failed too. Now
+the screen driver drops a removed device and makes a new one, and the Direct3D driver opens a new
+channel when the old one is dead (`reconnect_if_lost` in `wire.h`). The desktop came back on its own
+about 3 s after the restart, and `dxtest 11` passed afterwards.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only
