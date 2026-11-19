@@ -2728,3 +2728,4 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
 }
 
 #include "umd9.inc"
+#include "umd12.inc"

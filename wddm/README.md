@@ -965,6 +965,26 @@ desktop session; results land in `C:\HyperWin\AIO Results\Benchmark` as `avg|min
 | Direct3D 7 | fails to start (DirectDraw sits on Direct3D 9 here); works since the DirectDraw fix below |
 | Direct3D 8, 12 | not run to a result: 8 needs Direct3D 9, 12 needs phase 8 |
 
+#### Phase 8, Direct3D 12: first findings (2026-11-19)
+
+- Why `dxtest 12` fails today (`D3D12CreateDevice` 0x887a0004): `D3D12Core.dll` asks the kernel for the
+  driver name (`KMTQAITYPE_UMDRIVERNAME`), loads our `hwd3d_umd.dll` from the driver store (the INF's
+  fourth `UserModeDriverName`), finds no `OpenAdapter12` in it and gives up. Seen with `dbgrun` and a
+  breakpoint on `win32u!NtGdiDdDDIQueryAdapterInfo`. Whether the WDDM 1.3 kernel half is enough for the
+  runtime after that is not known yet. If it insists on WDDM 2.0, `hwgpuw.sys` needs the GPU virtual
+  address entries with empty page tables.
+- The plan for the driver part: the Direct3D 12 interface is close to the API, so each entry maps back
+  onto a Direct3D 12 call. Those calls go to vkd3d-proton's `d3d12core.dll`, kept in the driver store
+  under our own name and loaded by the driver (never beside a program, never in System32). It finds
+  the phone's GPU through the same Vulkan driver as every other program, so GPU data stays on the
+  phone as it does for Vulkan. vkd3d-proton on the phone, as planned above, can come later behind the
+  same entries. 32-bit programs are not served at first.
+- In the tree now, not yet run in Windows: `umd12.inc` exports `OpenAdapter12`, answers the adapter
+  questions with logging, and fills every function table with stubs that name themselves in the log
+  when first called (`gen_umd12.py` reads the names from the WDK header at build time). Next: run
+  `dxtest 12`, read which interface version and tables the runtime takes, then write the entries
+  `dxtest 12` uses (device, queue, allocator, list, heap, resource, descriptor heap, clear, copy, fence).
+
 #### OpenGL: two programs corrupt each other (2026-11-19)
 
 `guest/tools/gldepth.c` draws a far and a near quad each frame, reads the centre back, and swaps. One copy
