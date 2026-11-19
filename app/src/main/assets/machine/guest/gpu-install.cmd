@@ -44,8 +44,7 @@ rem installed is remembered by the package's hash rather than by a copy in Syste
 rem The firmware describes the GPU as ACPI\HWGP0001, with an interrupt line that Windows needs for the
 rem screen. Older firmware had none, and the adapter was a root device; that one goes once the ACPI one exists.
 set "GPUID=Root\HwGpuAdapter"
-powershell -NoProfile -Command "if (Get-PnpDevice | ? HardwareID -contains 'ACPI\HWGP0001') { exit 0 } else { exit 1 }" && set "GPUID=ACPI\HWGP0001"
-if "%GPUID%"=="ACPI\HWGP0001" powershell -NoProfile -Command "if (Get-PnpDevice | ? HardwareID -contains 'Root\HwGpuAdapter') { exit 0 } else { exit 1 }" && (%G%\hwdev.exe remove Root\HwGpuAdapter & del %G%\hwgpuw\installed.sha 2>nul)
+rem (The ACPI device does not take the driver yet: wddm/README.md. The root device stays the one we install.)
 set "NEWH="
 for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwgpuw\hwgpuw.inf SHA256 2^>nul') do if not defined NEWH set "NEWH=%%h"
 set "OLDH="
