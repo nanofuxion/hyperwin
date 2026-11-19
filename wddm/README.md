@@ -947,3 +947,20 @@ device: some check between `QueryLHDDICaps` and the adapter table rejects it. Ne
   (0x400) and not 3D acceleration (0x800), which `CheckDeviceType` wants (0xc00). Next: find where that
   table gets its ops (the loop at `FetchDirectDrawData+0x944..0xa44` is not even run for our driver;
   the entries are made at +0x828 with base ops 1, 5 or 0x105 from `CPixel::ConvertFromOldFormat`).
+
+#### AIO Graphics Test on the HyperWin GPU (2026-11-19)
+
+Release 2.2.0 of https://github.com/The412Banner/AIO-Graphics-Test (`gh release download 2.2.0 -R
+The412Banner/AIO-Graphics-Test`), pushed to `C:\HyperWin\aio64.exe`, nothing copied beside it. Started with
+`cd /d C:\HyperWin & start "" aio64.exe --cube <vk|gl|dx7|dx8|dx9|dx10|dx11|dx12> --bench 6 --autoclose 2` in the
+desktop session; results land in `C:\HyperWin\AIO Results\Benchmark` as `avg|min|max` FPS.
+
+| Backend | Result on the spare (Pixel 6 Pro) |
+| --- | --- |
+| Vulkan | 494 avg, 77 min, 993 max |
+| OpenGL | 223 avg, 23 min, 611 max |
+| Direct3D 10 | 217 avg, 91 min, 296 max |
+| Direct3D 11 | 215 avg, 87 min, 289 max |
+| Direct3D 9 | "could not create Direct3D9 device" (the `NOTAVAILABLE` above) |
+| Direct3D 7 | fails to start (DirectDraw sits on Direct3D 9 here) |
+| Direct3D 8, 12 | not run to a result: 8 needs Direct3D 9, 12 needs phase 8 |
