@@ -460,7 +460,7 @@ index 9113d96..39ea41a 100644
 +    return transfer(false, x, y, w, h);
  }
 diff --git a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
-index 9d8b83b..014c97a 100644
+index 9d8b83b..28e92c7 100644
 --- a/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
 +++ b/src/gfxstream/guest/platform/windows/WindowsVirtGpuDevice.cpp
 @@ -3,37 +3,519 @@
@@ -714,7 +714,7 @@ index 9d8b83b..014c97a 100644
 +
 +bool virtGpuScanoutSupported() {
 +    auto* c = HwgpuConnection::get();
-+    return c && c->scanout();
++    return c && c->scanout() && !(c->scanoutFlags() & HWGPU_SCANOUT_DESKTOP);
 +}
 +
 +int virtGpuScanout(uint32_t resourceId, uint32_t index, uint32_t seq, uint32_t flags) {
@@ -1563,7 +1563,7 @@ index 58b592a..68714f1 100644
     wsi_memory_type_select_cb select_blit_dst_memory_type;
  
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 0622857..2b3afd8 100644
+index 0622857..01b10b1 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
 @@ -27,6 +27,8 @@
@@ -1897,7 +1897,7 @@ index 0622857..2b3afd8 100644
     /* acquire timeout has to be explicitly handled for sw wsi */
     if (!chain->dxgi)
        return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
-@@ -823,6 +1023,101 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
+@@ -823,6 +1023,124 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
     return VK_SUCCESS;
  }
  
@@ -1923,8 +1923,31 @@ index 0622857..2b3afd8 100644
 +   if (!GetMonitorInfo(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi) ||
 +       !GetClientRect(wnd, &rc) || !ClientToScreen(wnd, &tl))
 +      return false;
-+   return tl.x <= mi.rcMonitor.left && tl.y <= mi.rcMonitor.top &&
-+          tl.x + rc.right >= mi.rcMonitor.right && tl.y + rc.bottom >= mi.rcMonitor.bottom;
++   if (!(tl.x <= mi.rcMonitor.left && tl.y <= mi.rcMonitor.top &&
++         tl.x + rc.right >= mi.rcMonitor.right && tl.y + rc.bottom >= mi.rcMonitor.bottom))
++      return false;
++   /* The phone's layer covers the whole screen, so any visible window above this one on the same
++    * screen (a message box, a topmost tool, the taskbar shown over it) keeps the frames in the window,
++    * where Windows draws the other one on top. Cloaked windows (hidden apps) do not count. */
++   typedef HRESULT (WINAPI *cloaked_fn)(HWND, DWORD, PVOID, DWORD);
++   static cloaked_fn get_attr;
++   static bool looked;
++   if (!looked) {
++      HMODULE dwm = LoadLibraryA("dwmapi.dll");
++      get_attr = dwm ? (cloaked_fn)(void *)GetProcAddress(dwm, "DwmGetWindowAttribute") : NULL;
++      looked = true;
++   }
++   for (HWND w = GetWindow(GetAncestor(wnd, GA_ROOT), GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
++      if (!IsWindowVisible(w) || IsIconic(w))
++         continue;
++      DWORD cloaked = 0;
++      if (get_attr && SUCCEEDED(get_attr(w, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked))) && cloaked)
++         continue;
++      RECT wr, both;
++      if (GetWindowRect(w, &wr) && IntersectRect(&both, &wr, &mi.rcMonitor))
++         return false;
++   }
++   return true;
 +}
 +
 +static bool
@@ -1999,7 +2022,7 @@ index 0622857..2b3afd8 100644
  static VkResult
  wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                          uint32_t image_index,
-@@ -837,6 +1132,8 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+@@ -837,6 +1155,8 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
  
     if (chain->dxgi)
        return wsi_win32_queue_present_dxgi(chain, image, damage);
@@ -2008,7 +2031,7 @@ index 0622857..2b3afd8 100644
  
     char *ptr = (char *)image->base.cpu_map;
     char *dptr = (char *)image->sw.ppvBits;
-@@ -851,6 +1148,13 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+@@ -851,6 +1171,13 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
  
     wsi_win32_set_image_idle(chain, image);
  
@@ -2022,7 +2045,7 @@ index 0622857..2b3afd8 100644
     return chain->status;
  }
  
-@@ -929,12 +1233,14 @@ wsi_win32_surface_create_swapchain_dxgi(
+@@ -929,12 +1256,14 @@ wsi_win32_surface_create_swapchain_dxgi(
  }
  
  static VkResult
@@ -2038,7 +2061,7 @@ index 0622857..2b3afd8 100644
     struct wsi_swapchain **swapchain_out)
  {
     wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
-@@ -972,6 +1278,7 @@ wsi_win32_surface_create_swapchain(
+@@ -972,6 +1301,7 @@ wsi_win32_surface_create_swapchain(
        { WSI_IMAGE_TYPE_DXGI },
     };
     dxgi_image_params.storage_image = (image_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
@@ -2046,7 +2069,7 @@ index 0622857..2b3afd8 100644
  
     struct wsi_cpu_image_params cpu_image_params = {
        { WSI_IMAGE_TYPE_CPU },
-@@ -980,7 +1287,7 @@ wsi_win32_surface_create_swapchain(
+@@ -980,7 +1310,7 @@ wsi_win32_surface_create_swapchain(
     bool supports_dxgi = wsi->dxgi.factory &&
                          wsi->dxgi.dcomp &&
                          wsi->wsi->win32.get_d3d12_command_queue;
@@ -2055,7 +2078,7 @@ index 0622857..2b3afd8 100644
        &dxgi_image_params.base : &cpu_image_params.base;
  
     VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
-@@ -1005,8 +1312,10 @@ wsi_win32_surface_create_swapchain(
+@@ -1005,8 +1335,10 @@ wsi_win32_surface_create_swapchain(
     chain->status = VK_SUCCESS;
  
     chain->surface = surface;
@@ -2067,7 +2090,7 @@ index 0622857..2b3afd8 100644
        result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
        if (result != VK_SUCCESS)
           goto fail;
-@@ -1036,6 +1345,33 @@ fail:
+@@ -1036,6 +1368,33 @@ fail:
     return result;
  }
  

@@ -13,6 +13,9 @@ typedef struct { UINT hAdapter; LUID AdapterLuid; ULONG NumOfSources; BOOL bPres
 typedef struct { ULONG NumAdapters; KMT_ADAPTERINFO *pAdapters; } KMT_ENUMADAPTERS2;
 typedef struct { UINT hAdapter; UINT Type; void *pData; UINT Size; } KMT_QUERYADAPTERINFO;
 typedef struct { UINT Value; } KMT_ADAPTERTYPE;
+typedef struct { WCHAR Name[MAX_PATH]; ULONG Version, Flags; } KMT_OPENGLINFO;
+typedef struct { HDC hDc; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; } KMT_OPENFROMHDC;
+typedef LONG (WINAPI *PFN_FROMHDC)(KMT_OPENFROMHDC *);
 typedef LONG (WINAPI *PFN_ENUM2)(KMT_ENUMADAPTERS2 *);
 typedef LONG (WINAPI *PFN_QAI)(KMT_QUERYADAPTERINFO *);
 
@@ -44,7 +47,24 @@ int main(int argc, char **argv)
         say("adapter %lu luid %08lx:%08lx sources %lu type %08lx (%08lx): render=%u display=%u software=%u post=%u\n", i,
             (unsigned long)list[i].AdapterLuid.HighPart, (unsigned long)list[i].AdapterLuid.LowPart, list[i].NumOfSources,
             (unsigned long)t.Value, (unsigned long)qs, t.Value & 1, (t.Value >> 1) & 1, (t.Value >> 2) & 1, (t.Value >> 3) & 1);
+        KMT_OPENGLINFO gl = { {0}, 0, 0 };
+        KMT_QUERYADAPTERINFO qg = { list[i].hAdapter, 2 /* UMOPENGLINFO */, &gl, sizeof gl };
+        LONG gs = qai(&qg);
+        say("   opengl %08lx: %ls version %lu flags %lu\n", (unsigned long)gs, gl.Name, gl.Version, gl.Flags);
     }
+    PFN_FROMHDC fromhdc = (PFN_FROMHDC)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc");
+    HDC screen = GetDC(NULL);
+    KMT_OPENFROMHDC fh = { screen, 0, { 0, 0 }, 0 };
+    LONG fs = fromhdc ? fromhdc(&fh) : -1;
+    say("screen's adapter %08lx: luid %08lx:%08lx source %u\n", (unsigned long)fs, (unsigned long)fh.AdapterLuid.HighPart,
+        (unsigned long)fh.AdapterLuid.LowPart, fh.VidPnSourceId);
+    if (!fs) {
+        KMT_OPENGLINFO gl = { {0}, 0, 0 };
+        KMT_QUERYADAPTERINFO qg = { fh.hAdapter, 2, &gl, sizeof gl };
+        LONG gs = qai(&qg);
+        say("   its opengl %08lx: %ls\n", (unsigned long)gs, gl.Name);
+    }
+    ReleaseDC(NULL, screen);
     if (argc > 2 && !strcmp(argv[1], "attach")) {
         /* dispinfo attach \\.\DISPLAY2 [x] [w] [h]: extends the desktop onto that display. */
         DEVMODEA dm = { 0 };

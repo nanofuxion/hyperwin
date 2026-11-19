@@ -223,6 +223,8 @@ struct Frame {
     bool vsync = false;
 };
 
+std::atomic<bool> g_screen_shown{false};  // DWM's desktop reaches the layer (hwgpu_host_show_buffer)
+
 struct Scan {
     std::mutex lock;
 #ifdef __ANDROID__
@@ -819,6 +821,10 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         const auto* p = as<sgpu_scanout>(m);
         if (!p || p->index >= HWGPU_SCANOUT_BUFFERS) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
         if (!g_scanout_ok) return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
+        // While DWM's desktop is on the layer (hwgpu_host_show_buffer), a program's frames would cover
+        // every other window. Refused, the program's driver draws into its window instead.
+        if (p->resource_id && g_screen_shown.load(std::memory_order_relaxed))
+            return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
         if (!p->resource_id) {
             scan_hide(int(l.slot));
             break;
@@ -1231,8 +1237,15 @@ void hwgpu_host_heap_free(void* p) { heap_release(p); }
 
 int hwgpu_host_vsync(void) { return (g_scanout_flags.load() & HWGPU_SCANOUT_VSYNC) != 0; }
 
+static void publish_scanout_flags();
+
 void hwgpu_host_set_vsync(int on) {
-    g_scanout_flags = on ? HWGPU_SCANOUT_VSYNC : 0;
+    if (on) g_scanout_flags.fetch_or(HWGPU_SCANOUT_VSYNC);
+    else g_scanout_flags.fetch_and(~HWGPU_SCANOUT_VSYNC);
+    publish_scanout_flags();
+}
+
+static void publish_scanout_flags() {
     if (!g_window) return;
     for (uint32_t i = 0; i < HWGPU_CHANNELS; i++)
         __atomic_store_n(&hwgpu_chan_ctl(chan_base(i))->scanout_flags, g_scanout_flags.load(), __ATOMIC_RELEASE);
@@ -1249,6 +1262,10 @@ void hwgpu_host_set_layer_size(int view_width, int view_height) {
 void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height) {
 #ifdef __ANDROID__
     if (!ahb) return;
+    if (!g_screen_shown.exchange(true, std::memory_order_relaxed)) {
+        g_scanout_flags.fetch_or(HWGPU_SCANOUT_DESKTOP);
+        publish_scanout_flags();
+    }
     AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahb));
     Frame f;
     f.ahb = ahb;

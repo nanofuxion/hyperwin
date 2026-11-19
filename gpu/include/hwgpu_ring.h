@@ -94,6 +94,9 @@ struct hwgpu_ctl {
     uint64_t submits_to_guest;
 };
 #define HWGPU_SCANOUT_VSYNC 1u
+/* phone: the screen shows Windows' desktop as DWM draws it on the GPU (the HyperWin screen). A
+ * program's frames then stay in its window, under any window above it, and never take the layer. */
+#define HWGPU_SCANOUT_DESKTOP 2u
 
 _Static_assert(sizeof(struct hwgpu_ctl) <= HWGPU_CTL_BYTES, "control fits its page");
 

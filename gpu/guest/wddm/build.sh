@@ -37,7 +37,10 @@ mkdir -p "$PKG"
 cp "$OUT/hwgpuw.sys" "$PKG/"
 bash gpu/guest/hwd3d/build-umd.sh >/dev/null
 cp gpu/work/umd-out/hwd3d_umd.dll gpu/work/umd-out/hwd3d_umd_x86.dll "$PKG/"
-H=$(cat "$OUT/hwgpuw.sys" "$PKG/hwd3d_umd.dll" "$PKG/hwd3d_umd_x86.dll" gpu/work/out/vulkan_hwgpu*.dll | shasum -a 256 | cut -c1-8)
+[ -f gpu/work/out/dx/zink/libgallium_wgl.dll ] || bash gpu/guest/dx/build.sh >/dev/null
+cp gpu/work/out/dx/zink/libgallium_wgl.dll "$PKG/hwgl.dll"
+cp gpu/work/out/dx/zink-x86/libgallium_wgl.dll "$PKG/hwgl_x86.dll"
+H=$(cat "$OUT/hwgpuw.sys" "$PKG/hwd3d_umd.dll" "$PKG/hwd3d_umd_x86.dll" "$PKG"/hwgl*.dll gpu/work/out/vulkan_hwgpu*.dll | shasum -a 256 | cut -c1-8)
 sed "s/^DriverVer *=.*/DriverVer   = 11\/18\/2026,1.0.$((0x$(echo $H | cut -c1-4))).$((0x$(echo $H | cut -c5-8)))/" \
   gpu/guest/wddm/hwgpuw.inf > "$PKG/hwgpuw.inf"
 [ -f gpu/work/out/vulkan_hwgpu.dll ] && cp gpu/work/out/vulkan_hwgpu.dll gpu/work/out/vulkan_hwgpu.json "$PKG/"

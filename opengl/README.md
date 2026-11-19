@@ -224,6 +224,20 @@ Per program (`use.cmd zink`, or the Gallium split of phase 2) keeps working mean
 as ARM64 and x64 with Zink beside it, found Vulkan through the adapter with the Khronos key removed, and
 the byte counters show no copy into or out of Windows.
 
+## System-wide ICD: working (2026-11-19)
+
+With the HyperWin screen (`wddm/README.md` phase 6) the window's adapter is the indirect display, and
+it passes Windows' OpenGL question on to its render adapter, the HyperWin GPU. So the ICD values on the
+HyperWin GPU's own key are enough: `OpenGLDriverName`, `OpenGLVersion` and `OpenGLFlags`, and the same
+three with `Wow` for 32-bit programs (without `OpenGLVersionWow` and `OpenGLFlagsWow` 32-bit programs
+still got "GDI Generic"). `hwgpuw.inf` installs them, with Zink's `libgallium_wgl.dll` in the driver
+package as `hwgl.dll` (ARM64X, for ARM64 and x64 programs) and `hwgl_x86.dll`.
+
+`gltest` passes as ARM64, x64 and x86 with nothing beside it: Windows' own `opengl32.dll` loads Zink,
+`GL_RENDERER` is `zink Vulkan 1.4(Virtio-GPU GFXStream (Mali-G78))`, OpenGL 3.2 compatibility.
+Frames reach the window through GDI, so they sit under any window above them. With the Basic Display
+as the screen (machines without the HyperWin screen) programs still get "GDI Generic".
+
 ## Things to check early
 
 - Which OpenGL version Zink reaches on the Mali driver, and which missing

@@ -133,6 +133,11 @@ arrives while the last is still on its way replaces any frame already waiting, l
 the screen lets go of a buffer, the host writes its count into `hwgpu_ctl.scanout_free`. The guest
 draws into that buffer only after that.
 
+- The layer covers the whole screen, so a program gets it only while its window fills the screen,
+  has the focus, and no other visible window is above it on that screen. Otherwise frames go into the
+  window, where Windows draws other windows over them. While Windows' own desktop is on the layer
+  (the HyperWin screen, `wddm/README.md` phase 6) the phone sets `HWGPU_SCANOUT_DESKTOP` in each
+  channel's `scanout_flags` and refuses program frames, so every program draws into its window.
 - The app process owns the layer (`GuestDisplay`) and lends it to each renderer process in the
   start message. When a renderer dies the app hides the layer. The next renderer shows it again
   with its first frame, and the desktop underneath stays on screen throughout.

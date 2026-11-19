@@ -7,13 +7,14 @@ Class       = System
 ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %Mfg%
 CatalogFile = hwgpuw.cat
-DriverVer   = 11/18/2026,1.0.17187.17188
+DriverVer   = 11/18/2026,1.0.23067.31938
 PnpLockdown = 1
 
 [DestinationDirs]
 Hw.Miniport = 13
 Hw.Vulkan   = 13
 Hw.D3D      = 13
+Hw.GL       = 13
 
 [SourceDisksNames]
 1 = %Disk%,,,
@@ -26,6 +27,8 @@ vulkan_hwgpu_x86.dll  = 1
 vulkan_hwgpu_x86.json = 1
 hwd3d_umd.dll     = 1
 hwd3d_umd_x86.dll = 1
+hwgl.dll          = 1
+hwgl_x86.dll      = 1
 
 [Manufacturer]
 %Mfg% = Hw, NTarm64
@@ -35,7 +38,7 @@ hwd3d_umd_x86.dll = 1
 
 [Install.NT]
 FeatureScore = FB
-CopyFiles = Hw.Miniport, Hw.Vulkan, Hw.D3D
+CopyFiles = Hw.Miniport, Hw.Vulkan, Hw.D3D, Hw.GL
 AddReg    = Install.AddReg
 
 [Hw.Miniport]
@@ -50,6 +53,12 @@ vulkan_hwgpu_x86.json,,,0x100
 [Hw.D3D]
 hwd3d_umd.dll,,,0x100
 hwd3d_umd_x86.dll,,,0x100
+
+; OpenGL: Mesa's Zink as an ICD (libgallium_wgl.dll, ARM64X, and its i686 build; opengl/README.md). Windows asks
+; the screen's adapter, and the HyperWin screen (an indirect display) passes the question to its render adapter.
+[Hw.GL]
+hwgl.dll,,,0x100
+hwgl_x86.dll,,,0x100
 
 [Install.NT.Services]
 AddService = hwgpuw, 0x00000002, Hw.Service
@@ -69,6 +78,12 @@ HKR,,VulkanDriverNameWow,0,"%13%\vulkan_hwgpu_x86.json"
 HKR,,UserModeDriverName,0x00010000,"%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll","%13%\hwd3d_umd.dll"
 HKR,,UserModeDriverNameWow,0x00010000,"%13%\hwd3d_umd_x86.dll","%13%\hwd3d_umd_x86.dll","%13%\hwd3d_umd_x86.dll","%13%\hwd3d_umd_x86.dll"
 HKR,,InstalledDisplayDrivers,0x00010000,"hwd3d_umd"
+HKR,,OpenGLDriverName,0,"%13%\hwgl.dll"
+HKR,,OpenGLVersion,0x00010001,1
+HKR,,OpenGLFlags,0x00010001,1
+HKR,,OpenGLDriverNameWow,0,"%13%\hwgl_x86.dll"
+HKR,,OpenGLVersionWow,0x00010001,1
+HKR,,OpenGLFlagsWow,0x00010001,1
 
 [Strings]
 Mfg  = "HyperWin"
