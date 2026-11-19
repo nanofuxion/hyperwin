@@ -15,6 +15,9 @@
 //
 // BC textures: Vortek decodes BC1 to BC5 on the CPU. bcn_layer, loaded under this wrapper,
 // decodes BC1 to BC7 on the GPU instead (see bcn.cpp for why copy2 is turned into copy).
+#include <sys/system_properties.h>
+#include <atomic>
+#include <cstdio>
 #include <string.h>
 #include <android/log.h>
 
@@ -384,6 +387,26 @@ VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderSta
             s.pNext = mi->pNext;
         } else {
             continue;  // nothing to look at; passed on as written
+        }
+        // Debugging a shader the phone's compiler chokes on: `setprop debug.hwgpu.spvdump 1` writes every
+        // stage of every graphics pipeline to $HWGPU_VK_CACHE_DIR/spv-<n>-<stage>.spv before it is built.
+        {
+            static int on = -1;
+            static std::atomic<uint32_t> count{0};
+            if (on < 0) {
+                char v[92] = "";
+                __system_property_get("debug.hwgpu.spvdump", v);
+                on = v[0] == '1';
+            }
+            const char* dir = getenv("HWGPU_VK_CACHE_DIR");
+            if (on && dir && code && size) {
+                char path[512];
+                snprintf(path, sizeof path, "%s/spv-%04u-%x.spv", dir, count++, unsigned(s.stage));
+                if (FILE* f = fopen(path, "wb")) {
+                    fwrite(code, 1, size, f);
+                    fclose(f);
+                }
+            }
         }
         if (!t.module) {
             t.code = static_cast<uint32_t*>(malloc(size));

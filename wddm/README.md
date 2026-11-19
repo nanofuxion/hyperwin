@@ -1030,3 +1030,12 @@ screen the only one once (`dispinfo only \\.\DISPLAYn` or `dispset` from the des
   read). That takes the phone's GPU process down, and with it every program's device for a few seconds;
   until it restarts, Direct3D 9 answers `NOTAVAILABLE` again. `d3d9test` reads back black. Next: dump
   that SPIR-V (the Vortek shim sits in the path), find the construct, and work around it or fall back.
+- The crashing shader is captured: `setprop debug.hwgpu.spvdump 1` makes the Vortek hook write every
+  pipeline stage to the app's `cache/shaders/spv-<n>-<stage>.spv` (`gpu/host/icd/vortek.cpp`). The pair
+  that kills Mali's compiler is DXVK's fixed-function vertex shader (43 KB, 151 access chains, a storage
+  buffer with a runtime array of matrices, 20 spec constants) and a small fragment shader, kept in
+  `gpu/host/icd/samples/`. `spirv-val` accepts both. Which construct Mali chokes on is not found yet.
+- With Vortek switched off in the app the phone's GPU process crashes at once in a loop (null read at
+  0x28), so that is no way to test. After that try the rebuilt spare's desktop stayed black even with
+  Vortek back on: Windows lists the HyperWin screen as attached and primary, but the screen driver gets
+  "commit modes: 0 paths" and no swap chain. Not solved; tests through the agent still run.
