@@ -921,3 +921,20 @@ The HyperWin GPU now shows the desktop on the phone, with nothing else drawing i
   stages, shader model 3), 3 (40 formats), 6, 34, then 4 (the 40 `FORMATOP`s, 800 bytes) and 7, and
   never reaches `CreateDevice`. `X8R8G8B8` carries display-mode and 3D-acceleration ops. The runtime
   rejects the adapter on some check we do not see yet.
+
+#### Looking inside Windows' Direct3D 9 runtime (2026-11-19)
+
+`guest/tools/dbgrun.c` starts a program under Windows' own debugger engine (System32\dbgeng.dll, no
+debugger install needed) and runs commands at the first stop and at each later stop (`wt` works on
+ARM64). Microsoft's public symbols for the exact `d3d9.dll` are fetched on the Mac by the CodeView GUID
+(`curl` from msdl.microsoft.com, see `/tmp`-style script in this section's history) and pushed to
+`C:\sym\d3d9.pdb\<GUID><age>\d3d9.pdb`. The debugger on the machine cannot download them, so point
+`_NT_SYMBOL_PATH` at that one folder (a `srv*` store needs a `pingme.txt` too).
+
+What it showed: `Direct3DCreate9` -> `CEnum::CEnum` -> `FetchDirectDrawData` -> `D3D9CreateDirectDrawObject`
+-> `CreateDeviceLHDDI` opens our driver and `QueryLHDDICaps` makes the ten `GetCaps` calls. Both return
+success. But later `CEnum::CheckDeviceType` calls `GetAdapterCaps(0, HAL)`, which succeeds and hands back
+a record that is entirely zero, so `IsSupportedOp` finds no format table and `D3DERR_NOTAVAILABLE` follows.
+`CEnum::FillInCaps` is never reached. So the runtime has the answers but never stores them for the HAL
+device: some check between `QueryLHDDICaps` and the adapter table rejects it. Next: trace from
+`FetchDirectDrawData`'s return into `CEnum::CEnum` (`wt -l 2` after it) with the symbols.

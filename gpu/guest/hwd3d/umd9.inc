@@ -195,7 +195,7 @@ static void load_caps(Adapter *a)
 static HRESULT APIENTRY GetCaps(HANDLE ha, const D3DDDIARG_GETCAPS *g)
 {
     Adapter *a = static_cast<Adapter *>(ha);
-    D9LOG("hwd3d_umd: Direct3D 9 GetCaps %u, %u bytes\n", (unsigned)g->Type, g->DataSize);
+    D9LOG("hwd3d_umd: Direct3D 9 GetCaps %u, %u bytes, adapter %p, info %p\n", (unsigned)g->Type, g->DataSize, (void *)a, (const void *)g->pInfo);
     if (g->pData && g->DataSize) memset(g->pData, 0, g->DataSize);
     switch (g->Type) {
     case D3DDDICAPS_GETD3D9CAPS:
