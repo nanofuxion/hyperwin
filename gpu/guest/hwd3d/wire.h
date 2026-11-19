@@ -90,12 +90,20 @@ static void connect_channel(void)
     DWORD got = 0;
     HANDLE dev = INVALID_HANDLE_VALUE;
     static struct hww adapter;
-    if (g_adapter || hww_open(&adapter)) {
-        struct hww_open wo;
+    struct hww_open wo;
+    int opened = g_adapter && hww_open_channel(&adapter, &wo) >= 0;
+    if (!opened && g_adapter) {   /* the adapter was replaced under us (a driver update): open the new one */
+        hww_close(&adapter);
+        g_adapter = NULL;
+    }
+    if (!opened && hww_open(&adapter)) {
         if (hww_open_channel(&adapter, &wo) < 0) {
-            if (!g_adapter) hww_close(&adapter);
+            hww_close(&adapter);
             return;
         }
+        opened = 1;
+    }
+    if (opened) {
         o.chan = wo.chan;
         o.slot = wo.slot;
         o.generation = wo.generation;
@@ -142,11 +150,20 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
 /* The phone's GPU process restarted (a driver swap, or it was stopped): every object on the old
  * channel is gone and the devices on it are removed. A program that makes a new device, such as the
  * screen driver or DWM rebuilding, gets a new channel. The old one stays mapped, unused. */
+/* A driver update takes the channel's memory away from the process: reading it then would fault. */
+static int chan_alive(void)
+{
+    struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
+    MEMORY_BASIC_INFORMATION mi;
+    if (!VirtualQuery(c, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+    return hwgpu_alive(c, g_gen);
+}
+
 static void reconnect_if_lost(void)
 {
-    if (!g_ok || hwgpu_alive(hwgpu_chan_ctl(g_chan), g_gen)) return;
+    if (!g_ok || chan_alive()) return;
     AcquireSRWLockExclusive(&g_lock);
-    if (!hwgpu_alive(hwgpu_chan_ctl(g_chan), g_gen)) {
+    if (!chan_alive()) {
         hlog("hwd3d: the phone's GPU restarted, opening a new channel\n");
         g_ok = 0;
         g_stage = NULL;

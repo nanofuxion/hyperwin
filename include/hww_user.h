@@ -85,6 +85,44 @@ static inline LONG hww_call(struct hww *w, struct hww_escape *e)
     return e->status;
 }
 
+/* A driver update stops the adapter while programs still hold its mappings, and the kernel driver takes
+ * them away. A thread reading one then would fault. Each mapping is remembered, and a fault inside one
+ * gets fresh zeroed memory there instead: a zeroed channel reads as closed (generation 0), so the
+ * program sees its device lost and opens a new channel. */
+#define HWW_GUARDED 64
+static struct { uintptr_t base, end; } hww_guarded[HWW_GUARDED];
+static LONG hww_nguarded;
+
+static LONG CALLBACK hww_fault(EXCEPTION_POINTERS *ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || ep->ExceptionRecord->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    LONG n = hww_nguarded < HWW_GUARDED ? hww_nguarded : HWW_GUARDED;
+    for (LONG i = 0; i < n; i++) {
+        if (at < hww_guarded[i].base || at >= hww_guarded[i].end) continue;
+        void *page = (void *)(at & ~(uintptr_t)0xfff);
+        MEMORY_BASIC_INFORMATION mi;
+        if (VirtualAlloc(page, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) ||
+            (VirtualQuery(page, &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE))
+            return EXCEPTION_CONTINUE_EXECUTION;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static inline void hww_guard(uint64_t user)
+{
+    MEMORY_BASIC_INFORMATION mi;
+    if (!user || !VirtualQuery((void *)(uintptr_t)user, &mi, sizeof mi)) return;
+    static LONG installed;
+    if (!InterlockedExchange(&installed, 1)) AddVectoredExceptionHandler(1, hww_fault);
+    LONG i = InterlockedIncrement(&hww_nguarded) - 1;
+    if (i >= HWW_GUARDED) return;
+    hww_guarded[i].base = (uintptr_t)mi.AllocationBase;
+    hww_guarded[i].end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+}
+
 /* A channel for this process, as IOCTL_HWGPU_OPEN gives on the legacy driver. */
 static inline LONG hww_open_channel(struct hww *w, struct hww_open *out)
 {
@@ -92,7 +130,10 @@ static inline LONG hww_open_channel(struct hww *w, struct hww_open *out)
     memset(&e, 0, sizeof e);
     e.op = HWW_ESC_OPEN;
     LONG st = hww_call(w, &e);
-    if (st >= 0) *out = e.u.open;
+    if (st >= 0) {
+        *out = e.u.open;
+        hww_guard(e.u.open.chan);
+    }
     return st;
 }
 
@@ -105,7 +146,10 @@ static inline LONG hww_map(struct hww *w, uint32_t slot, uint64_t offset, uint64
     e.u.map.offset = offset;
     e.u.map.size = size;
     LONG st = hww_call(w, &e);
-    if (st >= 0) *user = e.u.map.user;
+    if (st >= 0) {
+        *user = e.u.map.user;
+        hww_guard(e.u.map.user);
+    }
     return st;
 }
 
