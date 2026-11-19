@@ -35,6 +35,7 @@ hwgl_x86.dll      = 1
 
 [Hw.NTarm64]
 %Desc% = Install, Root\HwGpuAdapter
+%Desc% = Install, ACPI\HWGP0001
 
 [Install.NT]
 FeatureScore = FB

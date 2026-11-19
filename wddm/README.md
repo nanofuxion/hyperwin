@@ -882,3 +882,16 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
   screen, and what that costs before phase 6.
 - Whether anti-cheat that refuses test signing matters for the games you
   want. If so, the old direct path stays available beside the adapter.
+
+### Screen half, state at the end of 2026-11-19
+
+- Added `FlipOnVSyncMmIo` and `MaxQueuedFlipOnVSync` caps (screen half only), and `DxgkDdiPresent` now
+  accepts a flip with an empty buffer. DWM's frames now present (`present of primary ...: S_OK`) but the
+  phone still shows the logon screen only: `DxgkCbSynchronizeExecution` fails here, which Windows allows
+  only for an adapter with an interrupt line, so flips are not completed and the picture stalls.
+- Fix in progress: `guest/efi/gpu_ssdt.asl` describes the GPU as `ACPI\HWGP0001` with an interrupt
+  (GSIV 63) in the firmware's tables (`cpu_acpi.c`, built by `tools/efi/build-avf-compat.sh`),
+  `hwgpuw.inf` lists that id, and `gpu-install.cmd` prefers it over `Root\HwGpuAdapter`. The device
+  shows up in Windows, but its driver install ends in `CM_PROB_FAILED_INSTALL`. Not yet understood
+  (the INF probably needs an interrupt resource section; the driver must then connect it).
+- The spare is left with `Display` = 0 and the root-device install, which boots and renders.

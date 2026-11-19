@@ -139,6 +139,7 @@ static void report(const WCHAR *what, ULONG value)
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING path, name;
     ULONG disp;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;   /* flips can come at interrupt level: no registry there */
     RtlInitUnicodeString(&path, g.guard_path);
     InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     if (!NT_SUCCESS(ZwCreateKey(&key, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp))) return;
@@ -154,7 +155,7 @@ NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(ULONG cls, PVOID buf, ULONG len
 static BOOLEAN g_mms1_seen;
 static void report_bases(void)
 {
-    if (g_mms1_seen) return;
+    if (g_mms1_seen || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
     struct mod { HANDLE section; PVOID mapped, base; ULONG size, flags; USHORT order, init, count, name_at; UCHAR path[256]; };
     ULONG len = 0;
     ZwQuerySystemInformation(11, NULL, 0, &len);
@@ -857,6 +858,12 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps->PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps->SupportNonVGA = FALSE;
+    if (d.on) {
+        /* Flips: the new address is taken at once and reported at the next vsync. Without these
+         * caps DWM made a primary, set it as the screen's and gave it up again, over and over. */
+        caps->FlipCaps.FlipOnVSyncMmIo = 1;
+        caps->MaxQueuedFlipOnVSync = 1;
+    }
     return STATUS_SUCCESS;
 }
 

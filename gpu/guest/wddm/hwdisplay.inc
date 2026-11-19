@@ -628,9 +628,11 @@ static NTSTATUS NTAPI HwdOpenAllocation_impl(const HANDLE hDevice, const DXGKARG
 static NTSTATUS NTAPI HwdPresent_impl(const HANDLE hContext, DXGKARG_PRESENT *pr)
 {
     (void)hContext;
-    if (pr->DmaSize < 16) return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
-    RtlZeroMemory(pr->pDmaBuffer, 16);
-    pr->pDmaBuffer = (UCHAR *)pr->pDmaBuffer + 16;
+    /* A flip comes with no room in its buffer, and needs none: SetVidPnSourceAddress does the work. */
+    if (pr->DmaSize >= 16) {
+        RtlZeroMemory(pr->pDmaBuffer, 16);
+        pr->pDmaBuffer = (UCHAR *)pr->pDmaBuffer + 16;
+    }
     if (pr->pDmaBufferPrivateData && pr->DmaBufferPrivateDataSize >= sizeof(struct hww_marker)) {
         RtlZeroMemory(pr->pDmaBufferPrivateData, sizeof(struct hww_marker));
         pr->pDmaBufferPrivateData = (UCHAR *)pr->pDmaBufferPrivateData + sizeof(struct hww_marker);
