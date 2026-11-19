@@ -1039,3 +1039,7 @@ screen the only one once (`dispinfo only \\.\DISPLAYn` or `dispset` from the des
   0x28), so that is no way to test. After that try the rebuilt spare's desktop stayed black even with
   Vortek back on: Windows lists the HyperWin screen as attached and primary, but the screen driver gets
   "commit modes: 0 paths" and no swap chain. Not solved; tests through the agent still run.
+- Getting the desktop back when the screen driver logs "commit modes: 0 paths" and never gets a swap
+  chain (seen after DWM had crashed in a loop): set `IddRender` = 0, `pnputil /restart-device
+  ROOT\DISPLAY\0000` (frames come back, read back by the CPU), then `IddRender` = 1 and restart the device
+  again (frames go to the phone's screen directly). Restarts of Windows alone did not help.
