@@ -692,6 +692,26 @@ Install by hand for now: put `build/hwidd/pkg` in `C:\HyperWin\gpu\hwidd` and ru
 - Still to do: make the HyperWin screen the main display without the manual step, install it by default,
   and then the zero-copy steps above. The boot screen and recovery still come from Basic Display.
 
+#### DWM on the HyperWin GPU: first try (2026-11-19, spare machine)
+
+Settings can now come from `HKLM\SOFTWARE\HyperWin\Gpu` as well as the environment (for dwm.exe and
+WUDFHost.exe): `HWD3D_UMDLOG` (a folder ending in `\` gives one log per process), `HWD3D_UMDCALLS`,
+`HWD3D_SYSTEM` (`1`, or exe names: `dwm.exe,WUDFHost.exe`), and `IddRender` = 1 for the screen driver to
+ask for the HyperWin GPU.
+
+- With every Windows program allowed, Explorer, the Start menu, search and DWM each opened a device on the
+  phone, Android ran out of memory and killed the GPU process (lowmemorykiller: "device is low on swap"),
+  and DWM saw `DXGI_ERROR_DEVICE_REMOVED`. Allowing only dwm.exe and WUDFHost.exe avoids it.
+- Then DWM runs on the HyperWin GPU without errors, but the screen gets no swap chain: the indirect
+  display's swap chain is made of surfaces DWM shares with WUDFHost.exe, and those need what is not built
+  yet: kernel allocations for shared resources (the user-mode driver calls the allocate callback, the
+  kernel driver keeps the record in render-only mode too), `OpenResource` in the user-mode driver, and on
+  the phone one image used by two programs' devices.
+- DXVK (3.1.1 native) shares resources only through Windows handles. On the phone the choice is between
+  exporting and importing memory between separate devices (Vulkan external memory, each program keeps its
+  own device) and one Vulkan device under all programs' D3D11 devices (DXVK's `importImage`, as its D3D11on12
+  path does). Not decided yet.
+
 ## Things to check early
 
 - Which DXGK interface version Windows 11 on ARM accepts from a render-only

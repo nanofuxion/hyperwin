@@ -26,9 +26,9 @@ FLAGS=(-O2 -std=c++17 -fms-extensions -Wno-everything -include "$HERE/mingw-shim
        -DUMDF_MINIMUM_VERSION_REQUIRED=25 -DIDDCX_VERSION_MAJOR=1 -DIDDCX_VERSION_MINOR=${IDDV#1.} -DIDDCX_MINIMUM_VERSION_REQUIRED=4
        -I"$WORK/wdf-umdf" -I"$IDD" -I"$HERE" -I"$ROOT/include" -I"$ROOT/gpu/include")
 for f in fxstub hwidd; do "$T/aarch64-w64-mingw32-clang++" "${FLAGS[@]}" -c "$HERE/$f.cpp" -o "$OUT/$f.o"; done
-"$T/aarch64-w64-mingw32-clang++" -shared -static -o "$OUT/pkg/hwidd.dll" "$OUT/fxstub.o" "$OUT/hwidd.o" -ld3d11 -ldxgi \
+"$T/aarch64-w64-mingw32-clang++" -shared -static -o "$OUT/pkg/hwidd.dll" "$OUT/fxstub.o" "$OUT/hwidd.o" -ld3d11 -ldxgi -ladvapi32 \
   -Wl,--exclude-all-symbols -Wl,--export-all-symbols:no 2>/dev/null || \
-"$T/aarch64-w64-mingw32-clang++" -shared -static -o "$OUT/pkg/hwidd.dll" "$OUT/fxstub.o" "$OUT/hwidd.o" -ld3d11 -ldxgi
+"$T/aarch64-w64-mingw32-clang++" -shared -static -o "$OUT/pkg/hwidd.dll" "$OUT/fxstub.o" "$OUT/hwidd.o" -ld3d11 -ldxgi -ladvapi32
 "$T/llvm-strip" "$OUT/pkg/hwidd.dll"
 H=$(shasum -a 256 "$OUT/pkg/hwidd.dll" | cut -c1-8)
 sed "s/^DriverVer *=.*/DriverVer   = 11\/18\/2026,1.0.$((0x$(echo $H | cut -c1-4))).$((0x$(echo $H | cut -c5-8)))/" "$HERE/hwidd.inf" > "$OUT/pkg/hwidd.inf"

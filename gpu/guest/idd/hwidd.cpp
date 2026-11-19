@@ -319,6 +319,9 @@ static IDDCX_MONITOR g_monitor;
 // fails today and leaves the screen without frames.
 static void choose_render_adapter(IDDCX_ADAPTER adapter)
 {
+    // HKLM\SOFTWARE\HyperWin\Gpu\IddRender = 1 asks for the HyperWin GPU instead, for bringing that up.
+    DWORD gpu = 0, len = sizeof gpu;
+    RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\HyperWin\\Gpu", L"IddRender", RRF_RT_REG_DWORD, nullptr, &gpu, &len);
     IDXGIFactory1 *f = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&f))) return;
     IDXGIAdapter1 *a = nullptr;
@@ -326,7 +329,8 @@ static void choose_render_adapter(IDDCX_ADAPTER adapter)
         DXGI_ADAPTER_DESC1 d;
         a->GetDesc1(&d);
         a->Release();
-        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+        bool ours = !wcsncmp(d.Description, L"HyperWin GPU", 12);
+        if (gpu ? ours : (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
             IDARG_IN_ADAPTERSETRENDERADAPTER in = {};
             in.PreferredRenderAdapter = d.AdapterLuid;
             IddCxAdapterSetRenderAdapter(adapter, &in);

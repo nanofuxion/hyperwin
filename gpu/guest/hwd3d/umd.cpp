@@ -19,6 +19,50 @@
 
 /* ---- logging ---- */
 
+/* ---- settings: an environment variable, or the same name under HKLM\SOFTWARE\HyperWin\Gpu for programs
+ * whose environment cannot be set (dwm.exe, WUDFHost.exe). Returns the length, 0 when unset. ---- */
+static DWORD setting(const char *name, char *out, DWORD size)
+{
+    DWORD n = GetEnvironmentVariableA(name, out, size);
+    if (n && n < size) return n;
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\HyperWin\\Gpu", 0, KEY_READ, &k) != ERROR_SUCCESS) return 0;
+    DWORD type = 0, len = size;
+    LONG r = RegQueryValueExA(k, name, NULL, &type, (BYTE *)out, &len);
+    RegCloseKey(k);
+    if (r != ERROR_SUCCESS || !len) return 0;
+    if (type == REG_DWORD && len == 4) {
+        DWORD v = *(DWORD *)out;
+        if (!v) return 0;
+        return (DWORD)snprintf(out, size, "%lu", (unsigned long)v);
+    }
+    out[size - 1] = 0;
+    return (DWORD)strlen(out);
+}
+
+/* The log file: HWD3D_UMDLOG names it; when it names a folder (ends in \), each process gets its own. */
+static bool log_path(char *path, DWORD size)
+{
+    static char cached[MAX_PATH];
+    static int state;   /* 0 unknown, 1 none, 2 cached */
+    if (state == 1) return false;
+    if (state == 0) {
+        DWORD n = setting("HWD3D_UMDLOG", cached, sizeof cached);
+        if (!n) { state = 1; return false; }
+        if (cached[n - 1] == '\\') {
+            char exe[MAX_PATH];
+            DWORD m = GetModuleFileNameA(NULL, exe, sizeof exe);
+            const char *base = exe + m;
+            while (base > exe && base[-1] != '\\') base--;
+            snprintf(cached + n, sizeof cached - n, "umd-%s-%lu.log", base, (unsigned long)GetCurrentProcessId());
+        }
+        state = 2;
+    }
+    snprintf(path, size, "%s", cached);
+    return true;
+}
+
+
 static void ulog(const char *fmt, ...)
 {
     char s[512];
@@ -30,7 +74,7 @@ static void ulog(const char *fmt, ...)
     if (getenv("HWD3D_LOG")) fputs(s, stderr);
     /* HWD3D_UMDLOG=<file>: the same lines in a file, for programs whose stderr goes nowhere. */
     char path[MAX_PATH];
-    if (GetEnvironmentVariableA("HWD3D_UMDLOG", path, sizeof path) && path[0]) {
+    if (log_path(path, sizeof path)) {
         HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             DWORD n;
@@ -43,8 +87,10 @@ static void ulog(const char *fmt, ...)
 /* One line per call of an entry written here, when HWD3D_UMDLOG asks for the log. */
 static void ulog_call(const char *name)
 {
-    char v[8];
-    if (GetEnvironmentVariableA("HWD3D_UMDCALLS", v, sizeof v)) ulog("hwd3d_umd: %s\n", name);
+    static int on = -1;
+    char v[16];
+    if (on < 0) on = setting("HWD3D_UMDCALLS", v, sizeof v) ? 1 : 0;
+    if (on) ulog("hwd3d_umd: %s\n", name);
 }
 
 /* ---- stubs: every table entry has one ---- */
@@ -1983,14 +2029,25 @@ static SIZE_T APIENTRY a_CalcPrivateDeviceSize(D3D10DDI_HADAPTER, const D3D10DDI
 /* Until this adapter shows the desktop (wddm/README.md, phase 6), Windows' own programs (the shell, DWM,
  * search, the start menu) are left to the software renderer as before. Each device here holds one of
  * twenty channels to the phone, and there are dozens of them. A program in Windows' folder is one. */
+/* Windows' own programs (under %SystemRoot%) get Windows' software renderer: each device here costs a
+ * channel and memory on the phone, and Explorer, the Start menu and the like would hold one each.
+ * HWD3D_SYSTEM lets some in: "1" for all, or exe names separated by commas ("dwm.exe,WUDFHost.exe"). */
 static bool windows_own_program()
 {
     WCHAR exe[MAX_PATH], win[MAX_PATH];
-    char allow[8];
-    if (GetEnvironmentVariableA("HWD3D_SYSTEM", allow, sizeof allow)) return false;
     UINT n = GetWindowsDirectoryW(win, MAX_PATH);
     DWORD m = GetModuleFileNameW(NULL, exe, MAX_PATH);
-    return n && m > n && !_wcsnicmp(exe, win, n);
+    if (!(n && m > n && !_wcsnicmp(exe, win, n))) return false;
+    char allow[256];
+    if (!setting("HWD3D_SYSTEM", allow, sizeof allow)) return true;
+    if (!strcmp(allow, "1")) return false;
+    const WCHAR *base = exe + m;
+    while (base > exe && base[-1] != L'\\') base--;
+    char name[MAX_PATH];
+    WideCharToMultiByte(CP_ACP, 0, base, -1, name, sizeof name, NULL, NULL);
+    for (char *tok = strtok(allow, ","); tok; tok = strtok(NULL, ","))
+        if (!_stricmp(tok, name)) return false;
+    return true;
 }
 
 /* Sub-objects are the video functions; the driver has none, and the runtime calls this to find out. */
@@ -2158,7 +2215,7 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *p)
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
 {
     char v[8];
-    if (reason == DLL_PROCESS_ATTACH && GetEnvironmentVariableA("HWD3D_UMDLOG", v, sizeof v)) SetUnhandledExceptionFilter(on_crash);
+    if (reason == DLL_PROCESS_ATTACH && log_path(v, sizeof v)) SetUnhandledExceptionFilter(on_crash);
     if (reason == DLL_PROCESS_DETACH && g_chan) {
         const struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
         ulog("hwd3d_umd: submits to the phone %llu, to Windows %llu\n", (unsigned long long)c->submits_to_phone,
