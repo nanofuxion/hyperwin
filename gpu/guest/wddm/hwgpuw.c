@@ -869,8 +869,7 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     if (d.on) {
         /* Flips: the new address is taken at once and reported at the next vsync. Without these
          * caps DWM made a primary, set it as the screen's and gave it up again, over and over. */
-        caps->FlipCaps.FlipOnVSyncMmIo = 1;
-        caps->MaxQueuedFlipOnVSync = 1;
+        /* (no FlipCaps: flips then go through DxgkDdiPresent as DMA buffers, which need no interrupt level) */
     }
     return STATUS_SUCCESS;
 }

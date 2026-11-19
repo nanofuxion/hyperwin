@@ -895,3 +895,24 @@ about 3 s after the restart, and `dxtest 11` passed afterwards.
   shows up in Windows, but its driver install ends in `CM_PROB_FAILED_INSTALL`. Not yet understood
   (the INF probably needs an interrupt resource section; the driver must then connect it).
 - The spare is left with `Display` = 0 and the root-device install, which boots and renders.
+
+### Screen half works (2026-11-19, end of day)
+
+The HyperWin GPU now shows the desktop on the phone, with nothing else drawing it.
+
+- The earlier stall came from the flip caps. Without `FlipOnVSyncMmIo` (and with `DxgkDdiPresent` accepting
+  an empty buffer) Windows presents through DMA buffers, needs no interrupt level, and each flip of a
+  primary reaches the phone through the user-mode driver's `HWD3D_OP_SCANOUT`. The ACPI interrupt
+  device is not needed and is off in the firmware (`HWGPU_ACPI_DEVICE`).
+- Windows keeps Basic Display as the primary while the GPU is only an extra 800x600 screen. `guest/tools/
+  dispset.c` makes the GPU's screen the only one: `dispset \\.\DISPLAY2 1950 900`. Windows remembers
+  it across restarts. With `Display` = 1 the indirect display (hwidd) creates no monitor.
+- Checked on the spare: a restart comes back with the desktop on the phone (a notepad window opens and
+  shows), `dispinfo` lists the GPU's adapter as the screen's adapter, and the byte counters show 0
+  bytes copied either way.
+- `Display` stays 0 by default and `dispset` is by hand for now: a fresh machine keeps the indirect
+  display. Making it the default needs the install to run `dispset` once and a fallback if the GPU's
+  screen fails.
+- Direct3D 9 now sees our adapter on the screen: `Direct3D9` lists "HyperWin GPU", the display mode is
+  right, and the runtime opens our driver and reads its caps and 24 formats, but `CheckDeviceType` for
+  X8R8G8B8 still returns `D3DERR_NOTAVAILABLE`. Next: find which of the runtime's checks fails.
