@@ -938,3 +938,12 @@ a record that is entirely zero, so `IsSupportedOp` finds no format table and `D3
 `CEnum::FillInCaps` is never reached. So the runtime has the answers but never stores them for the HAL
 device: some check between `QueryLHDDICaps` and the adapter table rejects it. Next: trace from
 `FetchDirectDrawData`'s return into `CEnum::CEnum` (`wt -l 2` after it) with the symbols.
+- **Found: why the runtime disabled the adapter (2026-11-19).** With `dbgrun` and the symbols,
+  `D3DRecordHRESULT` showed the runtime's own message: "Driver disabled because it reported both
+  D3DFMT_R5G6B5 and D3DFMT_X1R5G5B5 as a display mode". We marked 22, 23, 24 and 35 as display modes.
+  Now X1R5G5B5 (24) is not one, so that check passes (Fetch no longer records an error). Direct3D 9 then
+  still returns `NOTAVAILABLE` from `CheckDeviceType`: its adapter-format table (built by the runtime
+  from the driver's format list in `FetchDirectDrawData`) holds X8R8G8B8 with only the display-mode op
+  (0x400) and not 3D acceleration (0x800), which `CheckDeviceType` wants (0xc00). Next: find where that
+  table gets its ops (the loop at `FetchDirectDrawData+0x944..0xa44` is not even run for our driver;
+  the entries are made at +0x828 with base ops 1, 5 or 0x105 from `CPixel::ConvertFromOldFormat`).

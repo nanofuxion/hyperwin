@@ -146,8 +146,8 @@ static void load_formats(Adapter *a)
         if (x & HWD3D9_FMT_SRGBWRITE) ops |= FORMATOP_SRGBWRITE;
         if (x & HWD3D9_FMT_VTX_TEX) ops |= FORMATOP_VERTEXTEXTURE;
         /* The screen can show these whatever the phone's mode list says (it has no display of its own). */
-        bool display = cand[i] == 22 || cand[i] == 23 || cand[i] == 24 || cand[i] == 35;
-        if ((x & HWD3D9_FMT_DISPLAY) || (display && (x & HWD3D9_FMT_RT))) ops |= FORMATOP_DISPLAYMODE | FORMATOP_3DACCELERATION;
+        bool display = cand[i] == 22 || cand[i] == 23 || cand[i] == 35;   /* not X1R5G5B5 too: the runtime disables a driver that offers both 16-bit display modes */
+        if (cand[i] != 24 && ((x & HWD3D9_FMT_DISPLAY) || (display && (x & HWD3D9_FMT_RT)))) ops |= FORMATOP_DISPLAYMODE | FORMATOP_3DACCELERATION;
         if (x & HWD3D9_FMT_AUTOGEN) ops |= FORMATOP_AUTOGENMIPMAP;
         if (!(x & HWD3D9_FMT_BLEND) && (x & HWD3D9_FMT_RT)) ops |= FORMATOP_NOALPHABLEND;
         if (!(x & HWD3D9_FMT_FILTER) && (x & HWD3D9_FMT_TEXTURE)) ops |= FORMATOP_NOFILTER;
