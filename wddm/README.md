@@ -1002,3 +1002,13 @@ Cost: the whole of a channel's shared ranges is flushed each time (about 8 GB pe
 0.45 s of the serving thread). AIO on the rebuilt spare shows Vulkan 106 and OpenGL 58 FPS; that machine
 has no working screen path, so the earlier 494 and 223 are not a fair baseline, and the cost is not
 measured cleanly yet. Next: flush only what a submit or read-back can have touched.
+
+With the spare's screen working again (same day) the cost is measured: AIO Vulkan 485 FPS (494 before the
+fix), OpenGL 190 (223), Direct3D 11 240 (215). The 106 and 58 above were that machine without a GPU
+desktop. On the rebuilt machine: dxtest 11 as ARM64, x64 and x86, gltest ARM64 and x64, vktest ARM64 and
+x64 through `vulkan-1.dll` with no Khronos key all PASS, the three copy counters read 0, and dxdiag lists
+"HyperWin GPU" and "HyperWin screen" as WDDM 1.3.
+
+The default install now also sets `HWD3D_SYSTEM` = `dwm.exe,WUDFHost.exe` and `IddRender` = 1 when they are
+not set, so a new machine puts its desktop on the phone's GPU. Windows still has to make the HyperWin
+screen the only one once (`dispinfo only \\.\DISPLAYn` or `dispset` from the desktop session).

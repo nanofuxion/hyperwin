@@ -56,6 +56,10 @@ for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwidd\hwidd.inf SHA256 
 set "OLDI="
 if exist %G%\hwidd\installed.sha set /p OLDI=<%G%\hwidd\installed.sha
 if defined NEWI if not "%NEWI%"=="%OLDI%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwidd Root\HwIdd && (echo %NEWI%> %G%\hwidd\installed.sha)
+rem The desktop on the phone's GPU (wddm/README.md): DWM and the screen driver use the HyperWin GPU, and the
+rem screen driver asks for it. Set once; a value someone changed is left alone.
+reg query HKLM\SOFTWARE\HyperWin\Gpu /v HWD3D_SYSTEM >nul 2>&1 || reg add HKLM\SOFTWARE\HyperWin\Gpu /v HWD3D_SYSTEM /t REG_SZ /d dwm.exe,WUDFHost.exe /f >nul
+reg query HKLM\SOFTWARE\HyperWin\Gpu /v IddRender >nul 2>&1 || reg add HKLM\SOFTWARE\HyperWin\Gpu /v IddRender /t REG_DWORD /d 1 /f >nul
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 rem Vulkan finds the driver through the adapter's VulkanDriverName. The global key is only for a
 rem machine that has no adapter (wddm/README.md).
