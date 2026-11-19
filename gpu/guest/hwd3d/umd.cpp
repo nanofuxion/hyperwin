@@ -28,7 +28,7 @@ static DWORD setting(const char *name, char *out, DWORD size)
     DWORD n = GetEnvironmentVariableA(name, out, size);
     if (n && n < size) return n;
     HKEY k;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\HyperWin\\Gpu", 0, KEY_READ, &k) != ERROR_SUCCESS) return 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\HyperWin\\Gpu", 0, KEY_READ | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS) return 0;
     DWORD type = 0, len = size;
     LONG r = RegQueryValueExA(k, name, NULL, &type, (BYTE *)out, &len);
     RegCloseKey(k);

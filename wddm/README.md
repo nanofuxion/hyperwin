@@ -1059,3 +1059,21 @@ screen the only one once (`dispinfo only \\.\DISPLAYn` or `dispset` from the des
 - Open: the 32-bit AIO Direct3D 9 window stays empty (3,000 FPS, so nothing is drawn or shown);
   Direct3D 8 says "could not create a Direct3D 8 device" (32-bit; there is no 64-bit `d3d8.dll` on this
   Windows); the Direct3D 7 and DirectDraw runs show no window.
+
+#### Direct3D 8 (2026-11-19)
+
+Only 32-bit programs can use Direct3D 8 on Windows on ARM (there is no 64-bit `d3d8.dll`). `d3d8.dll` opens
+our Direct3D 9 driver part with interface 8.
+
+- It creates the device first and asks for the caps and formats afterwards; the driver filled its format
+  list only on the caps-first path, so it answered "0 formats". Fixed.
+- Its transformed vertices sit in a system-memory vertex buffer, which has nothing on the phone:
+  `SetStreamSource` now treats such a buffer like a user-memory stream.
+- The driver reads its settings from the 64-bit registry view in 32-bit programs too (no log before).
+- `guest/tools/d3d8test.c` (i686): PASS, green triangle on red read back from the back buffer.
+- The 32-bit AIO Direct3D 9 cube draws (226 FPS). AIO's Direct3D 8 cube still says "could not create a
+  Direct3D 8 device": `CheckDeviceType` answers `NOTAVAILABLE` in `d3d8test` too, though `CreateDevice`
+  with software vertex processing works. Direct3D 7 and DirectDraw show no window yet.
+- Debugging 32-bit programs: `build/dbgrun-x86.exe` (same source, i686) with the 32-bit `d3d8.pdb` and
+  `d3d9.pdb` in one folder as `_NT_SYMBOL_PATH`. Windows Defender removed `aio32.exe` when it was started
+  under the debugger; the spare now has `C:\HyperWin` excluded.

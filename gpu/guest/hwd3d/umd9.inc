@@ -584,6 +584,16 @@ static HRESULT APIENTRY SetStreamSource(HANDLE hd, const D3DDDIARG_SETSTREAMSOUR
 {
     Dev *d = DV(hd);
     if (a->Stream == d->um_stream) d->um_vb = nullptr;
+    /* A vertex buffer in system memory (Direct3D 8 and older keep their transformed vertices in one) has
+     * nothing on the phone: it is drawn like a user-memory stream. */
+    Res *vbr = a->hVertexBuffer ? RS(a->hVertexBuffer) : nullptr;
+    if (vbr && !vbr->h && !vbr->subs.empty() && (vbr->subs[0].sys || !vbr->subs[0].mem.empty())) {
+        const uint8_t *base = vbr->subs[0].sys ? static_cast<const uint8_t *>(vbr->subs[0].sys) : vbr->subs[0].mem.data();
+        d->um_vb = base + a->Offset;
+        d->um_stride = a->Stride;
+        d->um_stream = a->Stream;
+        return S_OK;
+    }
     struct wbuf *b = req(d->h, HWD3D9_STREAM);
     put32(b, a->Stream);
     put32(b, a->hVertexBuffer ? RS(a->hVertexBuffer)->h : 0);
@@ -1153,6 +1163,8 @@ static HRESULT APIENTRY CreateDevice(HANDLE ha, D3DDDIARG_CREATEDEVICE *a)
         ad->caps_ok = SUCCEEDED(hr);
     }
     call_end(&r);
+    /* Direct3D 8 and older create the device first and ask for the caps and formats afterwards. */
+    if (ad->caps_ok && ad->formats.empty()) load_formats(ad);
     if (FAILED(hr) || !h) return FAILED(hr) ? hr : E_FAIL;
     Dev *d = new Dev();
     d->rt = a->hDevice;
