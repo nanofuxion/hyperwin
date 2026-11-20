@@ -1191,3 +1191,10 @@ the open Direct3D 12 problem is the Windows adapter: with `Wddm2` = 1, dxgkrnl s
 (internal error) right after the `DRIVERCAPS` and `PHYSICALADAPTERCAPS` queries (trace: `Add Start Q01 Q15 Stop Remove`).
 PanVK and lavapipe would matter only if a game needs the features the Mali driver lacks (depth bounds, min/max
 filtering, fragment shader interlock, conservative rasterization), which `panvk-ai` notes list.
+
+Variants tried for the `Wddm2` stop (status 0xC00000E5 after the `PHYSICALADAPTERCAPS` query), all with the same result:
+GpuMmu with and without `VirtualAddressingSupported`, the IOMMU model, no kernel-mode command buffer, `NoDmaPatching`,
+no `Render`/`RenderKm`/`Present` entries, the physical adapter handle set. A WDDM 2.0 init version with WDDM 1.3 caps
+stops one query earlier. Two nodes (a separate paging node) hung the boot at a black screen: the crash-loop guard
+let the next start through without the driver. Unknown so far: what dxgkrnl checks after that query. A kernel debugger
+view of dxgkrnl, or the checks of a known-good WDDM 2.0 miniport, would settle it.

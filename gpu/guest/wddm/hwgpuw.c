@@ -927,7 +927,9 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     if (g_w2) {
         caps->WDDMVersion = DXGKDDI_WDDMv2;
-        caps->MemoryManagementCaps.IoMmuSupported = 1;
+        caps->MemoryManagementCaps.GpuMmuSupported = 1;
+        caps->PresentationCaps.SupportKernelModeCommandBuffer = 0;
+        caps->SchedulingCaps.NoDmaPatching = 1;
     }
     caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
     caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -1023,7 +1025,7 @@ static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO 
             pc->NumExecutionNodes = 1;
             pc->PagingNodeIndex = 0;
             pc->DxgkPhysicalAdapterHandle = hAdapter;
-            pc->Flags.IoMmuSupported = 1;
+            pc->Flags.GpuMmuSupported = 1;
         }
         return STATUS_SUCCESS;
     case DXGKQAITYPE_GPUMMUCAPS: {
@@ -1486,6 +1488,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
         /* With a GPU address space there is no patching and no physical submit. */
         init.DxgkDdiPatch = NULL;
         init.DxgkDdiSubmitCommand = NULL;
+        init.DxgkDdiRender = NULL;
+        init.DxgkDdiRenderKm = NULL;
+        init.DxgkDdiPresent = NULL;
     }
     return HwDxgkInitialize(driver, registry, &init);
 }
