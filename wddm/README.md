@@ -1218,3 +1218,16 @@ applied under `Wddm2` = 1: interface and caps at 2.6 (`0xB004`), the power compo
 Not yet tried: a power component (`NUMPOWERCOMPONENTS` = 1 with `POWERCOMPONENTINFO`), the device class (the sample
 is class ComputeAccelerator, ours is System), and `DxgkCbGetDeviceInformation` fields. The default build now compiles
 at the 2.6 headers and was rechecked: `dxtest 11`, `vktest` and `gltest` pass.
+
+### Phase 8 kernel step: the adapter starts at WDDM 2.x (2026-11-20, late)
+
+What stopped it was the flip contract. A WDDM 2.x full adapter must report `FlipOnVSyncMmIo`, `FlipImmediateMmIo`,
+`FlipIndependent` and `MaxQueuedFlipOnVSync` = 1 (found in a public WDDM 2.x miniport and then checked here). With these and
+`MiscCaps.VirtualGpuOnly` = 1 (`Parameters\W2Virtual`) the adapter starts clean: caps, GPU MMU, page table level,
+segment 4, node metadata, process, device and context all get called. But Windows then hides a VirtualGpuOnly adapter from
+programs ("should not be used by Direct3D applications on the host"), so `dxtest 12` still runs on the Basic Render adapter.
+Without `VirtualGpuOnly`, the flip caps send Windows into the display half. With `Display` = 1 the adapter starts, then the
+machine goes down while Windows enumerates VidPN modes (`EnumVidPnCofuncModality`): the last traced call is `HwdEnumVidPn`.
+Next: find why the VidPN enumeration fails under 2.x (view with `-DHWW_TRACE`: `Parameters\Trace2` keeps the last calls),
+or make the render adapter visible some other way. The default stays `Wddm2` = 0 and was rechecked (`dxtest 11`, `vktest`).
+Also: wait 25 s after registry writes before a restart, or they are lost.

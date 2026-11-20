@@ -98,6 +98,7 @@ static void run_synced(PKSYNCHRONIZE_ROUTINE routine, PVOID context)
 
 #include "hwdisplay.inc"
 
+static BOOLEAN g_w2;   /* Parameters\\Wddm2 */
 static struct { ULONG submits, last_submit, last_flags, resets, preempts, sync_runs; } g_diag;
 
 static void *window(void) { return (UCHAR *)g.ring - HWGPU_RING_OFF; }
@@ -196,6 +197,10 @@ static LONG g_trn;
 static void tr(const char *name)
 {
     LONG at = InterlockedExchangeAdd(&g_trn, 0);
+    if (at > (LONG)sizeof g_tr - 64) {   /* keep the last calls: drop the oldest half */
+        RtlMoveMemory(g_tr, g_tr + 256, (SIZE_T)(at - 256));
+        at -= 256;
+    }
     for (ULONG i = 0; name[i] && at < (LONG)sizeof g_tr - 2; i++) g_tr[at++] = name[i];
     g_tr[at++] = ' ';
     g_tr[at] = 0;
@@ -721,6 +726,12 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     RtlZeroMemory(&g.dxgk, sizeof g.dxgk);
     RtlCopyMemory(&g.dxgk, iface, min((SIZE_T)iface->Size, sizeof g.dxgk));
     report_bases();
+    if (g_w2) {
+        DXGK_DEVICE_INFO di;
+        RtlZeroMemory(&di, sizeof di);
+        NTSTATUS gs = g.dxgk.DxgkCbGetDeviceInformation(g.dxgk.DeviceHandle, &di);
+        report(L"DevInfoStatus", (ULONG)gs);
+    }
     if (d.on) hwd_size_from_phone();
     *sources = d.on ? 1 : 0;   /* render-only unless Parameters\Display asks for the screen half */
     *children = d.on ? 1 : 0;
@@ -933,9 +944,16 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->ApertureSegmentCommitLimit = (SIZE_T)HW_HEAP_SIZE;
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     if (g_w2) {
-        caps->WDDMVersion = DXGKDDI_WDDMv2_6;
+        caps->WDDMVersion = DXGKDDI_WDDMv2;
         caps->MemoryManagementCaps.VirtualAddressingSupported = 1;
         caps->MemoryManagementCaps.GpuMmuSupported = 1;
+        /* What the 2.x full-adapter checks ask for, as the compute sample sets them. */
+        caps->SupportPerEngineTDR = 1;
+        caps->FlipCaps.FlipOnVSyncMmIo = 1;
+        caps->FlipCaps.FlipImmediateMmIo = 1;
+        caps->FlipCaps.FlipIndependent = 1;
+        caps->MaxQueuedFlipOnVSync = 1;
+        if (hwd_reg_dword(L"W2Virtual", 0)) caps->MiscCaps.VirtualGpuOnly = 1;   /* starts clean, but Windows hides such an adapter from programs */
         if (hwd_reg_dword(L"W2Kit", 0)) {
             caps->HighestAcceptableAddress.QuadPart = (LONGLONG)-1;
             caps->InternalGpuVirtualAddressRangeStart = 0x1000;
@@ -1119,6 +1137,11 @@ static NTSTATUS NTAPI HwCreateContext(const HANDLE hDevice, DXGKARG_CREATECONTEX
     cc->ContextInfo.DmaBufferPrivateDataSize = 64;     /* room for a marker */
     cc->ContextInfo.AllocationListSize = 256;
     cc->ContextInfo.PatchLocationListSize = 256;
+    if (g_w2) {
+        /* With GPU virtual addresses nothing in a DMA buffer is patched. */
+        cc->ContextInfo.Caps.NoPatchingRequired = 1;
+        cc->ContextInfo.PatchLocationListSize = 0;
+    }
     return STATUS_SUCCESS;
 }
 

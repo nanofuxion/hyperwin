@@ -19,11 +19,34 @@ static int check(const unsigned char* px, const char* api) {
     return ok ? 0 : 1;
 }
 
+
+// dxtest.exe <11|12> [adapter text] (or HWTEST_ADAPTER=<text>) picks the adapter whose name has that text; without it the default adapter is used.
+#include <dxgi.h>
+static IDXGIAdapter* pickAdapter() {
+    char want[64];
+    if (!GetEnvironmentVariableA("HWTEST_ADAPTER", want, sizeof want)) return nullptr;
+    IDXGIFactory1* f = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&f))) return nullptr;
+    IDXGIAdapter* found = nullptr;
+    IDXGIAdapter* a = nullptr;
+    for (UINT i = 0; !found && f->EnumAdapters(i, &a) == S_OK; i++) {
+        DXGI_ADAPTER_DESC d{};
+        a->GetDesc(&d);
+        char name[256];
+        WideCharToMultiByte(CP_ACP, 0, d.Description, -1, name, sizeof name, nullptr, nullptr);
+        printf("adapter %u: %s\n", i, name);
+        if (strstr(name, want)) found = a; else a->Release();
+    }
+    f->Release();
+    return found;
+}
+
 static int test11() {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     D3D_FEATURE_LEVEL fl;
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx);
+    IDXGIAdapter* pick = pickAdapter();
+    HRESULT hr = D3D11CreateDevice(pick, pick ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx);
     printf("D3D11CreateDevice 0x%08lx, feature level 0x%x\n", hr, fl);
     if (FAILED(hr)) return 2;
     IDXGIDevice* xd = nullptr;
@@ -54,7 +77,7 @@ static int test11() {
 
 static int test12() {
     ID3D12Device* dev = nullptr;
-    HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&dev);
+    HRESULT hr = D3D12CreateDevice(pickAdapter(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void**)&dev);
     printf("D3D12CreateDevice 0x%08lx\n", hr);
     if (FAILED(hr)) return 2;
     LUID luid = dev->GetAdapterLuid();
@@ -118,6 +141,7 @@ static int test12() {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     int which = argc > 1 ? atoi(argv[1]) : 11;
+    if (argc > 2) SetEnvironmentVariableA("HWTEST_ADAPTER", argv[2]);
     char path[MAX_PATH];
     HMODULE m = LoadLibraryA(which == 12 ? "d3d12.dll" : "d3d11.dll");
     GetModuleFileNameA(m, path, sizeof(path));

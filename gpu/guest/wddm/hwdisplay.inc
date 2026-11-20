@@ -4,6 +4,12 @@
  *
  * What it does for now: tells Windows there is one monitor, offers a list of modes, and takes
  * what Windows decides (commit, source address, visibility). Where a frame goes is the next step. */
+#ifdef HWW_TRACE
+static void tr(const char *name);
+#else
+#define tr(name) ((void)0)
+#endif
+
 
 #define HWD_REFRESH_N 60000u
 #define HWD_REFRESH_D 1000u
@@ -75,6 +81,7 @@ static void hwd_log(const char *name, NTSTATUS ns)
 
 static NTSTATUS NTAPI HwdQueryChildRelations(CONST PVOID ctx, PDXGK_CHILD_DESCRIPTOR rel, ULONG size)
 {
+    tr("HwdQueryChil");
     HWD_STEP(900);
     (void)ctx;
     if (size < 2 * sizeof(DXGK_CHILD_DESCRIPTOR)) return STATUS_BUFFER_TOO_SMALL;
@@ -91,6 +98,7 @@ static NTSTATUS NTAPI HwdQueryChildRelations(CONST PVOID ctx, PDXGK_CHILD_DESCRI
 
 static NTSTATUS NTAPI HwdQueryChildStatus(CONST PVOID ctx, PDXGK_CHILD_STATUS st, BOOLEAN nonDestructive)
 {
+    tr("HwdQueryChil");
     HWD_STEP(901);
     (void)ctx;
     (void)nonDestructive;
@@ -110,6 +118,7 @@ static NTSTATUS NTAPI HwdQueryChildStatus(CONST PVOID ctx, PDXGK_CHILD_STATUS st
 /* No EDID: Windows then asks RecommendMonitorModes, and the monitor shows as a generic one. */
 static NTSTATUS NTAPI HwdQueryDeviceDescriptor_impl(CONST PVOID ctx, ULONG uid, PDXGK_DEVICE_DESCRIPTOR desc)
 {
+    tr("HwdQueryDevi");
     (void)ctx;
     (void)uid;
     (void)desc;
@@ -227,6 +236,7 @@ static void hwd_path_defaults(D3DKMDT_VIDPN_PRESENT_PATH *p)
 
 static NTSTATUS NTAPI HwdIsSupportedVidPn_impl(const HANDLE hAdapter, DXGKARG_ISSUPPORTEDVIDPN *arg)
 {
+    tr("HwdIsSupport");
     (void)hAdapter;
     const DXGK_VIDPN_INTERFACE *vi;
     D3DKMDT_HVIDPNTOPOLOGY ht;
@@ -245,6 +255,7 @@ static NTSTATUS NTAPI HwdIsSupportedVidPn_impl(const HANDLE hAdapter, DXGKARG_IS
 
 static NTSTATUS NTAPI HwdRecommendFunctionalVidPn_impl(const HANDLE hAdapter, const DXGKARG_RECOMMENDFUNCTIONALVIDPN *arg)
 {
+    tr("HwdRecommend");
     (void)hAdapter;
     const DXGK_VIDPN_INTERFACE *vi;
     D3DKMDT_HVIDPN hv = arg->hRecommendedFunctionalVidPn;
@@ -305,6 +316,7 @@ static BOOLEAN hwd_pinned_target(const DXGK_VIDPN_INTERFACE *vi, D3DKMDT_HVIDPN 
  * have, or the one mode if the other side already decided. */
 static NTSTATUS NTAPI HwdEnumVidPnCofuncModality_impl(const HANDLE hAdapter, const DXGKARG_ENUMVIDPNCOFUNCMODALITY *arg)
 {
+    tr("HwdEnumVidPn");
     (void)hAdapter;
     const DXGK_VIDPN_INTERFACE *vi;
     D3DKMDT_HVIDPN hv = arg->hConstrainingVidPn;
@@ -331,6 +343,7 @@ static NTSTATUS NTAPI HwdEnumVidPnCofuncModality_impl(const HANDLE hAdapter, con
 
 static NTSTATUS NTAPI HwdRecommendMonitorModes_impl(const HANDLE hAdapter, const DXGKARG_RECOMMENDMONITORMODES *arg)
 {
+    tr("HwdRecommend");
     (void)hAdapter;
     struct hwd_mode list[8];
     UINT n = hwd_mode_list(list, 8);
@@ -357,6 +370,7 @@ static NTSTATUS NTAPI HwdRecommendMonitorModes_impl(const HANDLE hAdapter, const
 
 static NTSTATUS NTAPI HwdRecommendVidPnTopology(const HANDLE hAdapter, const DXGKARG_RECOMMENDVIDPNTOPOLOGY *arg)
 {
+    tr("HwdRecommend");
     HWD_STEP(905);
     (void)hAdapter;
     (void)arg;
@@ -365,6 +379,7 @@ static NTSTATUS NTAPI HwdRecommendVidPnTopology(const HANDLE hAdapter, const DXG
 
 static NTSTATUS NTAPI HwdCommitVidPn_impl(const HANDLE hAdapter, const DXGKARG_COMMITVIDPN *arg)
 {
+    tr("HwdCommitVid");
     (void)hAdapter;
     const DXGK_VIDPN_INTERFACE *vi;
     NTSTATUS ns = g.dxgk.DxgkCbQueryVidPnInterface(arg->hFunctionalVidPn, DXGK_VIDPN_INTERFACE_VERSION_V1, &vi);
@@ -380,6 +395,7 @@ static NTSTATUS NTAPI HwdCommitVidPn_impl(const HANDLE hAdapter, const DXGKARG_C
 
 static NTSTATUS NTAPI HwdUpdateActiveVidPnPresentPath_impl(const HANDLE hAdapter, const DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH *arg)
 {
+    tr("HwdUpdateAct");
     (void)hAdapter;
     (void)arg;
     return STATUS_SUCCESS;
@@ -387,6 +403,7 @@ static NTSTATUS NTAPI HwdUpdateActiveVidPnPresentPath_impl(const HANDLE hAdapter
 
 static NTSTATUS NTAPI HwdSetVidPnSourceAddress_impl(const HANDLE hAdapter, const DXGKARG_SETVIDPNSOURCEADDRESS *arg)
 {
+    tr("HwdSetVidPnS");
     (void)hAdapter;
     d.last_addr[d.source_sets & 3] = (ULONG64)arg->PrimaryAddress.QuadPart;
     d.last_flags = arg->Flags.Value;
@@ -400,6 +417,7 @@ static NTSTATUS NTAPI HwdSetVidPnSourceAddress_impl(const HANDLE hAdapter, const
 
 static NTSTATUS NTAPI HwdSetVidPnSourceVisibility_impl(const HANDLE hAdapter, const DXGKARG_SETVIDPNSOURCEVISIBILITY *arg)
 {
+    tr("HwdSetVidPnS");
     (void)hAdapter;
     d.visible = arg->Visible;
     return STATUS_SUCCESS;
@@ -408,6 +426,7 @@ static NTSTATUS NTAPI HwdSetVidPnSourceVisibility_impl(const HANDLE hAdapter, co
 /* Where the beam would be: a 60 Hz sawtooth from the system clock. */
 static NTSTATUS NTAPI HwdGetScanLine(const HANDLE hAdapter, DXGKARG_GETSCANLINE *arg)
 {
+    tr("HwdGetScanLi");
     HWD_STEP(902);
     (void)hAdapter;
     LARGE_INTEGER now;
@@ -422,6 +441,7 @@ static NTSTATUS NTAPI HwdGetScanLine(const HANDLE hAdapter, DXGKARG_GETSCANLINE 
 
 static NTSTATUS NTAPI HwdSetPointerPosition(const HANDLE hAdapter, const DXGKARG_SETPOINTERPOSITION *arg)
 {
+    tr("HwdSetPointe");
     HWD_STEP(903);
     (void)hAdapter;
     (void)arg;
@@ -430,6 +450,7 @@ static NTSTATUS NTAPI HwdSetPointerPosition(const HANDLE hAdapter, const DXGKARG
 
 static NTSTATUS NTAPI HwdSetPointerShape(const HANDLE hAdapter, const DXGKARG_SETPOINTERSHAPE *arg)
 {
+    tr("HwdSetPointe");
     HWD_STEP(904);
     (void)hAdapter;
     (void)arg;
@@ -438,6 +459,7 @@ static NTSTATUS NTAPI HwdSetPointerShape(const HANDLE hAdapter, const DXGKARG_SE
 
 static NTSTATUS NTAPI HwdIsSupportedVidPn(const HANDLE hAdapter, DXGKARG_ISSUPPORTEDVIDPN *arg)
 {
+    tr("HwdIsSupport");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdIsSupportedVidPn_impl(hAdapter, arg);
     hwd_log("IsSupportedVidPn", ns);
@@ -446,6 +468,7 @@ static NTSTATUS NTAPI HwdIsSupportedVidPn(const HANDLE hAdapter, DXGKARG_ISSUPPO
 
 static NTSTATUS NTAPI HwdRecommendFunctionalVidPn(const HANDLE hAdapter, const DXGKARG_RECOMMENDFUNCTIONALVIDPN *arg)
 {
+    tr("HwdRecommend");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdRecommendFunctionalVidPn_impl(hAdapter, arg);
     hwd_log("RecommendFunctionalVidPn", ns);
@@ -454,6 +477,7 @@ static NTSTATUS NTAPI HwdRecommendFunctionalVidPn(const HANDLE hAdapter, const D
 
 static NTSTATUS NTAPI HwdEnumVidPnCofuncModality(const HANDLE hAdapter, const DXGKARG_ENUMVIDPNCOFUNCMODALITY *arg)
 {
+    tr("HwdEnumVidPn");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdEnumVidPnCofuncModality_impl(hAdapter, arg);
     hwd_log("EnumVidPnCofuncModality", ns);
@@ -462,6 +486,7 @@ static NTSTATUS NTAPI HwdEnumVidPnCofuncModality(const HANDLE hAdapter, const DX
 
 static NTSTATUS NTAPI HwdRecommendMonitorModes(const HANDLE hAdapter, const DXGKARG_RECOMMENDMONITORMODES *arg)
 {
+    tr("HwdRecommend");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdRecommendMonitorModes_impl(hAdapter, arg);
     hwd_log("RecommendMonitorModes", ns);
@@ -470,6 +495,7 @@ static NTSTATUS NTAPI HwdRecommendMonitorModes(const HANDLE hAdapter, const DXGK
 
 static NTSTATUS NTAPI HwdCommitVidPn(const HANDLE hAdapter, const DXGKARG_COMMITVIDPN *arg)
 {
+    tr("HwdCommitVid");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdCommitVidPn_impl(hAdapter, arg);
     hwd_log("CommitVidPn", ns);
@@ -478,6 +504,7 @@ static NTSTATUS NTAPI HwdCommitVidPn(const HANDLE hAdapter, const DXGKARG_COMMIT
 
 static NTSTATUS NTAPI HwdSetVidPnSourceAddress(const HANDLE hAdapter, const DXGKARG_SETVIDPNSOURCEADDRESS *arg)
 {
+    tr("HwdSetVidPnS");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdSetVidPnSourceAddress_impl(hAdapter, arg);
     hwd_log("SetVidPnSourceAddress", ns);
@@ -486,6 +513,7 @@ static NTSTATUS NTAPI HwdSetVidPnSourceAddress(const HANDLE hAdapter, const DXGK
 
 static NTSTATUS NTAPI HwdSetVidPnSourceVisibility(const HANDLE hAdapter, const DXGKARG_SETVIDPNSOURCEVISIBILITY *arg)
 {
+    tr("HwdSetVidPnS");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdSetVidPnSourceVisibility_impl(hAdapter, arg);
     hwd_log("SetVidPnSourceVisibility", ns);
@@ -494,6 +522,7 @@ static NTSTATUS NTAPI HwdSetVidPnSourceVisibility(const HANDLE hAdapter, const D
 
 static NTSTATUS NTAPI HwdUpdateActiveVidPnPresentPath(const HANDLE hAdapter, const DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH *arg)
 {
+    tr("HwdUpdateAct");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdUpdateActiveVidPnPresentPath_impl(hAdapter, arg);
     hwd_log("UpdateActiveVidPnPresentPath", ns);
@@ -513,6 +542,7 @@ static volatile LONG64 hwd_next_id;
 
 static NTSTATUS NTAPI HwdGetStandardData_impl(const HANDLE hAdapter, DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *arg)
 {
+    tr("HwdGetStanda");
     (void)hAdapter;
     arg->ResourcePrivateDriverDataSize = 0;
     if (!arg->pAllocationPrivateDriverData) {
@@ -554,6 +584,7 @@ static NTSTATUS NTAPI HwdGetStandardData_impl(const HANDLE hAdapter, DXGKARG_GET
 
 static NTSTATUS NTAPI HwdCreateAllocation_impl(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *ca)
 {
+    tr("HwdCreateAll");
     (void)hAdapter;
     for (UINT i = 0; i < ca->NumAllocations; i++) {
         DXGK_ALLOCATIONINFO *ai = &ca->pAllocationInfo[i];
@@ -591,6 +622,7 @@ static NTSTATUS NTAPI HwdCreateAllocation_impl(const HANDLE hAdapter, DXGKARG_CR
 
 static NTSTATUS NTAPI HwdDestroyAllocation_impl(const HANDLE hAdapter, const DXGKARG_DESTROYALLOCATION *da)
 {
+    tr("HwdDestroyAl");
     (void)hAdapter;
     for (UINT i = 0; i < da->NumAllocations; i++) {
         if (da->pAllocationList[i] == d.source_alloc) d.source_alloc = NULL;
@@ -601,6 +633,7 @@ static NTSTATUS NTAPI HwdDestroyAllocation_impl(const HANDLE hAdapter, const DXG
 
 static NTSTATUS NTAPI HwdDescribeAllocation_impl(const HANDLE hAdapter, DXGKARG_DESCRIBEALLOCATION *da)
 {
+    tr("HwdDescribeA");
     (void)hAdapter;
     const struct hwd_alloc *al = da->hAllocation;
     if (!al) return STATUS_INVALID_PARAMETER;
@@ -616,6 +649,7 @@ static NTSTATUS NTAPI HwdDescribeAllocation_impl(const HANDLE hAdapter, DXGKARG_
 
 static NTSTATUS NTAPI HwdOpenAllocation_impl(const HANDLE hDevice, const DXGKARG_OPENALLOCATION *oa)
 {
+    tr("HwdOpenAlloc");
     (void)hDevice;
     for (UINT i = 0; i < oa->NumAllocations; i++) {
         DXGKARGCB_GETHANDLEDATA gh;
@@ -633,6 +667,7 @@ static NTSTATUS NTAPI HwdOpenAllocation_impl(const HANDLE hDevice, const DXGKARG
  * user-mode driver tells its renderer. Here the buffer only has to exist and move through the queue. */
 static NTSTATUS NTAPI HwdPresent_impl(const HANDLE hContext, DXGKARG_PRESENT *pr)
 {
+    tr("HwdPresent_i");
     (void)hContext;
     /* A flip comes with no room in its buffer, and needs none: SetVidPnSourceAddress does the work. */
     if (pr->DmaSize >= 16) {
@@ -649,6 +684,7 @@ static NTSTATUS NTAPI HwdPresent_impl(const HANDLE hContext, DXGKARG_PRESENT *pr
 
 static NTSTATUS NTAPI HwdQueryDeviceDescriptor(CONST PVOID ctx, ULONG uid, PDXGK_DEVICE_DESCRIPTOR desc)
 {
+    tr("HwdQueryDevi");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdQueryDeviceDescriptor_impl(ctx, uid, desc);
     hwd_log("QueryDeviceDescriptor", ns);
@@ -657,6 +693,7 @@ static NTSTATUS NTAPI HwdQueryDeviceDescriptor(CONST PVOID ctx, ULONG uid, PDXGK
 
 static NTSTATUS NTAPI HwdGetStandardData(const HANDLE hAdapter, DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *arg)
 {
+    tr("HwdGetStanda");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdGetStandardData_impl(hAdapter, arg);
     hwd_log("GetStandardData", ns);
@@ -665,6 +702,7 @@ static NTSTATUS NTAPI HwdGetStandardData(const HANDLE hAdapter, DXGKARG_GETSTAND
 
 static NTSTATUS NTAPI HwdCreateAllocation(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *ca)
 {
+    tr("HwdCreateAll");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdCreateAllocation_impl(hAdapter, ca);
     hwd_log("CreateAllocation", ns);
@@ -673,6 +711,7 @@ static NTSTATUS NTAPI HwdCreateAllocation(const HANDLE hAdapter, DXGKARG_CREATEA
 
 static NTSTATUS NTAPI HwdDestroyAllocation(const HANDLE hAdapter, const DXGKARG_DESTROYALLOCATION *da)
 {
+    tr("HwdDestroyAl");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdDestroyAllocation_impl(hAdapter, da);
     hwd_log("DestroyAllocation", ns);
@@ -681,6 +720,7 @@ static NTSTATUS NTAPI HwdDestroyAllocation(const HANDLE hAdapter, const DXGKARG_
 
 static NTSTATUS NTAPI HwdDescribeAllocation(const HANDLE hAdapter, DXGKARG_DESCRIBEALLOCATION *da)
 {
+    tr("HwdDescribeA");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdDescribeAllocation_impl(hAdapter, da);
     hwd_log("DescribeAllocation", ns);
@@ -689,6 +729,7 @@ static NTSTATUS NTAPI HwdDescribeAllocation(const HANDLE hAdapter, DXGKARG_DESCR
 
 static NTSTATUS NTAPI HwdOpenAllocation(const HANDLE hDevice, const DXGKARG_OPENALLOCATION *oa)
 {
+    tr("HwdOpenAlloc");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdOpenAllocation_impl(hDevice, oa);
     hwd_log("OpenAllocation", ns);
@@ -697,6 +738,7 @@ static NTSTATUS NTAPI HwdOpenAllocation(const HANDLE hDevice, const DXGKARG_OPEN
 
 static NTSTATUS NTAPI HwdPresent(const HANDLE hContext, DXGKARG_PRESENT *pr)
 {
+    tr("HwdPresent");
     HWD_STEP(1000 + __COUNTER__);
     NTSTATUS ns = HwdPresent_impl(hContext, pr);
     hwd_log("Present", ns);
