@@ -1146,6 +1146,10 @@ int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     AHardwareBuffer_Desc ad{d.Width, d.Height, 1, fmt,
                             AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY, 0, 0, 0};
+    // A driver added from a file (HWGPU_VK_DRIVER, such as PanVK-AI) reads the buffer's layout without the phone's gralloc
+    // and can only take a linear one. CPU usage keeps Mali's gralloc from compressing the buffer (AFBC).
+    static const bool custom_driver = getenv("HWGPU_VK_DRIVER") && *getenv("HWGPU_VK_DRIVER");
+    if (custom_driver) ad.usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
     AHardwareBuffer* ahb = nullptr;
     if (AHardwareBuffer_allocate(&ad, &ahb) != 0) {
         ad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);

@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <time.h>
@@ -228,6 +229,12 @@ struct Frame {
 };
 
 std::atomic<bool> g_screen_shown{false};  // DWM's desktop reaches the layer (hwgpu_host_show_buffer)
+// Desktop buffers (hwgpu_host_show_buffer) the compositor has not released yet. Windows draws its next
+// frame into a buffer it showed before, and a driver that does not see the display's fences (PanVK-AI on
+// kbase) would draw into one still being scanned out.
+std::mutex g_desk_lock;
+std::condition_variable g_desk_cv;
+int g_desk_held = 0;
 
 struct Scan {
     std::mutex lock;
@@ -261,6 +268,11 @@ void publish_free(const Frame& f) {
 void release_frame(Frame& f) {
     if (!f.ahb) return;
     publish_free(f);
+    if (f.slot == HWGPU_CHANNELS) {
+        std::lock_guard<std::mutex> l(g_desk_lock);
+        g_desk_held--;
+        g_desk_cv.notify_all();
+    }
 #ifdef __ANDROID__
     AHardwareBuffer_release(static_cast<AHardwareBuffer*>(f.ahb));
 #endif
@@ -1302,7 +1314,18 @@ void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height) {
     f.slot = HWGPU_CHANNELS;   // not a guest channel's buffer: nothing to tell when it is free
     f.width = width;
     f.height = height;
+    {
+        std::lock_guard<std::mutex> l(g_desk_lock);
+        g_desk_held++;
+    }
     scan_submit(f);
+    // Return once the compositor let go of every earlier desktop buffer (at most a refresh), so the next
+    // frame Windows draws never lands in a buffer still on the screen. Only with release callbacks,
+    // which also come for buffers the compositor dropped.
+    if (g_set_buffer_with_release) {
+        std::unique_lock<std::mutex> l(g_desk_lock);
+        g_desk_cv.wait_for(l, std::chrono::milliseconds(50), [] { return g_desk_held <= 1; });
+    }
 #else
     (void)ahb; (void)width; (void)height;
 #endif
