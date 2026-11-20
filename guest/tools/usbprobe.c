@@ -1,7 +1,7 @@
 /* usbprobe: the guest side of the USB ring, as a plain program (usb/README.md, phase 2 test).
  *   usbprobe            find an offered device, print its descriptors, and if it is a flash drive
  *                       (mass storage, bulk-only) read its first sector and time a sequential read
- *   usbprobe <MiB>      read that much (default 64)
+ *   usbprobe <MiB> [chunk]  read that much (default 64), `chunk` MiB per command (default 1, up to 7)
  * Run as SYSTEM (the agent does). The region is reached through \\.\HwUsbRaw (hwusbraw.sys, IOCTL_HWUSBRAW_IO: reads and writes by
  * copy; Windows would not map more than a megabyte or two of it into a program). Bulk data never comes to this
  * program: it stays in the arena, where the phone's usbfs put it, so the throughput is the ring's and the phone's.
@@ -112,6 +112,8 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     unsigned mib = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
+    unsigned chunk = argc > 2 ? (unsigned)atoi(argv[2]) : 1;   /* MiB per READ(10): up to 7 (the arena is about 7.9 MiB) */
+    if (chunk < 1 || chunk > 7) chunk = 1;
     g_h = CreateFileA("\\\\.\\HwUsbRaw", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (g_h == INVALID_HANDLE_VALUE) { printf("cannot open \\\\.\\HwUsbRaw (install it: C:\\HyperWin\\gpu\\usb\\install-usb.cmd): %lu\n", GetLastError()); return 2; }
     struct hw_usb_global gl;
@@ -123,7 +125,7 @@ int main(int argc, char **argv)
     printf("waiting for a device (plug one in; passthrough on: am broadcast -a dev.hyperwin.app.USB_PASS --ez enable true)...\n");
     for (int i = 0; i < 1200 && slot < 0; i++) {
         for (unsigned k = 0; k < HW_USB_SLOTS; k++)
-            if (rd32(HW_USB_GLOBAL_SIZE ? offsetof(struct hw_usb_global, dev) + (uint64_t)k * sizeof(struct hw_usb_dev_entry) : 0) == HW_USB_OFFERED) { slot = (int)k; break; }
+            { uint32_t st = rd32(offsetof(struct hw_usb_global, dev) + (uint64_t)k * sizeof(struct hw_usb_dev_entry)); if (st == HW_USB_OFFERED || st == HW_USB_ATTACHED) { slot = (int)k; break; } }
         if (slot < 0) Sleep(250);
     }
     if (slot < 0) { printf("no device offered in 5 minutes\n"); return 5; }
@@ -164,8 +166,8 @@ int main(int argc, char **argv)
     uint8_t rdc[10] = {0x28};
     rdc[8] = 1;
     if (bs <= 512 && bot(rdc, 10, 1, bs, 4096, &got) == 0) { rd(ARENA(4096), buf, 512); printf("sector 0: %u bytes, signature %02x%02x (55aa is a partition table)\n", got, buf[510], buf[511]); }
-    /* sequential read, 1 MiB at a time, straight into the arena (nothing comes to this program) */
-    uint32_t per = (1u << 20) / bs, total = mib * (1u << 20) / bs;
+    /* sequential read, `chunk` MiB at a time, straight into the arena (nothing comes to this program) */
+    uint32_t per = (chunk << 20) / bs, total = mib * (1u << 20) / bs;
     if (total > last + 1) total = last + 1;
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
@@ -178,6 +180,6 @@ int main(int argc, char **argv)
     }
     QueryPerformanceCounter(&t1);
     double secs = (double)(t1.QuadPart - t0.QuadPart) / f.QuadPart;
-    printf("read %.1f MiB in %.2f s: %.1f MB/s\n", bytes / 1048576.0, secs, bytes / 1e6 / secs);
+    printf("read %.1f MiB in %.2f s with %u MiB commands: %.1f MB/s\n", bytes / 1048576.0, secs, chunk, bytes / 1e6 / secs);
     return 0;
 }
