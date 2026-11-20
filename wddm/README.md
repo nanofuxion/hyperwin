@@ -1169,3 +1169,15 @@ a vkd3d `d3d12core.dll` inside Windows is dropped. The Send To entries that copy
 `hwwtest counters` lists `dwm.exe` (process 384) with a channel to the phone and 289740 submits, while
 the byte counters stay at 0 both ways. `HWD3D_SYSTEM` = `dwm.exe,WUDFHost.exe` and `IddRender` = 1 came from the
 default install, and the first-logon `dispset auto` made the HyperWin screen the primary display.
+
+### Phase 8 kernel step, first try (2026-11-20): WDDM 2.0 behind `Parameters\Wddm2`
+
+`hwgpuw.sys` now builds against the WDDM 2.0 structures. With `Services\hwgpuw\Parameters\Wddm2` = 1 it declares
+WDDM 2.0 with a GPU MMU: process, root page table and virtual submit entries (stubs), `QUERYSEGMENT4`,
+`PHYSICALADAPTERCAPS`, `GPUMMUCAPS` (CPU-written page tables, 39-bit, three levels) and `PAGETABLELEVELDESC`.
+The default (flag 0) is unchanged and was rechecked: `dxtest 11` and `vktest` pass.
+
+Result with the flag on: Windows asks for `DRIVERCAPS` (type 1), then `PHYSICALADAPTERCAPS` (type 15), both
+answered with success. Then it stops the adapter with problem 43 and calls nothing more, so the cause is a check
+inside dxgkrnl that the trace cannot see. Next: try other caps and entry sets (build with `-DHWW_TRACE` for the
+call trace in `Parameters\Trace2`), and read the Kernel-PnP log for the failing status.

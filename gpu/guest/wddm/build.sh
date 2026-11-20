@@ -13,7 +13,7 @@ DLLTOOL=${DLLTOOL:-/opt/homebrew/opt/llvm/bin/llvm-dlltool}
 mkdir -p "$OUT"
 clang --target=aarch64-pc-windows-msvc -fms-extensions -fms-compatibility -fms-compatibility-version=19.30 \
   -nostdinc -ffreestanding -fno-stack-protector -fno-builtin -O2 -Wall -Wno-unknown-pragmas -Wno-microsoft \
-  -D_ARM64_ -DNTDDI_VERSION=0x0A000008 -D_WIN32_WINNT=0x0A00 -DWINNT=1 -DNT_INST=0 -DDXGKDDI_INTERFACE_VERSION=0x4002 \
+  -D_ARM64_ -DNTDDI_VERSION=0x0A000008 -D_WIN32_WINNT=0x0A00 -DWINNT=1 -DNT_INST=0 -DDXGKDDI_INTERFACE_VERSION=0x5023 \
   -isystem "$(clang -print-resource-dir)/include" -isystem "$K/km" -isystem "$K/shared" -isystem "$K/km/crt" -isystem "$S/shared" \
    -Iinclude -Igpu/include -c gpu/guest/wddm/hwgpuw.c -o "$OUT/hwgpuw.o"
 cat > "$OUT/ntoskrnl.def" <<'DEF'

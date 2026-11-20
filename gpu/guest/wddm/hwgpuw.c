@@ -857,11 +857,59 @@ static VOID NTAPI HwControlEtw(BOOLEAN enable, ULONG flags, UCHAR level)
     (void)level;
 }
 
+/* ---- WDDM 2.0 (Parameters\\Wddm2 = 1), for Direct3D 12 (wddm/README.md, phase 8) ----
+ * Windows then hands the driver GPU virtual addresses. The phone owns every object, so the page tables
+ * stay empty for now: the entries below are what the memory manager needs in order to start the adapter. */
+static BOOLEAN g_w2;
+
+static NTSTATUS NTAPI HwCreateProcess(const HANDLE hAdapter, DXGKARG_CREATEPROCESS *p)
+{
+    (void)hAdapter;
+    tr("CreateProcess");
+    p->hKmdProcess = p->hDxgkProcess;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI HwDestroyProcess(const HANDLE hAdapter, const HANDLE hProcess)
+{
+    (void)hAdapter;
+    (void)hProcess;
+    return STATUS_SUCCESS;
+}
+
+static VOID NTAPI HwSetRootPageTable(const HANDLE hAdapter, const DXGKARG_SETROOTPAGETABLE *p)
+{
+    (void)hAdapter;
+    (void)p;
+    tr("SetRoot");
+}
+
+static SIZE_T NTAPI HwGetRootPageTableSize(const HANDLE hAdapter, DXGKARG_GETROOTPAGETABLESIZE *p)
+{
+    (void)hAdapter;
+    p->NumberOfPte = 512;
+    return 512 * 8;
+}
+
+static NTSTATUS NTAPI HwSubmitCommandVirtual(const HANDLE hAdapter, const DXGKARG_SUBMITCOMMANDVIRTUAL *sc)
+{
+    (void)hAdapter;
+    tr("SubmitVirtual");
+    g_diag.submits++;
+    complete_fence(sc->SubmissionFenceId, sc->NodeOrdinal, sc->EngineOrdinal);
+    return STATUS_SUCCESS;
+}
+
 /* What the adapter can do, as the scheduler and memory manager need to hear it. A render-only
  * adapter with no engine of its own to schedule: one node, no preemption, no overlays. */
 static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
 {
-    if (size < sizeof *caps) return STATUS_BUFFER_TOO_SMALL;
+    /* The structure grows with each Windows version: ask only for what is set here, and clear what came. */
+    ULONG need = max(max((ULONG)(FIELD_OFFSET(DXGK_DRIVERCAPS, WDDMVersion) + sizeof caps->WDDMVersion),
+                         (ULONG)(FIELD_OFFSET(DXGK_DRIVERCAPS, GpuEngineTopology) + sizeof caps->GpuEngineTopology)),
+                     max((ULONG)(FIELD_OFFSET(DXGK_DRIVERCAPS, PreemptionCaps) + sizeof caps->PreemptionCaps),
+                         (ULONG)(FIELD_OFFSET(DXGK_DRIVERCAPS, MemoryManagementCaps) + sizeof caps->MemoryManagementCaps)));
+    if (size < need) return STATUS_BUFFER_TOO_SMALL;
     RtlZeroMemory(caps, size);
     caps->HighestAcceptableAddress.QuadPart = ~0ull >> 1;
     caps->MaxAllocationListSlotId = 256;
@@ -870,6 +918,10 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->PresentationCaps.SupportKernelModeCommandBuffer = 1;
     caps->ApertureSegmentCommitLimit = (SIZE_T)HW_HEAP_SIZE;
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
+    if (g_w2) {
+        caps->WDDMVersion = DXGKDDI_WDDMv2;
+        caps->MemoryManagementCaps.GpuMmuSupported = 1;
+    }
     caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
     caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps->PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -924,9 +976,30 @@ static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO *qai)
+static NTSTATUS query_segments4(const DXGKARG_QUERYADAPTERINFO *qai)
 {
-    tr("QAI");
+    if (qai->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT4)) return STATUS_BUFFER_TOO_SMALL;
+    DXGK_QUERYSEGMENTOUT4 *out = qai->pOutputData;
+    out->SegmentDescriptorStride = sizeof(DXGK_SEGMENTDESCRIPTOR4);
+    if (!out->pSegmentDescriptor) {
+        out->NbSegment = 1;
+    } else {
+        DXGK_SEGMENTDESCRIPTOR4 *d4 = (DXGK_SEGMENTDESCRIPTOR4 *)out->pSegmentDescriptor;
+        RtlZeroMemory(d4, sizeof *d4);
+        d4->Flags.Aperture = 1;
+        d4->Flags.CacheCoherent = 1;
+        d4->Flags.CpuVisible = 1;
+        d4->Size = (SIZE_T)HW_HEAP_SIZE;
+        d4->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
+    }
+    out->PagingBufferSegmentId = 0;
+    out->PagingBufferSize = 64 * 1024;
+    out->PagingBufferPrivateDataSize = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO *qai)
+{
     (void)hAdapter;
     switch (qai->Type) {
     case DXGKQAITYPE_DRIVERCAPS:
@@ -934,6 +1007,38 @@ static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QU
     case DXGKQAITYPE_QUERYSEGMENT:
     case DXGKQAITYPE_QUERYSEGMENT3:
         return query_segments(qai->Type, qai);
+    case DXGKQAITYPE_QUERYSEGMENT4:
+        return query_segments4(qai);
+    case DXGKQAITYPE_PHYSICALADAPTERCAPS:
+        if (qai->OutputDataSize < FIELD_OFFSET(DXGK_PHYSICALADAPTERCAPS, Flags) + sizeof(DXGK_PHYSICALADAPTERFLAGS)) return STATUS_BUFFER_TOO_SMALL;
+        RtlZeroMemory(qai->pOutputData, qai->OutputDataSize);
+        {
+            DXGK_PHYSICALADAPTERCAPS *pc = qai->pOutputData;
+            pc->NumExecutionNodes = 1;
+            pc->PagingNodeIndex = 0;
+            pc->Flags.GpuMmuSupported = 1;
+        }
+        return STATUS_SUCCESS;
+    case DXGKQAITYPE_GPUMMUCAPS: {
+        if (qai->OutputDataSize < sizeof(DXGK_GPUMMUCAPS)) return STATUS_BUFFER_TOO_SMALL;
+        DXGK_GPUMMUCAPS *mm = qai->pOutputData;
+        RtlZeroMemory(mm, sizeof *mm);
+        mm->CacheCoherentMemorySupported = 1;
+        mm->PageTableUpdateMode = DXGK_PAGETABLEUPDATE_CPU_VIRTUAL;
+        mm->VirtualAddressBitCount = 39;
+        mm->LeafPageTableSizeFor64KPagesInBytes = 4096;
+        mm->PageTableLevelCount = 3;
+        return STATUS_SUCCESS;
+    }
+    case DXGKQAITYPE_PAGETABLELEVELDESC: {
+        if (qai->OutputDataSize < sizeof(DXGK_PAGE_TABLE_LEVEL_DESC)) return STATUS_BUFFER_TOO_SMALL;
+        DXGK_PAGE_TABLE_LEVEL_DESC *lv = qai->pOutputData;
+        RtlZeroMemory(lv, sizeof *lv);
+        lv->PageTableIndexBitCount = 9;
+        lv->PageTableSizeInBytes = 4096;
+        lv->PageTableAlignmentInBytes = 4096;
+        return STATUS_SUCCESS;
+    }
     case DXGKQAITYPE_UMDRIVERPRIVATE:
         if (qai->OutputDataSize >= 4) {
             RtlZeroMemory(qai->pOutputData, qai->OutputDataSize);
@@ -944,6 +1049,17 @@ static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QU
     default:
         return STATUS_NOT_SUPPORTED;
     }
+}
+
+static NTSTATUS NTAPI HwQueryAdapterInfo(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO *qai)
+{
+    NTSTATUS st = qai_inner(hAdapter, qai);
+    static const char hx[] = "0123456789abcdef";
+    char nm[16] = {'Q', '0' + (char)((qai->Type / 10) % 10), '0' + (char)(qai->Type % 10), '=',
+                   hx[(st >> 28) & 15], hx[(st >> 24) & 15], hx[(st >> 20) & 15], hx[(st >> 16) & 15],
+                   hx[(st >> 12) & 15], hx[(st >> 8) & 15], hx[(st >> 4) & 15], hx[st & 15], 0};
+    tr(nm);
+    return st;
 }
 
 static NTSTATUS NTAPI HwCreateDevice(const HANDLE hAdapter, DXGKARG_CREATEDEVICE *cd)
@@ -1352,5 +1468,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     init.DxgkDdiQueryEngineStatus = HwQueryEngineStatus;
     init.DxgkDdiQueryDependentEngineGroup = HwQueryDependentEngineGroup;
     hwd_setup(&init);
+    g_w2 = hwd_reg_dword(L"Wddm2", 0) != 0;
+    if (g_w2) {
+        init.Version = DXGKDDI_INTERFACE_VERSION_WDDM2_0;
+        init.DxgkDdiCreateProcess = HwCreateProcess;
+        init.DxgkDdiDestroyProcess = HwDestroyProcess;
+        init.DxgkDdiSetRootPageTable = HwSetRootPageTable;
+        init.DxgkDdiGetRootPageTableSize = HwGetRootPageTableSize;
+        init.DxgkDdiSubmitCommandVirtual = HwSubmitCommandVirtual;
+        /* With a GPU address space there is no patching and no physical submit. */
+        init.DxgkDdiPatch = NULL;
+        init.DxgkDdiSubmitCommand = NULL;
+    }
     return HwDxgkInitialize(driver, registry, &init);
 }
