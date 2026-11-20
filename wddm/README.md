@@ -1181,3 +1181,13 @@ Result with the flag on: Windows asks for `DRIVERCAPS` (type 1), then `PHYSICALA
 answered with success. Then it stops the adapter with problem 43 and calls nothing more, so the cause is a check
 inside dxgkrnl that the trace cannot see. Next: try other caps and entry sets (build with `-DHWW_TRACE` for the
 call trace in `Parameters\Trace2`), and read the Kernel-PnP log for the failing status.
+
+### Check, 2026-11-20: the phone side already runs Direct3D 12
+
+`dxtest 12` run beside vkd3d-proton (`use.cmd vkd3d`, a test only: the rule is no DLLs in Windows) draws the right
+pixel through the stock Mali-G78 driver, with `VKD3D_DEBUG=warn` showing no missing-feature failure (one
+note: `TotalLaneCount = 512, may be inaccurate`). So the phone's Vulkan has what vkd3d-proton needs for this test, and
+the open Direct3D 12 problem is the Windows adapter: with `Wddm2` = 1, dxgkrnl stops it with status 0xC00000E5
+(internal error) right after the `DRIVERCAPS` and `PHYSICALADAPTERCAPS` queries (trace: `Add Start Q01 Q15 Stop Remove`).
+PanVK and lavapipe would matter only if a game needs the features the Mali driver lacks (depth bounds, min/max
+filtering, fragment shader interlock, conservative rasterization), which `panvk-ai` notes list.

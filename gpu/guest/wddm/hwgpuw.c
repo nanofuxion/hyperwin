@@ -673,6 +673,7 @@ static void start_polling(void)
 
 static NTSTATUS NTAPI HwAddDevice(CONST PDEVICE_OBJECT pdo, PVOID *context)
 {
+    tr("Add");
     g.pdo = pdo;
     *context = &g;
     return STATUS_SUCCESS;
@@ -714,6 +715,7 @@ static void write_adapter_strings(const char *gpu)
 static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXGKRNL_INTERFACE iface, PULONG sources,
                                     PULONG children)
 {
+    tr("Start");
     (void)ctx;
     (void)info;
     g.dxgk = *iface;
@@ -746,6 +748,7 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
 
 static NTSTATUS NTAPI HwStopDevice(CONST PVOID ctx)
 {
+    tr("Stop");
     (void)ctx;
     hwd_stop();
     if (g.timer) {
@@ -771,12 +774,14 @@ static NTSTATUS NTAPI HwStopDevice(CONST PVOID ctx)
 
 static NTSTATUS NTAPI HwRemoveDevice(CONST PVOID ctx)
 {
+    tr("Remove");
     (void)ctx;
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI HwDispatchIoRequest(CONST PVOID ctx, ULONG source, PVIDEO_REQUEST_PACKET packet)
 {
+    tr("Io");
     (void)ctx;
     (void)source;
     (void)packet;
@@ -799,6 +804,7 @@ static VOID NTAPI HwDpc(CONST PVOID ctx)
 
 static NTSTATUS NTAPI HwQueryChildRelations(CONST PVOID ctx, PDXGK_CHILD_DESCRIPTOR rel, ULONG size)
 {
+    tr("ChildRel");
     (void)ctx;
     (void)rel;
     (void)size;
@@ -823,6 +829,7 @@ static NTSTATUS NTAPI HwQueryDeviceDescriptor(CONST PVOID ctx, ULONG uid, PDXGK_
 
 static NTSTATUS NTAPI HwSetPowerState(CONST PVOID ctx, ULONG uid, DEVICE_POWER_STATE state, POWER_ACTION action)
 {
+    tr("Power");
     (void)ctx;
     (void)uid;
     (void)state;
@@ -920,7 +927,7 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     if (g_w2) {
         caps->WDDMVersion = DXGKDDI_WDDMv2;
-        caps->MemoryManagementCaps.GpuMmuSupported = 1;
+        caps->MemoryManagementCaps.IoMmuSupported = 1;
     }
     caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
     caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -1000,7 +1007,6 @@ static NTSTATUS query_segments4(const DXGKARG_QUERYADAPTERINFO *qai)
 
 static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO *qai)
 {
-    (void)hAdapter;
     switch (qai->Type) {
     case DXGKQAITYPE_DRIVERCAPS:
         return query_caps(qai->pOutputData, qai->OutputDataSize);
@@ -1016,7 +1022,8 @@ static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO 
             DXGK_PHYSICALADAPTERCAPS *pc = qai->pOutputData;
             pc->NumExecutionNodes = 1;
             pc->PagingNodeIndex = 0;
-            pc->Flags.GpuMmuSupported = 1;
+            pc->DxgkPhysicalAdapterHandle = hAdapter;
+            pc->Flags.IoMmuSupported = 1;
         }
         return STATUS_SUCCESS;
     case DXGKQAITYPE_GPUMMUCAPS: {
