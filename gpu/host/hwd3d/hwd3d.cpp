@@ -26,7 +26,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -155,7 +157,10 @@ struct Mapped {
     uint8_t* data;
 };
 
+struct Shared;
+struct Chan;
 void drop_shared_object(uint32_t slot, uint32_t object);
+void sync_opened_shares(Chan& c);
 
 struct Chan {
     void* chan = nullptr;
@@ -188,6 +193,13 @@ struct Chan {
         uint32_t slot, seq;
     };
     std::vector<Pending> pending;
+    struct OpenedShare {
+        uint32_t handle = 0;
+        std::shared_ptr<Shared> shared;
+        ID3D11Texture2D* tex = nullptr;
+        uint64_t synced_version = 0;
+    };
+    std::vector<OpenedShare> opened_shares;
 
     // Writes the results the GPU has for ended queries into the query page.
     void poll_queries() {
@@ -302,6 +314,14 @@ struct Chan {
     void release(uint32_t h) {
         uint32_t i = h & 0xFFFFF;
         if (!h || i >= table.size() || !table[i].ptr || handle(i, table[i].gen) != h) return;
+        for (auto it = opened_shares.begin(); it != opened_shares.end();) {
+            if (it->handle == h) {
+                if (it->tex) it->tex->Release();
+                it = opened_shares.erase(it);
+            } else {
+                ++it;
+            }
+        }
         drop_shared_object(slot, h);
         Obj& o = table[i];
         found.erase({o.ident, o.iface});
@@ -320,6 +340,9 @@ struct Chan {
     // What the program still held, newest first, as it would have let go.
     void release_all() {
         idle();
+        for (auto& os : opened_shares)
+            if (os.tex) os.tex->Release();
+        opened_shares.clear();
         for (auto& p : pending) {
             p.q->Release();
             p.ctx->Release();
@@ -839,9 +862,25 @@ struct Shared {
     D3D11_TEXTURE2D_DESC desc{};
     uint32_t owner = 0;   // the channel slot that made it; it goes when that channel ends
     uint32_t object = 0;  // or sooner, when the owner releases this texture
+    bool cpu_fallback = false;
+    uint32_t bpp = 4;
+    ID3D11Device* owner_dev = nullptr;
+    ID3D11DeviceContext* owner_ctx = nullptr;
+    ID3D11Texture2D* owner_tex = nullptr;
+    ID3D11Texture2D* staging = nullptr;
+    std::mutex ahb_lock;
+    std::atomic<uint64_t> version{0};
+    std::atomic<bool> opened{false};
+    ~Shared() {
+        if (staging) staging->Release();
+        if (owner_tex) owner_tex->Release();
+        if (owner_ctx) owner_ctx->Release();
+        if (owner_dev) owner_dev->Release();
+        if (ahb) AHardwareBuffer_release(ahb);
+    }
 };
 std::mutex g_shared_lock;
-std::map<uint32_t, Shared> g_shared;
+std::map<uint32_t, std::shared_ptr<Shared>> g_shared;
 uint32_t g_next_share = 1;
 
 // The Vulkan entry DXVK itself uses (vulkan_loader.cpp in dxvk-android.patch).
@@ -967,7 +1006,11 @@ HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_
     VkDeviceMemory memory = VK_NULL_HANDLE;
     do {
         if (!vkGetAndroidHardwareBufferPropertiesANDROID || !vkCreateImage || !vkAllocateMemory || !vkBindImageMemory) {
-            LOG("shared surface: the phone's Vulkan device has no Android hardware buffer import");
+            static bool told_no_ahb = false;
+            if (!told_no_ahb) {
+                told_no_ahb = true;
+                LOG("shared surface: the phone's Vulkan device has no Android hardware buffer import");
+            }
             break;
         }
         VkAndroidHardwareBufferFormatPropertiesANDROID fp{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
@@ -1038,6 +1081,61 @@ HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_
     return hr;
 }
 
+void sync_owner_to_ahb(Shared& s) {
+    if (!s.cpu_fallback || !s.owner_ctx || !s.owner_tex || !s.staging || !s.ahb) return;
+    s.owner_ctx->CopyResource(s.staging, s.owner_tex);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    HRESULT map_hr = s.owner_ctx->Map(s.staging, 0, D3D11_MAP_READ, 0, &m);
+    if (FAILED(map_hr) || !m.pData) {
+        static bool told_map = false;
+        if (!told_map) {
+            told_map = true;
+            LOG("shared surface: CPU fallback Map failed (0x%x)", unsigned(map_hr));
+        }
+        return;
+    }
+    AHardwareBuffer_Desc hd{};
+    AHardwareBuffer_describe(s.ahb, &hd);
+    {
+        std::lock_guard<std::mutex> lk(s.ahb_lock);
+        void* dst = nullptr;
+        int lock_rc = AHardwareBuffer_lock(s.ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &dst);
+        if (lock_rc == 0 && dst) {
+            size_t dst_pitch = size_t(hd.stride) * s.bpp;
+            size_t row_bytes = std::min<size_t>(size_t(s.desc.Width) * s.bpp, std::min<size_t>(m.RowPitch, dst_pitch));
+            for (uint32_t y = 0; y < s.desc.Height; y++)
+                memcpy(static_cast<uint8_t*>(dst) + size_t(y) * dst_pitch,
+                       static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, row_bytes);
+            AHardwareBuffer_unlock(s.ahb, nullptr);
+            s.version.fetch_add(1, std::memory_order_release);
+        } else {
+            static bool told_lock = false;
+            if (!told_lock) {
+                told_lock = true;
+                LOG("shared surface: CPU fallback AHardwareBuffer_lock failed (%d)", lock_rc);
+            }
+        }
+    }
+    s.owner_ctx->Unmap(s.staging, 0);
+}
+
+void sync_opened_shares(Chan& c) {
+    if (c.opened_shares.empty() || !c.immediate) return;
+    for (auto& os : c.opened_shares) {
+        uint64_t v = os.shared->version.load(std::memory_order_acquire);
+        if (v == os.synced_version) continue;
+        AHardwareBuffer_Desc hd{};
+        AHardwareBuffer_describe(os.shared->ahb, &hd);
+        std::lock_guard<std::mutex> lk(os.shared->ahb_lock);
+        void* src = nullptr;
+        if (AHardwareBuffer_lock(os.shared->ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &src) == 0 && src) {
+            c.immediate->UpdateSubresource(os.tex, 0, nullptr, src, hd.stride * os.shared->bpp, 0);
+            AHardwareBuffer_unlock(os.shared->ahb, nullptr);
+            os.synced_version = v;
+        }
+    }
+}
+
 int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     D3D11_TEXTURE2D_DESC d;
     r.get(&d, sizeof d);   // zeroes past the end
@@ -1058,24 +1156,99 @@ int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     }
     ID3D11Texture2D* tex = nullptr;
     HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
+    std::shared_ptr<Shared> sp;
+    bool fallback = false;
     if (FAILED(hr)) {
         AHardwareBuffer_release(ahb);
-        return hr;
+        ahb = nullptr;
+        AHardwareBuffer_Desc cad{
+            d.Width, d.Height, 1, fmt,
+            AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+            0, 0, 0};
+        if (AHardwareBuffer_allocate(&cad, &ahb) != 0) {
+            cad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
+            if (AHardwareBuffer_allocate(&cad, &ahb) != 0) {
+                cad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE);
+                if (AHardwareBuffer_allocate(&cad, &ahb) != 0) {
+                    LOG("channel %u: no CPU Android hardware buffer for a %ux%u shared surface", c.slot, d.Width, d.Height);
+                    return E_OUTOFMEMORY;
+                }
+            }
+        }
+        D3D11_TEXTURE2D_DESC td = d;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags &= ~UINT(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                             D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
+        td.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        HRESULT thr = dev->CreateTexture2D(&td, nullptr, &tex);
+        if (FAILED(thr) || !tex) {
+            AHardwareBuffer_release(ahb);
+            return FAILED(thr) ? thr : hr;
+        }
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        ID3D11Texture2D* staging = nullptr;
+        thr = dev->CreateTexture2D(&sd, nullptr, &staging);
+        if (FAILED(thr) || !staging) {
+            tex->Release();
+            AHardwareBuffer_release(ahb);
+            return FAILED(thr) ? thr : hr;
+        }
+        ID3D11DeviceContext* ctx = nullptr;
+        dev->GetImmediateContext(&ctx);
+        if (!ctx) {
+            staging->Release();
+            tex->Release();
+            AHardwareBuffer_release(ahb);
+            return E_FAIL;
+        }
+        sp = std::make_shared<Shared>();
+        sp->ahb = ahb;
+        sp->desc = d;
+        sp->owner = c.slot;
+        sp->cpu_fallback = true;
+        sp->bpp = (fmt == AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
+        sp->owner_dev = dev;
+        dev->AddRef();
+        sp->owner_ctx = ctx;
+        sp->owner_tex = tex;
+        tex->AddRef();
+        sp->staging = staging;
+        fallback = true;
+    } else {
+        sp = std::make_shared<Shared>();
+        sp->ahb = ahb;
+        sp->desc = d;
+        sp->owner = c.slot;
     }
     uint32_t id;
     {
         std::lock_guard<std::mutex> g(g_shared_lock);
         id = g_next_share++;
-        g_shared[id] = Shared{ahb, d, c.slot};
+        g_shared[id] = sp;
     }
     uint32_t object = c.put(tex, HI_ID3D11Texture2D);
     {
         std::lock_guard<std::mutex> g(g_shared_lock);
-        g_shared[id].object = object;
+        sp->object = object;
     }
     w.u32(object);
     w.u32(id);
-    LOG("channel %u: shared surface %u, %ux%u format %u", c.slot, id, d.Width, d.Height, unsigned(d.Format));
+    if (fallback) {
+        static int fallback_logged = 0;
+        if (fallback_logged++ < 8) {
+            LOG("channel %u: shared surface %u (CPU readback fallback), %ux%u format %u", c.slot, id, d.Width, d.Height, unsigned(d.Format));
+        }
+    } else {
+        LOG("channel %u: shared surface %u, %ux%u format %u", c.slot, id, d.Width, d.Height, unsigned(d.Format));
+    }
     return S_OK;
 }
 
@@ -1083,23 +1256,46 @@ int32_t open_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     uint32_t id = r.u32();
     auto* dev = static_cast<ID3D11Device*>(c.obj(device, HI_ID3D11Device));
     if (!r.ok || !dev || dev == BAD) return E_INVALIDARG;
-    AHardwareBuffer* ahb = nullptr;
+    std::shared_ptr<Shared> sp;
     D3D11_TEXTURE2D_DESC d{};
     {
         std::lock_guard<std::mutex> g(g_shared_lock);
         auto it = g_shared.find(id);
         if (it == g_shared.end()) return E_INVALIDARG;
-        ahb = it->second.ahb;
-        d = it->second.desc;
-        AHardwareBuffer_acquire(ahb);
+        sp = it->second;
+        d = sp->desc;
     }
+    if (!sp->cpu_fallback) {
+        AHardwareBuffer* ahb = sp->ahb;
+        AHardwareBuffer_acquire(ahb);
+        ID3D11Texture2D* tex = nullptr;
+        HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
+        AHardwareBuffer_release(ahb);   // the imported memory holds its own reference
+        if (FAILED(hr)) return hr;
+        w.u32(c.put(tex, HI_ID3D11Texture2D));
+        w.arr(&d, sizeof d);
+        LOG("channel %u: opened shared surface %u", c.slot, id);
+        return S_OK;
+    }
+    sp->opened.store(true, std::memory_order_release);
+    D3D11_TEXTURE2D_DESC td = d;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.CPUAccessFlags = 0;
+    td.MiscFlags &= ~UINT(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                         D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
+    td.BindFlags |= D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     ID3D11Texture2D* tex = nullptr;
-    HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
-    AHardwareBuffer_release(ahb);   // the imported memory holds its own reference
-    if (FAILED(hr)) return hr;
-    w.u32(c.put(tex, HI_ID3D11Texture2D));
+    HRESULT hr = dev->CreateTexture2D(&td, nullptr, &tex);
+    if (FAILED(hr) || !tex) return FAILED(hr) ? hr : E_FAIL;
+    uint32_t obj_h = c.put(tex, HI_ID3D11Texture2D);
+    tex->AddRef();
+    c.opened_shares.push_back({obj_h, sp, tex, 0});
+    sync_opened_shares(c);
+    w.u32(obj_h);
     w.arr(&d, sizeof d);
-    LOG("channel %u: opened shared surface %u", c.slot, id);
+    LOG("channel %u: opened shared surface %u (CPU readback fallback)", c.slot, id);
     return S_OK;
 }
 
@@ -1160,22 +1356,35 @@ int32_t finish(Chan& c) {
         }
         hr = S_OK;
     }
+    if (SUCCEEDED(hr)) {
+        std::vector<std::shared_ptr<Shared>> mine;
+        {
+            std::lock_guard<std::mutex> g(g_shared_lock);
+            for (auto& kv : g_shared)
+                if (kv.second->owner == c.slot && kv.second->cpu_fallback && kv.second->opened.load(std::memory_order_acquire))
+                    mine.push_back(kv.second);
+        }
+        for (auto& sp : mine) sync_owner_to_ahb(*sp);
+    }
     return SUCCEEDED(hr) ? 0 : hr;
 }
 
 int32_t scanout(Chan& c, Rd& r) {
     uint32_t id = r.u32();
+    std::shared_ptr<Shared> sp;
     AHardwareBuffer* ahb = nullptr;
     uint32_t w = 0, h = 0;
     {
         std::lock_guard<std::mutex> g(g_shared_lock);
         auto it = g_shared.find(id);
         if (it == g_shared.end()) return E_INVALIDARG;
-        ahb = it->second.ahb;
-        w = it->second.desc.Width;
-        h = it->second.desc.Height;
+        sp = it->second;
+        ahb = sp->ahb;
+        w = sp->desc.Width;
+        h = sp->desc.Height;
         AHardwareBuffer_acquire(ahb);
     }
+    if (sp->cpu_fallback && sp->owner == c.slot) sync_owner_to_ahb(*sp);
     // The program that drew it waited for its GPU work before presenting (HWD3D_OP_FINISH).
     bool tell = c.presents < 3 || !(c.presents % 600);
     if (tell) LOG("channel %u: screen frame %llu from shared surface %u", c.slot, (unsigned long long)c.presents + 1, id);
@@ -1190,24 +1399,30 @@ int32_t scanout(Chan& c, Rd& r) {
 // their own import, and the screen keeps what it shows. Without this every swap chain DWM rebuilt stayed
 // in phone memory until DWM's channel closed.
 void drop_shared_object(uint32_t slot, uint32_t object) {
-    std::lock_guard<std::mutex> g(g_shared_lock);
-    for (auto it = g_shared.begin(); it != g_shared.end(); ++it) {
-        if (it->second.owner == slot && it->second.object == object) {
-            AHardwareBuffer_release(it->second.ahb);
-            g_shared.erase(it);
-            return;
+    std::shared_ptr<Shared> dead;
+    {
+        std::lock_guard<std::mutex> g(g_shared_lock);
+        for (auto it = g_shared.begin(); it != g_shared.end(); ++it) {
+            if (it->second->owner == slot && it->second->object == object) {
+                dead = std::move(it->second);
+                g_shared.erase(it);
+                break;
+            }
         }
     }
 }
 
 void drop_shared(uint32_t slot) {
-    std::lock_guard<std::mutex> g(g_shared_lock);
-    for (auto it = g_shared.begin(); it != g_shared.end();) {
-        if (it->second.owner == slot) {
-            AHardwareBuffer_release(it->second.ahb);
-            it = g_shared.erase(it);
-        } else {
-            ++it;
+    std::vector<std::shared_ptr<Shared>> dead;
+    {
+        std::lock_guard<std::mutex> g(g_shared_lock);
+        for (auto it = g_shared.begin(); it != g_shared.end();) {
+            if (it->second->owner == slot) {
+                dead.push_back(std::move(it->second));
+                it = g_shared.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 }
@@ -1322,6 +1537,7 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
 }
 
 int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, Wr& w) {
+    if (h.op == HWD3D_OP_CALL) sync_opened_shares(c);
     {
         int32_t st;
         if (h.op == HWD3D_OP_RELEASE) {
@@ -1411,9 +1627,9 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
     }
     if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation)) LOG("channel %u: bad HwD3D stream, dropping it", slot);
     d9_release(c);
+    drop_shared(slot);
     c.release_all();
     sweep_dead();
-    drop_shared(slot);
     LOG("channel %u: HwD3D ends after %llu messages", slot, (unsigned long long)c.received);
     if (c.presents) {
         double f = double(c.presents);

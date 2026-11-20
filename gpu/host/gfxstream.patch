@@ -209,20 +209,56 @@ index 4531a514..83bfe4ec 100644
      if (ret != 0) {
          GFXSTREAM_ERROR("Failed to transfer: failed to sync with backend resource.");
          return ret;
+diff --git a/host/vulkan/vk_common_operations.cpp b/host/vulkan/vk_common_operations.cpp
+index 7ecd8ea3..1494dd80 100644
+--- a/host/vulkan/vk_common_operations.cpp
++++ b/host/vulkan/vk_common_operations.cpp
+@@ -1651,9 +1651,12 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
+ 
+     if (emulation->getFeatures().VulkanAllocateHostMemory.enabled() &&
+         !emulation->supportsExternalMemoryHostProperties()) {
+-        GFXSTREAM_ERROR(
+-            "VulkanAllocateHostMemory is enabled but is not supported, you might encounter errors "
+-            "when using vkMapMemory() due to unaligned host mappings.");
++        GFXSTREAM_WARNING(
++            "VulkanAllocateHostMemory is enabled but VK_EXT_external_memory_host is not "
++            "supported; disabling VulkanAllocateHostMemory.");
++        emulation->mFeatures.VulkanAllocateHostMemory.setEnabled(false);
++        emulation->mFeatures.VulkanAllocateHostMemory.setReason(
++            "Host Vulkan driver lacks VK_EXT_external_memory_host");
+     }
+ 
+     GFXSTREAM_VERBOSE("Vulkan global emulation state successfully initialized.");
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index d737c56a..8bdac257 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -2581,7 +2581,9 @@ class VkDecoderGlobalState::Impl {
+         }
+ 
+ #if defined(__ANDROID__)
+-        updatedDeviceExtensions.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
++        if (m_vkEmulation->getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB) {
++            updatedDeviceExtensions.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
++        }
+ #endif
+ 
+         const auto r2features = m_vkEmulation->getRobustness2Features();
 diff --git a/host/vulkan/vk_memory_allocation_helper.cpp b/host/vulkan/vk_memory_allocation_helper.cpp
-index 8e0079ed..7a1311e1 100644
+index 8e0079ed..b9754a73 100644
 --- a/host/vulkan/vk_memory_allocation_helper.cpp
 +++ b/host/vulkan/vk_memory_allocation_helper.cpp
-@@ -674,7 +674,7 @@ VkResult VkMemoryAllocationHelper::selectStrategy(
+@@ -674,7 +674,8 @@ VkResult VkMemoryAllocationHelper::selectStrategy(
          } else if (features->ExternalBlob.enabled()) {
              hostVisRes = selectHostVisibleExternalBlobStrategy(*this, inputs, outPlan);
          } else if (features->VulkanAllocateHostMemory.enabled() &&
 -                   !outPlan->hasChainedAllocateStructs()) {
++                   supportsExternalMemoryHostProperties &&
 +                   outPlan->canImportHostPointer()) {
              hostVisRes = selectHostVisibleHeapMemoryStrategy(
                  /*hasCreateBlobInfo=*/createBlobInfoPtr != nullptr, *this, outPlan);
          }
-@@ -827,6 +827,14 @@ uint32_t VkMemoryAllocationPlan::computeCaching() const {
+@@ -827,6 +828,14 @@ uint32_t VkMemoryAllocationPlan::computeCaching() const {
      return MAP_CACHE_NONE;
  }
  

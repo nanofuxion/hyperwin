@@ -212,6 +212,22 @@ index 80b4a65..d698e80 100644
    
    /**
     * \brief Sets name of the calling thread
+diff --git a/src/util/util_singleton.h b/src/util/util_singleton.h
+index ee5fe56..27253fb 100644
+--- a/src/util/util_singleton.h
++++ b/src/util/util_singleton.h
+@@ -20,9 +20,10 @@ public:
+   Rc<T> acquire(Args... constantArgs) {
+     std::lock_guard lock(m_mutex);
+ 
+-    if (!(m_useCount++))
++    if (!m_useCount)
+       m_object = new T(constantArgs...);
+ 
++    m_useCount++;
+     return m_object;
+   }
+ 
 diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
 index f9d1e98..d20b30b 100644
 --- a/src/vulkan/vulkan_loader.cpp

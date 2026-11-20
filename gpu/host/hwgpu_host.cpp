@@ -754,7 +754,7 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
                         (unsigned long long)(st_scan >> 20),
                         (unsigned long long)(st_in >> 10), (unsigned long long)(st_out >> 10),
                         (unsigned long long)(st_ns / 1000000));
-                    st_calls = st_pull = st_scan = st_in = st_out = st_ns = 0;
+                    st_calls = st_pull = st_scan = st_in = st_out = st_ns = st_flush = 0;
                     st_last = now_ns();
                 }
             }
