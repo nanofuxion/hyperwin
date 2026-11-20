@@ -30,3 +30,10 @@ sc start HyperWinAgent
 rem GPU: Vulkan over the shared window, rendered by the phone (gpu/README.md), and the rest of the
 rem HyperWin drivers, sound among them.
 call C:\HyperWin\gpu-install.cmd
+
+rem The desktop on the phone's GPU: once, make the HyperWin screen the only display, so programs find the
+rem HyperWin GPU as the default adapter. Done in this session because it changes the user's display settings.
+rem Not marked done when the screen never showed up; the next logon tries again.
+if not exist C:\HyperWin\gpu\screen.done if exist C:\HyperWin\gpu\dispset.exe (
+  C:\HyperWin\gpu\dispset.exe auto && (echo.> C:\HyperWin\gpu\screen.done & shutdown /r /t 10)
+)

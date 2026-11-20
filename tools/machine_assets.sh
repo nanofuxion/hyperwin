@@ -65,6 +65,9 @@ done
 mkdir -p "$OUT/guest/gpu/hwidd"
 cp "$ROOT"/build/hwidd/pkg/* "$OUT/guest/gpu/hwidd/"
 [ -f "$ROOT/build/hwwtest.exe" ] && cp "$ROOT/build/hwwtest.exe" "$OUT/guest/gpu/"
+# Makes the HyperWin screen the only display once, at first logon (guest/tools/dispset.c).
+[ "$ROOT/build/dispset.exe" -nt "$ROOT/guest/tools/dispset.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 "$ROOT/guest/tools/dispset.c" -o "$ROOT/build/dispset.exe" -luser32
+cp "$ROOT/build/dispset.exe" "$OUT/guest/gpu/"
 # Phone storage as drives: the service and the WinFsp installer it needs.
 [ -f "$ROOT/build/files/hwfiles.exe" ] || sh "$ROOT/guest/files/build.sh"
 cp "$ROOT/build/files/hwfiles.exe" "$ROOT/build/files/winfsp.msi" "$OUT/guest/gpu/"
