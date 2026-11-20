@@ -232,7 +232,7 @@ driver instead; bulk data stays in the arena and never comes to the program.
    backing, the EFI reservation, and a host-only `usb_ring_test` that runs the
    app side against a fake guest and a fake device (loopback control and bulk
    endpoints) on the Mac.
-2. **Android URB engine.** *(built; the guest side of the test is `guest/tools/usbprobe.c` over `hwusbraw`; built 2026-11-20: `UsbBridge.kt`, `app/src/main/cpp/usb_host.c`; the app starts it with the machine, off until `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable true`. Compiled and smoke-tested with no device attached. Device test, 2026-11-20, a Samsung Type-C flash drive (090c:1000, USB 3.1, 61 GB): descriptors through the ring, INQUIRY, capacity, sector 0 (signature 55aa) and a sequential read all work from Windows through `usbprobe`: 112 MiB in 4.85 s with 4 MiB commands, 24 MB/s (19.8 MB/s with 1 MiB commands). Not tuned: the guest polls through IOCTL copies and one command is in flight; hwusb.sys in the kernel comes next.)* `UsbBridge.kt` and `usb_host.c` for control, bulk
+2. **Android URB engine.** *(built; the guest side of the test is `guest/tools/usbprobe.c` over `hwusbraw`; built 2026-11-20: `UsbBridge.kt`, `app/src/main/cpp/usb_host.c`; the app starts it with the machine and it is on by default: Android's own permission prompt for each device is the consent. `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable false` turns it off. Compiled and smoke-tested with no device attached. Device test, 2026-11-20, a Samsung Type-C flash drive (090c:1000, USB 3.1, 61 GB): descriptors through the ring, INQUIRY, capacity, sector 0 (signature 55aa) and a sequential read all work from Windows through `usbprobe`: 112 MiB in 4.85 s with 4 MiB commands, 24 MB/s (19.8 MB/s with 1 MiB commands). Not tuned: the guest polls through IOCTL copies and one command is in flight; hwusb.sys in the kernel comes next.)* `UsbBridge.kt` and `usb_host.c` for control, bulk
    and interrupt transfers. Test: read a flash drive's descriptors and do a raw
    bulk read through the ring from the test guest on the phone.
 3. **`hwusb.sys` for control, bulk and interrupt.** Test: a flash drive mounts
@@ -256,3 +256,12 @@ driver instead; bulk data stays in the arena and never comes to the program.
   `SharedMemory` mapping works under the app's SELinux domain. libusb's Android
   support says it does, but test it on the Pixel first.
 - The Pixel's USB-C port speed in host mode with the dock attached.
+
+## Current route: USB/IP (usbip-win2)
+
+The app runs a USB/IP server (`app/src/main/cpp/usbipd.c`) on 127.0.0.1:3240. The guest reaches it as 10.0.2.2:3240.
+Windows uses usbip-win2 (BSD-2-Clause, signed ARM64 drivers), fetched at build time by `tools/machine_assets.sh`.
+`guest/drivers/hwusbraw/usbwatch.ps1` runs at every boot as a SYSTEM task, attaches each device the app exports and
+leaves it alone once attached. Plugging in is plug and play: Android's own prompt is the consent, the app offers the
+device, the watcher attaches it within two seconds. Unplugging closes the connection and Windows drops the port.
+Input devices and hubs stay with Android. The ring mode stays as `usb_mode=ring`. Phase 3 (a UdeCx driver) is dropped.

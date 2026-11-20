@@ -72,6 +72,10 @@ cp "$ROOT"/build/hwidd/pkg/* "$OUT/guest/gpu/hwidd/"
 [ "$ROOT/build/usbprobe.exe" -nt "$ROOT/guest/tools/usbprobe.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 -I"$ROOT/include" "$ROOT/guest/tools/usbprobe.c" -o "$ROOT/build/usbprobe.exe"
 mkdir -p "$OUT/guest/gpu/usb"
 cp "$ROOT/build/hwusbraw/hwusbraw.sys" "$ROOT/build/usbprobe.exe" "$OUT/guest/gpu/usb/"
+# usbip-win2 (BSD-2-Clause), the virtual USB host controller for Windows, and the watcher that attaches phone devices.
+[ -f "$ROOT/build/dl/USBip-0.9.8.1-arm64.exe" ] || curl -sL -o "$ROOT/build/dl/USBip-0.9.8.1-arm64.exe" https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-arm64.exe
+cp "$ROOT/build/dl/USBip-0.9.8.1-arm64.exe" "$OUT/guest/gpu/usb/usbip-setup.exe"
+perl -pe 's/\r?\n/\r\n/' "$ROOT/guest/drivers/hwusbraw/usbwatch.ps1" > "$OUT/guest/gpu/usb/usbwatch.ps1"
 for f in install-usb.cmd remove-usb.cmd; do perl -pe 's/\r?\n/\r\n/' "$ROOT/guest/drivers/hwusbraw/$f" > "$OUT/guest/gpu/usb/$f"; done
 # Makes the HyperWin screen the only display once, at first logon (guest/tools/dispset.c).
 [ "$ROOT/build/dispset.exe" -nt "$ROOT/guest/tools/dispset.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 "$ROOT/guest/tools/dispset.c" -o "$ROOT/build/dispset.exe" -luser32

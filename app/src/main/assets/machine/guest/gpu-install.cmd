@@ -78,6 +78,8 @@ if "%HWAD%"=="1" (reg delete HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v %G%\vulkan_
 rem Send To entries that put DXVK, vkd3d-proton or Zink beside a program (gpu\dx\use.cmd).
 for /d %%u in (C:\Users\*) do if exist "%%u\AppData\Roaming\Microsoft\Windows\SendTo" call :sendto "%%u\AppData\Roaming\Microsoft\Windows\SendTo"
 call :sendto "C:\Users\Default\AppData\Roaming\Microsoft\Windows\SendTo"
+rem USB passthrough has its own installer, kept apart so a USB failure never touches the display.
+if exist %G%\usb\install-usb.cmd call %G%\usb\install-usb.cmd
 exit /b 0
 
 :sendto

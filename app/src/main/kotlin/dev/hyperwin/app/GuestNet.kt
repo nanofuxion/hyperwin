@@ -423,7 +423,9 @@ class GuestNet(private val ctx: Context, private val lan: Boolean, private val t
             val s = Socket()
             val ok = runCatching {
                 s.tcpNoDelay = true
-                s.connect(InetSocketAddress(dst, dport), 10_000)
+                // 10.0.2.2 is this app: its USB/IP server (UsbBridge) listens on the loopback only.
+                val target = if (dst.hostAddress == "10.0.2.2" && dport == UsbBridge.USBIP_PORT) InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)) else dst
+                s.connect(InetSocketAddress(target, dport), 10_000)
             }.isSuccess
             synchronized(conn.lock) {
                 if (conn.dead) { runCatching { s.close() }; return@Thread }

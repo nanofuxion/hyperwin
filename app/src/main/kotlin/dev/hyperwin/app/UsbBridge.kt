@@ -15,17 +15,19 @@ import java.nio.ByteBuffer
 /**
  * USB passthrough, phone side (usb/README.md): finds devices, asks permission, opens and claims them, and
  * gives the usbfs file descriptor to native code, which serves Windows' requests through the shared USB region.
- * Off until switched on: `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable true` (Settings comes with phase 3).
+ * On by default: Android asks the user whether this app may use each device when it is plugged in, and that is the consent.
+ * `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable false` turns it off (Settings comes with phase 3).
  * Devices the phone's own input paths already carry (keyboards, mice, gamepads) and hubs stay with Android.
  */
 object UsbBridge {
     private const val TAG = "HyperWinUsb"
+    const val USBIP_PORT = 3240   // 127.0.0.1 only; the guest reaches it as 10.0.2.2 (GuestNet)
     private const val ACTION_PERMISSION = "dev.hyperwin.app.USB_PERMISSION"
     private const val ACTION_SWITCH = "dev.hyperwin.app.USB_PASS"
     private const val ACTION_DUMP = "dev.hyperwin.app.USB_DUMP"   // debug: log 48 bytes of the region at --ei offset
     init { System.loadLibrary("hyperwin") }
 
-    private class Open(val device: UsbDevice, val connection: UsbDeviceConnection, val slot: Int)
+    private class Open(val device: UsbDevice, val connection: UsbDeviceConnection, val slot: Int, val usbip: Boolean)
 
     private var ctx: Context? = null
     private var manager: UsbManager? = null
@@ -40,7 +42,9 @@ object UsbBridge {
         manager = ctx!!.getSystemService(Context.USB_SERVICE) as UsbManager
         nativeStart(region)
         regionBuffer = region
-        enabled = ctx!!.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).getBoolean("usb_pass", false)
+        if (usbipMode()) Log.i(TAG, "usbip server " + nativeUsbipStart(USBIP_PORT))
+        enabled = ctx!!.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).getBoolean("usb_pass", true)
+        Log.i(TAG, "passthrough ${if (enabled) "on" else "off"} at start")
         val r = object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
                 val dev: UsbDevice? = i.getParcelableExtra(UsbManager.EXTRA_DEVICE)
@@ -76,6 +80,9 @@ object UsbBridge {
         open.values.toList().forEach { release(it.device) }
     }
 
+    /** USB/IP (usbip-win2 in Windows) is the default; "ring" serves the shared USB region instead (usbprobe, usb/README.md). */
+    private fun usbipMode() = ctx!!.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).getString("usb_mode", "usbip") != "ring"
+
     /** Input devices and hubs stay with Android. */
     private fun passes(d: UsbDevice): Boolean {
         if (d.deviceClass == UsbConstants.USB_CLASS_HUB) return false
@@ -96,15 +103,20 @@ object UsbBridge {
         val c = m.openDevice(d) ?: return Unit.also { Log.w(TAG, "cannot open ${d.deviceName}") }
         for (n in 0 until d.interfaceCount) c.claimInterface(d.getInterface(n), true)   // takes it from Android's drivers
         val raw = c.rawDescriptors
-        val slot = nativeAttach(c.fileDescriptor, d.deviceId, d.vendorId, d.productId, 3, raw)   // native reads the real speed
+        val usbip = usbipMode()
+        val slot = if (usbip) {
+            // /dev/bus/usb/BBB/DDD
+            val parts = d.deviceName.split('/')
+            nativeUsbipAdd(c.fileDescriptor, parts[parts.size - 2].toInt(), parts.last().toInt(), d.vendorId, d.productId, raw)
+        } else nativeAttach(c.fileDescriptor, d.deviceId, d.vendorId, d.productId, 3, raw)   // native reads the real speed
         if (slot < 0) { Log.w(TAG, "no slot for ${d.deviceName}: $slot"); c.close(); return }
-        open[d.deviceName] = Open(d, c, slot)
+        open[d.deviceName] = Open(d, c, slot, usbip)
         Log.i(TAG, "${d.deviceName} ${"%04x:%04x".format(d.vendorId, d.productId)} in slot $slot")
     }
 
     private fun release(d: UsbDevice) {
         val o = open.remove(d.deviceName) ?: return
-        nativeDetach(o.slot)
+        if (o.usbip) nativeUsbipRemove(o.slot) else nativeDetach(o.slot)
         for (n in 0 until d.interfaceCount) runCatching { o.connection.releaseInterface(d.getInterface(n)) }
         o.connection.close()
         Log.i(TAG, "${d.deviceName} released")
@@ -113,5 +125,8 @@ object UsbBridge {
     @JvmStatic private external fun nativeStart(region: ByteBuffer)
     @JvmStatic private external fun nativeAttach(fd: Int, busId: Int, vid: Int, pid: Int, speed: Int, desc: ByteArray): Int
     @JvmStatic private external fun nativeDetach(slot: Int)
+    @JvmStatic private external fun nativeUsbipStart(port: Int): Int
+    @JvmStatic private external fun nativeUsbipAdd(fd: Int, busnum: Int, devnum: Int, vid: Int, pid: Int, desc: ByteArray): Int
+    @JvmStatic private external fun nativeUsbipRemove(slot: Int)
     @JvmStatic external fun nativeSlotState(slot: Int): Int
 }
