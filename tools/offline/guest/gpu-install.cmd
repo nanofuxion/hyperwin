@@ -4,13 +4,17 @@ rem the Vulkan driver vulkan_hwgpu.dll; also the input driver hwvsinput.sys, the
 rem service hwfiles.exe, the sound driver hwaudio.sys and the touch driver hwhid.sys. Run as administrator or SYSTEM, by firstboot.cmd on new machines and by
 rem the app on older ones. Safe to run again.
 set G=C:\HyperWin\gpu
+rem Only when the ring driver changed: the screen driver holds it open, so stopping it for nothing leaves it
+rem stopping until the next restart and the screen black.
+fc /b %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys >nul 2>&1 || (
 rem The storage service keeps the ring driver open, so it stops first.
 sc stop HyperWinFiles >nul 2>&1 && ping -n 3 127.0.0.1 >nul
 sc stop hwgpu >nul 2>&1
 copy /y %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys
+)
 sc query hwgpu >nul 2>&1 || sc create hwgpu type= kernel start= auto binPath= System32\drivers\hwgpu.sys DisplayName= "HyperWin GPU ring"
 sc config hwgpu start= auto
-sc start hwgpu
+sc start hwgpu >nul 2>&1
 rem Apps link to the Vulkan loader, which Windows does not ship. Keep one something else installed,
 rem and update ours (the marker says System32's copy came from here).
 if not exist %SystemRoot%\System32\vulkan-1.dll echo.> %G%\vulkan-1.ours
@@ -60,6 +64,10 @@ rem The desktop on the phone's GPU (wddm/README.md): DWM and the screen driver u
 rem screen driver asks for it. Set once; a value someone changed is left alone.
 reg query HKLM\SOFTWARE\HyperWin\Gpu /v HWD3D_SYSTEM >nul 2>&1 || reg add HKLM\SOFTWARE\HyperWin\Gpu /v HWD3D_SYSTEM /t REG_SZ /d dwm.exe,WUDFHost.exe /f >nul
 reg query HKLM\SOFTWARE\HyperWin\Gpu /v IddRender >nul 2>&1 || reg add HKLM\SOFTWARE\HyperWin\Gpu /v IddRender /t REG_DWORD /d 1 /f >nul
+rem The HyperWin screen is the display at every logon, not just the first: Windows can lose its display settings,
+rem and the phone's screen then stays black. Setting the mode again also starts the picture: a screen that is already
+rem right stays black after a boot until this runs.
+reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /v HyperWinScreen /t REG_SZ /d "%G%\dispset.exe auto" /f >nul
 rem The Vulkan loader finds drivers through this key: value name = the driver's manifest, data 0.
 rem Vulkan finds the driver through the adapter's VulkanDriverName. The global key is only for a
 rem machine that has no adapter (wddm/README.md).

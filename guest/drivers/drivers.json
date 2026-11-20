@@ -881,6 +881,15 @@
           "description": "HyperWin mouse"
         }
       ]
+    },
+    {
+      "service": "hwusbraw",
+      "file": "build/hwusbraw/hwusbraw.sys",
+      "start": 2,
+      "type": 1,
+      "class": "{4d36e97d-e325-11ce-bfc1-08002be10318}",
+      "className": "System",
+      "description": "HyperWin USB raw ring (USB passthrough tests; its own driver, apart from the GPU and display drivers)"
     }
   ]
 }

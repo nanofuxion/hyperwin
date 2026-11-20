@@ -6,6 +6,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$ROOT/app/src/main/assets/machine
 rm -rf "$OUT"
 mkdir -p "$OUT/drivers" "$OUT/efi"
+[ "$ROOT/build/hwusbraw/hwusbraw.sys" -nt "$ROOT/guest/drivers/hwusbraw/hwusbraw.c" ] || sh "$ROOT/guest/drivers/hwusbraw/build.sh" >/dev/null
 cp "$ROOT/guest/drivers/drivers.json" "$OUT/"
 python3 -I - "$ROOT/guest/drivers/drivers.json" <<'PY' | while read -r f; do cp "$ROOT/$f" "$OUT/drivers/"; done
 import json, sys
