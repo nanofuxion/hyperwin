@@ -718,7 +718,8 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     tr("Start");
     (void)ctx;
     (void)info;
-    g.dxgk = *iface;
+    RtlZeroMemory(&g.dxgk, sizeof g.dxgk);
+    RtlCopyMemory(&g.dxgk, iface, min((SIZE_T)iface->Size, sizeof g.dxgk));
     report_bases();
     if (d.on) hwd_size_from_phone();
     *sources = d.on ? 1 : 0;   /* render-only unless Parameters\Display asks for the screen half */
@@ -932,7 +933,7 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->ApertureSegmentCommitLimit = (SIZE_T)HW_HEAP_SIZE;
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     if (g_w2) {
-        caps->WDDMVersion = DXGKDDI_WDDMv2;
+        caps->WDDMVersion = DXGKDDI_WDDMv2_6;
         caps->MemoryManagementCaps.VirtualAddressingSupported = 1;
         caps->MemoryManagementCaps.GpuMmuSupported = 1;
         if (hwd_reg_dword(L"W2Kit", 0)) {
@@ -1045,6 +1046,7 @@ static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO 
         if (qai->OutputDataSize < sizeof(DXGK_GPUMMUCAPS)) return STATUS_BUFFER_TOO_SMALL;
         DXGK_GPUMMUCAPS *mm = qai->pOutputData;
         RtlZeroMemory(mm, sizeof *mm);
+        mm->ZeroInPteSupported = 1;
         mm->CacheCoherentMemorySupported = 1;
         mm->PageTableUpdateMode = DXGK_PAGETABLEUPDATE_CPU_VIRTUAL;
         mm->VirtualAddressBitCount = 39;
@@ -1057,8 +1059,16 @@ static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO 
         DXGK_PAGE_TABLE_LEVEL_DESC *lv = qai->pOutputData;
         RtlZeroMemory(lv, sizeof *lv);
         lv->PageTableIndexBitCount = 9;
+        lv->PageTableSegmentId = 2;               /* the aperture is segment 1, system memory the next one */
+        lv->PagingProcessPageTableSegmentId = 2;
         lv->PageTableSizeInBytes = 4096;
         lv->PageTableAlignmentInBytes = 4096;
+        return STATUS_SUCCESS;
+    }
+    case DXGKQAITYPE_HISTORYBUFFERPRECISION: {
+        if (!g_w2) return STATUS_NOT_SUPPORTED;
+        DXGKARG_HISTORYBUFFERPRECISION *hp = qai->pOutputData;
+        for (UINT i = 0; i < qai->OutputDataSize / sizeof *hp; i++) hp[i].PrecisionBits = 64;
         return STATUS_SUCCESS;
     }
     case DXGKQAITYPE_UMDRIVERPRIVATE:
@@ -1355,6 +1365,7 @@ static NTSTATUS NTAPI HwGetNodeMetadata(const HANDLE hAdapter, UINT node, DXGKAR
     (void)node;
     RtlZeroMemory(nm, sizeof *nm);
     nm->EngineType = DXGK_ENGINE_TYPE_3D;
+    if (g_w2) nm->GpuMmuSupported = 1;
     return STATUS_SUCCESS;
 }
 
@@ -1492,7 +1503,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     hwd_setup(&init);
     g_w2 = hwd_reg_dword(L"Wddm2", 0) != 0;
     if (g_w2) {
-        init.Version = DXGKDDI_INTERFACE_VERSION_WDDM2_0;
+        init.Version = DXGKDDI_INTERFACE_VERSION_WDDM2_6;
         init.DxgkDdiCreateProcess = HwCreateProcess;
         init.DxgkDdiDestroyProcess = HwDestroyProcess;
         init.DxgkDdiSetRootPageTable = HwSetRootPageTable;
@@ -1500,6 +1511,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
         init.DxgkDdiSubmitCommandVirtual = HwSubmitCommandVirtual;
         /* With a GPU address space there is no patching and no physical submit. */
         init.DxgkDdiSetStablePowerState = HwSetStablePowerState;
+        /* A WDDM 2.x table also carries the power component, history buffer and virtual machine entries. */
+        init.DxgkDdiSetPowerComponentFState = (PDXGKDDISETPOWERCOMPONENTFSTATE)HwSuccess;
+        init.DxgkDdiPowerRuntimeControlRequest = (PDXGKDDIPOWERRUNTIMECONTROLREQUEST)HwSuccess;
+        init.DxgkDdiFormatHistoryBuffer = (PDXGKDDI_FORMATHISTORYBUFFER)HwSuccess;
     }
     return HwDxgkInitialize(driver, registry, &init);
 }

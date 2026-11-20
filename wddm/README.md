@@ -1208,3 +1208,13 @@ buffers; the physical adapter handle is the start-device handle. With all of the
 `PHYSICALADAPTERCAPS` query, also with the query refused, an internal VA range, `NoDmaPatching` and a high address
 limit set. A boot ETW capture of `Microsoft-Windows-DxgKrnl` (autologger) is mostly display-manager noise.
 Still unknown. The default (`Wddm2` = 0) is unchanged: `dxtest 11` passes.
+
+### Compare with Microsoft's WDDM 2.6 compute sample (2026-11-20)
+
+`microsoft/graphics-driver-samples` (compute-only `CosKmd`, a GpuMmu driver at WDDM 2.6) differs from ours in these ways, now
+applied under `Wddm2` = 1: interface and caps at 2.6 (`0xB004`), the power component, history buffer and
+`SetStablePowerState` entries, `GpuMmuSupported` in the node metadata, page tables in segment 2 (the aperture is 1),
+`ZeroInPteSupported`, and history precision 64 bits. `Wddm2` = 1 still stops after `PHYSICALADAPTERCAPS`.
+Not yet tried: a power component (`NUMPOWERCOMPONENTS` = 1 with `POWERCOMPONENTINFO`), the device class (the sample
+is class ComputeAccelerator, ours is System), and `DxgkCbGetDeviceInformation` fields. The default build now compiles
+at the 2.6 headers and was rechecked: `dxtest 11`, `vktest` and `gltest` pass.
