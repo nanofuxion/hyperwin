@@ -78,6 +78,7 @@ done
 # DXVK, vkd3d-proton, Zink and HwD3D, which use.cmd puts beside a program (Send To in Explorer).
 cp -R "$ROOT/gpu/work/out/dx" "$OUT/guest/gpu/"
 perl -pe 's/\r?\n/\r\n/' "$ROOT/gpu/guest/dx/use.cmd" > "$OUT/guest/gpu/dx/use.cmd"
+cp "$ROOT/gpu/guest/dx/hasmanifest.ps1" "$OUT/guest/gpu/dx/hasmanifest.ps1"
 # The app compares this with C:\HyperWin\gpu\stamp.txt and sends the files again when they differ.
 STAMP=$(cd "$OUT/guest/gpu" && find . -type f | LC_ALL=C sort | xargs shasum | shasum | cut -c1-16)
 printf '%s\r\n' "$STAMP" > "$OUT/guest/gpu/stamp.txt"

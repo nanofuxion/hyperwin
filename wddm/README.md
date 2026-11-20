@@ -1253,3 +1253,26 @@ after the screen-mode enumeration (status 0xC00000E5 in the PnP log, problem 43)
 Next steps: hold the failed start earlier (in `DxgkDdiSetVidPnSourceVisibility` or the first `CreateContext`) with a short
 hold, take the dump with an agent that starts before PnP finishes, and read `!stacks` for the thread inside the start.
 Kernel debugging is off again on the test guest (`bcdedit /debug off`) and the default build is installed.
+
+### Direct3D 12 for now: vkd3d-proton chosen per program (2026-11-20, known issue)
+
+Deliberate exception to "no DLLs in Windows", for Direct3D 12 only, until the driver-level D3D12 (phase 8) works.
+Off by default: nothing changes for a program until it is chosen (Send To, "GPU - vkd3d-proton, Direct3D 12", or
+`gpu\dx\use.cmd vkd3d <program.exe>`). Direct3D 9 to 11 programs stay clean. Windows' own `d3d12.dll` is never replaced.
+
+What Windows allows for `d3d12.dll` (tested with `dxtest 12` on the test guest, ARM64):
+
+| Way | Works? |
+| --- | --- |
+| `PATH` containing the vkd3d folder | No: System32 is searched before `PATH` |
+| `<program>.exe.local` folder (with `DevOverrideEnable`) | No, same session; not worth a reboot-time system setting |
+| External `<program>.exe.manifest` with `<file name="d3d12.dll" loadFrom="...">` | **Yes**, for a program with no manifest of its own: the DLLs stay in `C:\HyperWin\gpu\dx\vkd3d` |
+| DLLs copied beside the program | Yes (the old way), used as the fallback for programs with their own manifest |
+
+`use.cmd vkd3d` picks the manifest when the program has none (`hasmanifest.ps1` checks for one), else copies. `use.cmd off`
+removes ours. Run: `dxtest 12` loads `C:\HyperWin\gpu\dx\vkd3d\d3d12.dll` and passes on `HyperWin GPU (Mali-G78)`.
+
+**Known issue:** a Direct3D 12 program chosen this way loads a visible vkd3d DLL (from the vkd3d folder or beside it). Games with
+kernel anti-cheat may refuse to start. The planned fix is the driver-level Direct3D 12 driver part, where Windows loads only our
+driver. 32-bit programs are not served (vkd3d-proton is ARM64X only here). The manifest route needs a path without
+parentheses.
