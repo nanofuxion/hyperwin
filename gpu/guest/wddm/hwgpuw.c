@@ -694,6 +694,12 @@ static void write_adapter_strings(const char *gpu)
     ZwSetValueKey(key, &us, 0, REG_SZ, name, (n + 1) * sizeof(WCHAR));
     RtlInitUnicodeString(&us, L"HardwareInformation.ChipType");
     ZwSetValueKey(key, &us, 0, REG_SZ, name, (n + 1) * sizeof(WCHAR));
+    /* Device Manager and dxdiag show the device's own name, not the adapter string: the same text
+     * goes there (the driver description, and the friendly name on the device node). */
+    RtlInitUnicodeString(&us, L"DriverDesc");
+    ZwSetValueKey(key, &us, 0, REG_SZ, name, (n + 1) * sizeof(WCHAR));
+    static const DEVPROPKEY friendly = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+    IoSetDevicePropertyData(g.pdo, &friendly, LOCALE_NEUTRAL, 0, DEVPROP_TYPE_STRING, (n + 1) * sizeof(WCHAR), name);
     RtlInitUnicodeString(&us, L"HardwareInformation.DACType");
     static const WCHAR dac[] = L"Phone";
     ZwSetValueKey(key, &us, 0, REG_SZ, (PVOID)dac, sizeof dac);
