@@ -84,4 +84,7 @@ VKTEST=$ROOT/../sweetcider-gpu/tools/gfxstream-guest/vktest
 # of the driver.
 "$T/x86_64-w64-mingw32-clang" -std=c11 -O1 -I"$WORK/shim" -I"$SRC/include" -I"$VKTEST" \
   -o "$OUT/vktest-x64.exe" "$VKTEST/vktest.c"
+# And as a 32-bit program, through the 32-bit loader and VulkanDriverNameWow.
+"$T/i686-w64-mingw32-clang" -std=c11 -O1 -I"$WORK/shim" -I"$SRC/include" -I"$VKTEST" \
+  -o "$OUT/vktest-x86.exe" "$VKTEST/vktest.c"
 ls -la "$OUT"
