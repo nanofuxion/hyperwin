@@ -1198,3 +1198,13 @@ no `Render`/`RenderKm`/`Present` entries, the physical adapter handle set. A WDD
 stops one query earlier. Two nodes (a separate paging node) hung the boot at a black screen: the crash-loop guard
 let the next start through without the driver. Unknown so far: what dxgkrnl checks after that query. A kernel debugger
 view of dxgkrnl, or the checks of a known-good WDDM 2.0 miniport, would settle it.
+
+### Rules from a public WDDM 2.x miniport (2026-11-20)
+
+`D-Ogi/amdgpu-wddm` (PolyForm Noncommercial: read for facts only, nothing copied) lists what dxgkrnl checks, taken from
+Microsoft's docs and a reading of dxgkrnl. Applied here: `DxgkDdiSetStablePowerState` and `DxgkDdiCalibrateGpuClock`
+are both needed from interface 0x5008; GpuMmu needs `VirtualAddressingSupported`; the legacy `SubmitCommand` stays for paging
+buffers; the physical adapter handle is the start-device handle. With all of these `Wddm2` = 1 still stops after the
+`PHYSICALADAPTERCAPS` query, also with the query refused, an internal VA range, `NoDmaPatching` and a high address
+limit set. A boot ETW capture of `Microsoft-Windows-DxgKrnl` (autologger) is mostly display-manager noise.
+Still unknown. The default (`Wddm2` = 0) is unchanged: `dxtest 11` passes.

@@ -869,6 +869,12 @@ static VOID NTAPI HwControlEtw(BOOLEAN enable, ULONG flags, UCHAR level)
  * stay empty for now: the entries below are what the memory manager needs in order to start the adapter. */
 static BOOLEAN g_w2;
 
+static VOID NTAPI HwSetStablePowerState(const HANDLE hAdapter, const DXGKARG_SETSTABLEPOWERSTATE *p)
+{
+    (void)hAdapter;
+    (void)p;
+}
+
 static NTSTATUS NTAPI HwCreateProcess(const HANDLE hAdapter, DXGKARG_CREATEPROCESS *p)
 {
     (void)hAdapter;
@@ -927,9 +933,15 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     if (g_w2) {
         caps->WDDMVersion = DXGKDDI_WDDMv2;
+        caps->MemoryManagementCaps.VirtualAddressingSupported = 1;
         caps->MemoryManagementCaps.GpuMmuSupported = 1;
-        caps->PresentationCaps.SupportKernelModeCommandBuffer = 0;
-        caps->SchedulingCaps.NoDmaPatching = 1;
+        if (hwd_reg_dword(L"W2Kit", 0)) {
+            caps->HighestAcceptableAddress.QuadPart = (LONGLONG)-1;
+            caps->InternalGpuVirtualAddressRangeStart = 0x1000;
+            caps->InternalGpuVirtualAddressRangeEnd = 0x1000000;
+            caps->SchedulingCaps.NoDmaPatching = 1;
+            caps->SchedulingCaps.CancelCommandAware = 1;
+        }
     }
     caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
     caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -1018,13 +1030,14 @@ static NTSTATUS qai_inner(const HANDLE hAdapter, const DXGKARG_QUERYADAPTERINFO 
     case DXGKQAITYPE_QUERYSEGMENT4:
         return query_segments4(qai);
     case DXGKQAITYPE_PHYSICALADAPTERCAPS:
+        if (hwd_reg_dword(L"W2NoQ15", 0)) return STATUS_NOT_SUPPORTED;
         if (qai->OutputDataSize < FIELD_OFFSET(DXGK_PHYSICALADAPTERCAPS, Flags) + sizeof(DXGK_PHYSICALADAPTERFLAGS)) return STATUS_BUFFER_TOO_SMALL;
         RtlZeroMemory(qai->pOutputData, qai->OutputDataSize);
         {
             DXGK_PHYSICALADAPTERCAPS *pc = qai->pOutputData;
             pc->NumExecutionNodes = 1;
             pc->PagingNodeIndex = 0;
-            pc->DxgkPhysicalAdapterHandle = hAdapter;
+            pc->DxgkPhysicalAdapterHandle = g.dxgk.DeviceHandle;
             pc->Flags.GpuMmuSupported = 1;
         }
         return STATUS_SUCCESS;
@@ -1486,11 +1499,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
         init.DxgkDdiGetRootPageTableSize = HwGetRootPageTableSize;
         init.DxgkDdiSubmitCommandVirtual = HwSubmitCommandVirtual;
         /* With a GPU address space there is no patching and no physical submit. */
-        init.DxgkDdiPatch = NULL;
-        init.DxgkDdiSubmitCommand = NULL;
-        init.DxgkDdiRender = NULL;
-        init.DxgkDdiRenderKm = NULL;
-        init.DxgkDdiPresent = NULL;
+        init.DxgkDdiSetStablePowerState = HwSetStablePowerState;
     }
     return HwDxgkInitialize(driver, registry, &init);
 }
