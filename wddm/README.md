@@ -1237,3 +1237,19 @@ GDI `CreateContext` (the 1.3 run goes on to `CreateContext`, `CreateAllocation`,
 Tried at interface 0x5023 and 0xB004, WDDM 2.0 and 2.6 declared: same place. The trace has a filter for frequent calls
 and the paging, submit and engine entries (`-DHWW_TRACE`, `Parameters\Trace2`, read with
 `reg query`). Not traced: what dxgkrnl itself does between the two calls, so a kernel debugger is the clean way on.
+
+### Debugger work on the Wddm2 stall: where it stopped (2026-11-20, time limit reached)
+
+What works: a live kernel dump of the guest (`guest/tools/dbg/ld.c`), opened with the 2023 ARM64 `dbgeng.dll`
+(`guest/tools/dbg/lk.cpp`), with public symbols. Local kernel debugging does not attach on this guest.
+What it showed: nothing about the stall itself, because the failing adapter is already stopped and unloaded when a dump
+can be made. Holding `DxgkDdiStopDevice` (`Parameters\W2HoldStop`, seconds) to keep the caller's stack alive blocked the
+boot and ended in a SYSTEM_SERVICE_EXCEPTION with an access violation at a pool address: dxgkrnl calls into the driver after
+it unloaded. That matches the 6008 unexpected shutdowns seen before and is what fills the crash guard (`NoGuard` = 1
+turns the guard off for tests, never leave it on).
+Known facts for resuming: at WDDM 2.x with the flip caps the adapter starts (caps, GPU MMU queries, process, device, context all
+called). With `VirtualGpuOnly` it stays up but Windows hides it from programs. Without it and with `Display` = 1 the start fails
+after the screen-mode enumeration (status 0xC00000E5 in the PnP log, problem 43) and dxgkrnl then stops the adapter.
+Next steps: hold the failed start earlier (in `DxgkDdiSetVidPnSourceVisibility` or the first `CreateContext`) with a short
+hold, take the dump with an agent that starts before PnP finishes, and read `!stacks` for the thread inside the start.
+Kernel debugging is off again on the test guest (`bcdedit /debug off`) and the default build is installed.

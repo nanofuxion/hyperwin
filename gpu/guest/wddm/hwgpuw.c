@@ -762,6 +762,11 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
 
 static NTSTATUS NTAPI HwStopDevice(CONST PVOID ctx)
 {
+    if (g_w2 && hwd_reg_dword(L"W2HoldStop", 0)) {   /* debugging: stay here so the caller's stack can be read in a dump */
+        LARGE_INTEGER hold;
+        hold.QuadPart = -10LL * 1000 * 1000 * (LONGLONG)hwd_reg_dword(L"W2HoldStop", 0);
+        KeDelayExecutionThread(KernelMode, FALSE, &hold);
+    }
     tr("Stop");
     (void)ctx;
     hwd_stop();
@@ -1485,7 +1490,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
     static const WCHAR sub[] = L"\\Parameters";
     RtlCopyMemory(g.guard_path + chars, sub, sizeof sub);
     ULONG tries = guard_count(FALSE, 0);
-    if (tries >= 2) return STATUS_UNSUCCESSFUL;
+    report(L"EntryTries", tries);
+    if (tries >= 2 && !hwd_reg_dword(L"NoGuard", 0)) return STATUS_UNSUCCESSFUL;
     guard_count(TRUE, tries + 1);
 
     DRIVER_INITIALIZATION_DATA init;
@@ -1553,5 +1559,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry)
         init.DxgkDdiPowerRuntimeControlRequest = (PDXGKDDIPOWERRUNTIMECONTROLREQUEST)HwSuccess;
         init.DxgkDdiFormatHistoryBuffer = (PDXGKDDI_FORMATHISTORYBUFFER)HwSuccess;
     }
-    return HwDxgkInitialize(driver, registry, &init);
+    NTSTATUS ist = HwDxgkInitialize(driver, registry, &init);
+    report(L"InitializeStatus", (ULONG)ist);
+    return ist;
 }
