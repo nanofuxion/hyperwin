@@ -59,6 +59,7 @@ if defined PROG powershell -NoProfile -ExecutionPolicy Bypass -File "%LAYERS%has
    echo   ^<file name="d3d12core.dll" loadFrom="%LAYERS%vkd3d\d3d12core.dll"/^>
    echo   ^<file name="dxgi.dll" loadFrom="%LAYERS%dxvk\dxgi.dll"/^>
    echo ^</assembly^>) > "%PROG%.manifest"
+  copy /b "%PROG%+,," "%PROG%" >nul 2>&1
   echo vkd3d-proton: Direct3D 12 for %PROG% through %PROG%.manifest, files stay in %LAYERS%vkd3d
   exit /b 0
 )
@@ -79,7 +80,10 @@ exit /b 0
 
 :off
 rem Our manifest for a program goes too.
-if defined PROG if exist "%PROG%.manifest" findstr /c:"%LAYERS%vkd3d" "%PROG%.manifest" >nul 2>&1 && del "%PROG%.manifest"
+if defined PROG if exist "%PROG%.manifest" findstr /c:"%LAYERS%vkd3d" "%PROG%.manifest" >nul 2>&1 && (
+  del "%PROG%.manifest"
+  copy /b "%PROG%+,," "%PROG%" >nul 2>&1
+)
 rem Only our own copies go. A program's own file with one of these names stays.
 for %%l in (dxvk sarek vkd3d zink zink-x86 hwd3d) do for %%f in ("%LAYERS%%%l\*.dll") do (
   if exist "%~1\%%~nxf" fc /b "%%~f" "%~1\%%~nxf" >nul && del "%~1\%%~nxf"

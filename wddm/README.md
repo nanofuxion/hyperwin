@@ -1278,3 +1278,8 @@ removes ours. Run: `dxtest 12` loads `C:\HyperWin\gpu\dx\vkd3d\d3d12.dll` and pa
 kernel anti-cheat may refuse to start. The planned fix is the driver-level Direct3D 12 driver part, where Windows loads only our
 driver. 32-bit programs are not served (vkd3d-proton is ARM64X only here). The manifest route needs a path without
 parentheses.
+
+**Known issue (2026-11-20):** because the manifest sends `dxgi.dll` to DXVK's, the same program's Direct3D 11 then crashes in
+Windows' `d3d11.dll` (AIO `--cube dx11` with the manifest on: access violation at start). Programs that use both need
+`use.cmd off`. Windows also keeps using a cached activation context until the program's file changes, so `use.cmd` now touches the
+`.exe` when it adds or removes the manifest (before, a new manifest took effect only after the file changed).
