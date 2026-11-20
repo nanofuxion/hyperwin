@@ -221,7 +221,7 @@ fallback.
    backing, the EFI reservation, and a host-only `usb_ring_test` that runs the
    app side against a fake guest and a fake device (loopback control and bulk
    endpoints) on the Mac.
-2. **Android URB engine.** `UsbBridge.kt` and `usb_host.c` for control, bulk
+2. **Android URB engine.** *(built 2026-11-20: `UsbBridge.kt`, `app/src/main/cpp/usb_host.c`; the app starts it with the machine, off until `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable true`. Compiled and smoke-tested with no device attached. The real test below needs a flash drive on the phone's USB-C port: not run yet)* `UsbBridge.kt` and `usb_host.c` for control, bulk
    and interrupt transfers. Test: read a flash drive's descriptors and do a raw
    bulk read through the ring from the test guest on the phone.
 3. **`hwusb.sys` for control, bulk and interrupt.** Test: a flash drive mounts

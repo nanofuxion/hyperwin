@@ -209,6 +209,7 @@ object AvfPlan {
     ) {
         fun close() {
             FileShare.stop()   // its threads read the window
+            UsbBridge.stop()   // and so do the USB workers
             GuestAudio.stop()  // so do its streams
             runCatching { SharedMemory.unmap(buffer) }
             runCatching { fd.close() }

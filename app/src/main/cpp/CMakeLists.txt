@@ -3,7 +3,7 @@ project(hyperwin C)
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
 # Machine prep libraries come from tools/third_party/build.sh android.
 set(PREP ${ROOT}/build/third_party/android-prep)
-add_library(hyperwin SHARED jni.c files.c audio_host.c
+add_library(hyperwin SHARED jni.c files.c audio_host.c usb_host.c ${ROOT}/usb/host/usb_engine.c
     ${ROOT}/core/ring.c
     ${ROOT}/core/tpm2.c
     ${ROOT}/core/sha256.c
