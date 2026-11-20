@@ -1163,3 +1163,9 @@ or Zink file goes beside a program or into one, so anti-cheat sees a plain GPU d
 therefore forwards its DDI calls to the phone, where vkd3d-proton for Android runs. The earlier idea of loading
 a vkd3d `d3d12core.dll` inside Windows is dropped. The Send To entries that copy those DLLs beside a program
 (`gpu\dx\use.cmd`) are not extended and will go once the phone side picks the translator.
+
+### Check, 2026-11-20: DWM composes on the GPU (fresh machine, default install)
+
+`hwwtest counters` lists `dwm.exe` (process 384) with a channel to the phone and 289740 submits, while
+the byte counters stay at 0 both ways. `HWD3D_SYSTEM` = `dwm.exe,WUDFHost.exe` and `IddRender` = 1 came from the
+default install, and the first-logon `dispset auto` made the HyperWin screen the primary display.
