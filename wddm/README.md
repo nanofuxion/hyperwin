@@ -1155,3 +1155,11 @@ root page table entries). Next: raise `hwgpuw.sys` to WDDM 2.0, then retry befor
 
 The adapter friendly name now reads `HyperWin GPU (Mali-G78)` on the device node (`Enum\ROOT\SYSTEM\0001`).
 `vktest` passes as ARM64, x64 and x86 through the system loader with no Khronos key.
+
+### Decision (2026-11-20): DirectX translation stays on the phone
+
+Windows holds only the driver: the kernel part and the user-mode DLLs in the driver store. No DXVK, vkd3d-proton
+or Zink file goes beside a program or into one, so anti-cheat sees a plain GPU driver. The Direct3D 12 driver part
+therefore forwards its DDI calls to the phone, where vkd3d-proton for Android runs. The earlier idea of loading
+a vkd3d `d3d12core.dll` inside Windows is dropped. The Send To entries that copy those DLLs beside a program
+(`gpu\dx\use.cmd`) are not extended and will go once the phone side picks the translator.
