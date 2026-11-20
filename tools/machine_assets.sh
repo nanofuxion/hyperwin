@@ -65,6 +65,13 @@ done
 mkdir -p "$OUT/guest/gpu/hwidd"
 cp "$ROOT"/build/hwidd/pkg/* "$OUT/guest/gpu/hwidd/"
 [ -f "$ROOT/build/hwwtest.exe" ] && cp "$ROOT/build/hwwtest.exe" "$OUT/guest/gpu/"
+# USB tests (usb/README.md): the raw ring driver, its install and remove scripts, and the guest test program. They are
+# sent with the GPU files but nothing installs or starts them; the GPU and display drivers have no USB code in them.
+[ "$ROOT/build/hwusbraw/hwusbraw.sys" -nt "$ROOT/guest/drivers/hwusbraw/hwusbraw.c" ] || sh "$ROOT/guest/drivers/hwusbraw/build.sh" >/dev/null
+[ "$ROOT/build/usbprobe.exe" -nt "$ROOT/guest/tools/usbprobe.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 -I"$ROOT/include" "$ROOT/guest/tools/usbprobe.c" -o "$ROOT/build/usbprobe.exe"
+mkdir -p "$OUT/guest/gpu/usb"
+cp "$ROOT/build/hwusbraw/hwusbraw.sys" "$ROOT/build/usbprobe.exe" "$OUT/guest/gpu/usb/"
+for f in install-usb.cmd remove-usb.cmd; do perl -pe 's/\r?\n/\r\n/' "$ROOT/guest/drivers/hwusbraw/$f" > "$OUT/guest/gpu/usb/$f"; done
 # Makes the HyperWin screen the only display once, at first logon (guest/tools/dispset.c).
 [ "$ROOT/build/dispset.exe" -nt "$ROOT/guest/tools/dispset.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 "$ROOT/guest/tools/dispset.c" -o "$ROOT/build/dispset.exe" -luser32
 cp "$ROOT/build/dispset.exe" "$OUT/guest/gpu/"

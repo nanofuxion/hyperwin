@@ -215,13 +215,24 @@ the dock from Android, and the app could send a second Windows display to it.
 That needs its own display driver in Windows, so it isn't simpler. It's just a
 fallback.
 
+## Rule: USB stays out of the GPU and display drivers
+
+No USB code goes into `hwgpu.sys`, `hwgpuw.sys` or the display drivers: if USB fails, the screen must not. USB has drivers
+of its own, installed only when wanted and off by default. `guest/drivers/hwusbraw` is the first one: a small legacy driver
+that maps the USB region in the kernel and lets SYSTEM read and write it by IOCTL (`include/hwusbraw_ioctl.h`), for tests.
+`C:\HyperWin\gpu\usb\install-usb.cmd` installs it (demand start), `remove-usb.cmd` takes it out. `hwusb.sys` (phase 3) will be
+its own driver the same way. The files travel with the GPU files but nothing installs or starts them.
+
+Windows would not map more than a megabyte or two of the region into a program, so the test program copies through the
+driver instead; bulk data stays in the arena and never comes to the program.
+
 ## Phases
 
 1. **ABI and region.** *(done, 2026-11-20: `include/hw_usb.h`, `usb/host/usb_engine.[ch]`, `usb/test/usb_ring_test.c`, `make test`; the app creates the region and Windows still boots with it)* `include/hw_usb.h` with static asserts, the `AvfPlan`
    backing, the EFI reservation, and a host-only `usb_ring_test` that runs the
    app side against a fake guest and a fake device (loopback control and bulk
    endpoints) on the Mac.
-2. **Android URB engine.** *(built 2026-11-20: `UsbBridge.kt`, `app/src/main/cpp/usb_host.c`; the app starts it with the machine, off until `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable true`. Compiled and smoke-tested with no device attached. The real test below needs a flash drive on the phone's USB-C port: not run yet)* `UsbBridge.kt` and `usb_host.c` for control, bulk
+2. **Android URB engine.** *(built; the guest side of the test is `guest/tools/usbprobe.c` over `hwusbraw`; built 2026-11-20: `UsbBridge.kt`, `app/src/main/cpp/usb_host.c`; the app starts it with the machine, off until `am broadcast -a dev.hyperwin.app.USB_PASS --ez enable true`. Compiled and smoke-tested with no device attached. The real test below needs a flash drive on the phone's USB-C port: not run yet)* `UsbBridge.kt` and `usb_host.c` for control, bulk
    and interrupt transfers. Test: read a flash drive's descriptors and do a raw
    bulk read through the ring from the test guest on the phone.
 3. **`hwusb.sys` for control, bulk and interrupt.** Test: a flash drive mounts

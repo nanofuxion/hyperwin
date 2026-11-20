@@ -11,7 +11,6 @@
 #define HYPERWIN_HW_USB_H
 
 #include <stdint.h>
-#include <string.h>
 #include "hw_abi.h"
 
 #define HW_USB_SIZE (64ull * 1024ull * 1024ull)

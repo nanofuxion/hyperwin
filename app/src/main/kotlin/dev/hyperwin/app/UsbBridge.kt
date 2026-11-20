@@ -22,6 +22,7 @@ object UsbBridge {
     private const val TAG = "HyperWinUsb"
     private const val ACTION_PERMISSION = "dev.hyperwin.app.USB_PERMISSION"
     private const val ACTION_SWITCH = "dev.hyperwin.app.USB_PASS"
+    private const val ACTION_DUMP = "dev.hyperwin.app.USB_DUMP"   // debug: log 48 bytes of the region at --ei offset
     init { System.loadLibrary("hyperwin") }
 
     private class Open(val device: UsbDevice, val connection: UsbDeviceConnection, val slot: Int)
@@ -31,12 +32,14 @@ object UsbBridge {
     private val open = HashMap<String, Open>()
     @Volatile private var enabled = false
     private var receiver: BroadcastReceiver? = null
+    private var regionBuffer: ByteBuffer? = null
 
     fun start(context: Context, region: ByteBuffer) {
         stop()
         ctx = context.applicationContext
         manager = ctx!!.getSystemService(Context.USB_SERVICE) as UsbManager
         nativeStart(region)
+        regionBuffer = region
         enabled = ctx!!.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).getBoolean("usb_pass", false)
         val r = object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
@@ -45,6 +48,10 @@ object UsbBridge {
                     UsbManager.ACTION_USB_DEVICE_ATTACHED -> if (dev != null) offer(dev)
                     UsbManager.ACTION_USB_DEVICE_DETACHED -> if (dev != null) release(dev)
                     ACTION_PERMISSION -> if (dev != null && i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) attach(dev)
+                    ACTION_DUMP -> regionBuffer?.let { b ->
+                        val n = i.getIntExtra("offset", 0)
+                        Log.i(TAG, "region[$n..]: " + (0 until 48).joinToString("") { "%02x".format(b.get(n + it)) })
+                    }
                     ACTION_SWITCH -> {
                         enabled = i.getBooleanExtra("enable", false)
                         c.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).edit().putBoolean("usb_pass", enabled).apply()
@@ -56,7 +63,7 @@ object UsbBridge {
         }
         val f = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED); addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-            addAction(ACTION_PERMISSION); addAction(ACTION_SWITCH)
+            addAction(ACTION_PERMISSION); addAction(ACTION_SWITCH); addAction(ACTION_DUMP)
         }
         ctx!!.registerReceiver(r, f, Context.RECEIVER_EXPORTED)
         receiver = r
