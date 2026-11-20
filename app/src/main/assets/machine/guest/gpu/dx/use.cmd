@@ -57,11 +57,13 @@ if defined PROG powershell -NoProfile -ExecutionPolicy Bypass -File "%LAYERS%has
    echo ^<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"^>
    echo   ^<file name="d3d12.dll" loadFrom="%LAYERS%vkd3d\d3d12.dll"/^>
    echo   ^<file name="d3d12core.dll" loadFrom="%LAYERS%vkd3d\d3d12core.dll"/^>
+   echo   ^<file name="dxgi.dll" loadFrom="%LAYERS%dxvk\dxgi.dll"/^>
    echo ^</assembly^>) > "%PROG%.manifest"
   echo vkd3d-proton: Direct3D 12 for %PROG% through %PROG%.manifest, files stay in %LAYERS%vkd3d
   exit /b 0
 )
 for %%f in (d3d12 d3d12core) do copy /y "%LAYERS%vkd3d\%%f.dll" "%~1\" >nul
+copy /y "%LAYERS%dxvk\dxgi.dll" "%~1\" >nul
 echo vkd3d-proton: Direct3D 12 in %~1 (copies: the program has its own manifest or is a folder)
 exit /b 0
 

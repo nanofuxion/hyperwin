@@ -1269,6 +1269,8 @@ What Windows allows for `d3d12.dll` (tested with `dxtest 12` on the test guest, 
 | External `<program>.exe.manifest` with `<file name="d3d12.dll" loadFrom="...">` | **Yes**, for a program with no manifest of its own: the DLLs stay in `C:\HyperWin\gpu\dx\vkd3d` |
 | DLLs copied beside the program | Yes (the old way), used as the fallback for programs with their own manifest |
 
+The manifest also points `dxgi.dll` at DXVK's (a visible DLL too: vkd3d-proton needs it for swap chains; without it the AIO scene says "Could not create the Direct3D 12 swapchain"). The AIO Direct3D 12 scene then runs at 114 FPS on the phone GPU.
+
 `use.cmd vkd3d` picks the manifest when the program has none (`hasmanifest.ps1` checks for one), else copies. `use.cmd off`
 removes ours. Run: `dxtest 12` loads `C:\HyperWin\gpu\dx\vkd3d\d3d12.dll` and passes on `HyperWin GPU (Mali-G78)`.
 
