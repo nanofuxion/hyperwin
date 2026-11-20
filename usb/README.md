@@ -5,8 +5,8 @@ The data moves through shared memory, not vsock, so it runs at RAM speed.
 DisplayLink docks are the main reason to build this. Storage, network
 adapters, audio interfaces, webcams and security keys come with it.
 
-Nothing here is built yet. Keyboards, mice and gamepads already reach Windows
-through the input paths and can stay there.
+Status: phase 1 is built (the ABI, the shared region, and a host test). Nothing else is yet. Keyboards, mice and
+gamepads already reach Windows through the input paths and can stay there.
 
 ## How it works
 
@@ -95,6 +95,8 @@ Each one is passed through on its own.
   input paths.
 
 ## The shared region
+
+Layout as built: the global area is 64 KiB (header and the device table), then 8 slots of `HW_USB_SLOT_STRIDE` = 8 MiB less 8 KiB each (control page 4 KiB, two rings of 32 KiB, arena about 7.93 MiB). The firmware keeps the region from Windows like the heap.
 
 The window is nearly full. 4K frames, GPU rings and file slots use almost all
 of the 128 MiB. USB gets its own region, set up the same way as the GPU heap:
@@ -215,7 +217,7 @@ fallback.
 
 ## Phases
 
-1. **ABI and region.** `include/hw_usb.h` with static asserts, the `AvfPlan`
+1. **ABI and region.** *(done, 2026-11-20: `include/hw_usb.h`, `usb/host/usb_engine.[ch]`, `usb/test/usb_ring_test.c`, `make test`; the app creates the region and Windows still boots with it)* `include/hw_usb.h` with static asserts, the `AvfPlan`
    backing, the EFI reservation, and a host-only `usb_ring_test` that runs the
    app side against a fake guest and a fake device (loopback control and bulk
    endpoints) on the Mac.

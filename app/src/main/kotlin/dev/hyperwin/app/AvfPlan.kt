@@ -23,8 +23,11 @@ object AvfPlan {
      */
     const val HEAP_SIZE_MIB = 512
     const val HEAP_SIZE = HEAP_SIZE_MIB * 1024 * 1024
-    /** Memory the VM needs beyond what Windows itself gets: the window and the GPU heap. */
-    const val SHARED_MIB = WINDOW_SIZE_MIB + HEAP_SIZE_MIB
+    /** USB passthrough (include/hw_usb.h, usb/README.md): a third region right below the heap. */
+    const val USB_SIZE_MIB = 64
+    const val USB_SIZE = USB_SIZE_MIB * 1024 * 1024
+    /** Memory the VM needs beyond what Windows itself gets: the window, the GPU heap and the USB region. */
+    const val SHARED_MIB = WINDOW_SIZE_MIB + HEAP_SIZE_MIB + USB_SIZE_MIB
     const val WINDOWS_VM_MEMORY_MIB = WINDOWS_MEMORY_MIB + SHARED_MIB
     const val WINDOW_GUARD_BELOW_TOP_MIB = 16
     /** Default guest frame size. A machine may ask for another; see include/hw_abi.h for the limits. */
@@ -44,7 +47,11 @@ object AvfPlan {
     /** Keep the ring inside UEFI conventional RAM, with room below its top boundary. */
     const val WINDOW_PA = RAM_BASE_PA + (WINDOWS_MEMORY_MIB - WINDOW_SIZE_MIB - WINDOW_GUARD_BELOW_TOP_MIB).toLong() * 1024 * 1024
     const val HEAP_PA = WINDOW_PA - HEAP_SIZE.toLong()
+    const val USB_PA = HEAP_PA - USB_SIZE.toLong()
     const val VSOCK_PORT = 5601
+    const val USB_SLOTS = 8
+    /** (USB_SIZE - 64 KiB global area) / slots, as HW_USB_SLOT_STRIDE. */
+    const val USB_SLOT_STRIDE = (USB_SIZE - 0x10000) / USB_SLOTS
 
     fun stageUnattended(ctx: Context): File {
         val root = File(ctx.filesDir, "oem").apply { mkdirs() }
@@ -83,7 +90,17 @@ object AvfPlan {
         val link = runCatching { Os.readlink("/proc/self/fd/${pfd.fd}") }.getOrDefault("?")
         // Zero until the renderer hands parts of it out; pages are only real once touched.
         val heap = SharedMemory.create("hyperwin-gpu", HEAP_SIZE)
-        return SharedWindow(shm, map, pfd, link, heap, fdOf(heap))
+        // The USB region starts with its global page (include/hw_usb.h): magic, version, slot count and stride,
+        // host_state = 1. The rest is zero; slots fill as devices are offered.
+        val usb = SharedMemory.create("hyperwin-usb", USB_SIZE)
+        val usbMap = usb.mapReadWrite().order(ByteOrder.LITTLE_ENDIAN)
+        usbMap.position(0)
+        usbMap.put("HWUSBRNG".toByteArray())
+        usbMap.putInt(8, 1)                       // version
+        usbMap.putInt(12, USB_SLOTS)              // slots
+        usbMap.putInt(16, 1)                      // host_state
+        usbMap.putInt(28, USB_SLOT_STRIDE)        // slot_stride
+        return SharedWindow(shm, map, pfd, link, heap, fdOf(heap), usb, usbMap, fdOf(usb))
     }
 
     private fun fdOf(shm: SharedMemory): ParcelFileDescriptor {
@@ -126,7 +143,7 @@ object AvfPlan {
                     val vmConfig = requireNotNull(args?.firstOrNull())
                     val rawConfig = vmConfig.javaClass.getMethod("getRawConfig").invoke(vmConfig)
                     val backingClass = Class.forName("android.system.virtualizationservice.CustomMemoryBackingFile")
-                    val backings = java.lang.reflect.Array.newInstance(backingClass, 2)
+                    val backings = java.lang.reflect.Array.newInstance(backingClass, 3)
                     fun backing(fd: ParcelFileDescriptor, start: Long, size: Long) = backingClass.getDeclaredConstructor().newInstance().also {
                         backingClass.getField("file").set(it, fd.dup())
                         backingClass.getField("rangeStart").setLong(it, start)
@@ -134,6 +151,7 @@ object AvfPlan {
                     }
                     java.lang.reflect.Array.set(backings, 0, backing(window.fd, WINDOW_PA, WINDOW_SIZE.toLong()))
                     java.lang.reflect.Array.set(backings, 1, backing(window.heapFd, HEAP_PA, HEAP_SIZE.toLong()))
+                    java.lang.reflect.Array.set(backings, 2, backing(window.usbFd, USB_PA, USB_SIZE.toLong()))
                     rawConfig.javaClass.getField("customMemoryBackingFiles").set(rawConfig, backings)
                     invokeBinderMethod(method, original, args)
                 }
@@ -185,6 +203,9 @@ object AvfPlan {
         val link: String,
         val heap: SharedMemory,
         val heapFd: ParcelFileDescriptor,
+        val usb: SharedMemory,
+        val usbBuffer: ByteBuffer,
+        val usbFd: ParcelFileDescriptor,
     ) {
         fun close() {
             FileShare.stop()   // its threads read the window
@@ -194,6 +215,9 @@ object AvfPlan {
             runCatching { memory.close() }
             runCatching { heapFd.close() }
             runCatching { heap.close() }
+            runCatching { SharedMemory.unmap(usbBuffer) }
+            runCatching { usbFd.close() }
+            runCatching { usb.close() }
         }
     }
 }

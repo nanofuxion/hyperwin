@@ -1,6 +1,7 @@
 /* First boot file on the setup disk. AVF has no QEMU bootindex, so the
  * installer would start on its own and never see the shared display. */
 #include "hw_abi.h"
+#include "../../include/hw_usb.h"
 
 typedef uint64_t (*efi_fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
@@ -144,6 +145,11 @@ uint64_t SetupBootEntry(void *image, void *system)
         /* The GPU heap below it (hw_abi.h) is the phone's too: keep it from Windows the same way. */
         for (i = 0; i < HW_HEAP_SIZE; i += 2u * 1024u * 1024u) {
             address = HW_HEAP_PA + i;
+            bs_fn(bs, 2)(2, 0, (2u * 1024u * 1024u) / 4096, (uint64_t)&address, 0, 0);
+        }
+        /* The USB region right below the heap (include/hw_usb.h) too. */
+        for (i = 0; i < HW_USB_SIZE; i += 2u * 1024u * 1024u) {
+            address = HW_USB_PA + i;
             bs_fn(bs, 2)(2, 0, (2u * 1024u * 1024u) / 4096, (uint64_t)&address, 0, 0);
         }
         paint(0);                 /* black, and byte-for-byte the frame the host starts with */

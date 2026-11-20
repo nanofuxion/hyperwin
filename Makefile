@@ -25,7 +25,11 @@ $(BUILD)/hwbridge: host/hwbridge.c core/ring.c core/tpm2.c core/sha256.c include
 $(BUILD)/bcd_testsign: core/bcd_testsign.c core/bcd_testsign.h | $(BUILD)
 	$(HOSTCC) $(CFLAGS) -DHW_BCD_TEST -o $@ core/bcd_testsign.c
 
-test: $(BUILD)/hwbridge $(BUILD)/bcd_testsign
+$(BUILD)/usb_ring_test: usb/test/usb_ring_test.c usb/host/usb_engine.c usb/host/usb_engine.h include/hw_usb.h | $(BUILD)
+	$(HOSTCC) -std=c11 -O1 -pthread -o $@ usb/test/usb_ring_test.c usb/host/usb_engine.c
+
+test: $(BUILD)/hwbridge $(BUILD)/bcd_testsign $(BUILD)/usb_ring_test
+	$(BUILD)/usb_ring_test
 	$(BUILD)/hwbridge test
 	$(BUILD)/bcd_testsign $(BUILD)/originals/BCD-original
 
