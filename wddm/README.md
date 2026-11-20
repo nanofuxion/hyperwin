@@ -1144,3 +1144,14 @@ our Direct3D 9 driver part with interface 8.
   `GetCaps` 2) or from this spare's display state after today's experiments is not known yet. Tools: the
   32-bit `ddraw.dll` and `ddraw.pdb` from the symbol server, `llvm-objdump`, and `dbgrun-x86` with
   command files (`$$<file`) instead of quoted commands.
+
+### Phase 8 probe result (2026-11-19, spare machine)
+
+With the `OpenAdapter12` skeleton installed, `dxtest 12` reaches the driver. The runtime calls `OpenAdapter12`,
+`GetCaps` with type 1074 (8 bytes), then `GetSupportedVersions` twice (size, then list with one slot, offering
+only the 0043 version). It then calls `CloseAdapter` and never calls `CreateDevice`. Most likely cause: the
+kernel part still reports WDDM 1.3, and D3D12 needs a WDDM 2.0 adapter (GPU virtual addressing, process and
+root page table entries). Next: raise `hwgpuw.sys` to WDDM 2.0, then retry before filling entries.
+
+The adapter friendly name now reads `HyperWin GPU (Mali-G78)` on the device node (`Enum\ROOT\SYSTEM\0001`).
+`vktest` passes as ARM64, x64 and x86 through the system loader with no Khronos key.
