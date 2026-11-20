@@ -1231,3 +1231,9 @@ machine goes down while Windows enumerates VidPN modes (`EnumVidPnCofuncModality
 Next: find why the VidPN enumeration fails under 2.x (view with `-DHWW_TRACE`: `Parameters\Trace2` keeps the last calls),
 or make the render adapter visible some other way. The default stays `Wddm2` = 0 and was rechecked (`dxtest 11`, `vktest`).
 Also: wait 25 s after registry writes before a restart, or they are lost.
+
+Update, same day: with the flip caps and `Display` = 1 the 2.x run dies after the VidPN enumeration, before the first
+GDI `CreateContext` (the 1.3 run goes on to `CreateContext`, `CreateAllocation`, `OpenAllocation`, `SetVidPnSourceAddress`).
+Tried at interface 0x5023 and 0xB004, WDDM 2.0 and 2.6 declared: same place. The trace has a filter for frequent calls
+and the paging, submit and engine entries (`-DHWW_TRACE`, `Parameters\Trace2`, read with
+`reg query`). Not traced: what dxgkrnl itself does between the two calls, so a kernel debugger is the clean way on.

@@ -192,14 +192,15 @@ static void report_bases(void)
 /* Bring-up trace, built with -DHWW_TRACE: the names of the driver entries dxgkrnl calls, in order, kept in the
  * service's Parameters key as Trace2. */
 #ifdef HWW_TRACE
-static CHAR g_tr[512];
+static CHAR g_tr[3000];
 static LONG g_trn;
 static void tr(const char *name)
 {
+    if (!strncmp(name, "HwdPresent", 10) || !strncmp(name, "HwdDescribeA", 12) || !strncmp(name, "StdData", 7) || !strncmp(name, "CreateDevice", 12) || !strncmp(name, "DestroyDevice", 13)) return;   /* too frequent */
     LONG at = InterlockedExchangeAdd(&g_trn, 0);
     if (at > (LONG)sizeof g_tr - 64) {   /* keep the last calls: drop the oldest half */
-        RtlMoveMemory(g_tr, g_tr + 256, (SIZE_T)(at - 256));
-        at -= 256;
+        RtlMoveMemory(g_tr, g_tr + 1500, (SIZE_T)(at - 1500));
+        at -= 1500;
     }
     for (ULONG i = 0; name[i] && at < (LONG)sizeof g_tr - 2; i++) g_tr[at++] = name[i];
     g_tr[at++] = ' ';
@@ -514,6 +515,7 @@ static NTSTATUS esc_unmap(struct hww_map *m)
 
 static NTSTATUS NTAPI HwEscape(const HANDLE hAdapter, const DXGKARG_ESCAPE *arg)
 {
+    tr("Escape");
     (void)hAdapter;
     if (!arg->pPrivateDriverData || arg->PrivateDriverDataSize < sizeof(struct hww_escape)) return STATUS_BUFFER_TOO_SMALL;
     struct hww_escape *e = arg->pPrivateDriverData;
@@ -953,7 +955,9 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
         caps->FlipCaps.FlipImmediateMmIo = 1;
         caps->FlipCaps.FlipIndependent = 1;
         caps->MaxQueuedFlipOnVSync = 1;
-        if (hwd_reg_dword(L"W2Virtual", 0)) caps->MiscCaps.VirtualGpuOnly = 1;   /* starts clean, but Windows hides such an adapter from programs */
+#if DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_5
+        if (hwd_reg_dword(L"W2Virtual", 0)) caps->MiscCaps.VirtualGpuOnly = 1;
+#endif   /* starts clean, but Windows hides such an adapter from programs */
         if (hwd_reg_dword(L"W2Kit", 0)) {
             caps->HighestAcceptableAddress.QuadPart = (LONGLONG)-1;
             caps->InternalGpuVirtualAddressRangeStart = 0x1000;
@@ -1207,6 +1211,7 @@ static NTSTATUS NTAPI HwSuccess(const HANDLE h, PVOID arg)
  * empty paging buffer is a finished one. */
 static NTSTATUS NTAPI HwBuildPagingBuffer(const HANDLE hAdapter, DXGKARG_BUILDPAGINGBUFFER *pb)
 {
+    tr("BuildPaging");
     (void)hAdapter;
     (void)pb;
     return STATUS_SUCCESS;
@@ -1214,6 +1219,7 @@ static NTSTATUS NTAPI HwBuildPagingBuffer(const HANDLE hAdapter, DXGKARG_BUILDPA
 
 static NTSTATUS NTAPI HwSubmitCommand(const HANDLE hAdapter, const DXGKARG_SUBMITCOMMAND *sc)
 {
+    tr("Submit");
     (void)hAdapter;
     g_diag.submits++;
     g_diag.last_submit = sc->SubmissionFenceId;
@@ -1276,6 +1282,7 @@ static BOOLEAN NTAPI sync_preempted(PVOID context)
 
 static NTSTATUS NTAPI HwPreemptCommand(const HANDLE hAdapter, const DXGKARG_PREEMPTCOMMAND *pc)
 {
+    tr("Preempt");
     (void)hAdapter;
     KIRQL irql;
     KeAcquireSpinLock(&g.pending_lock, &irql);
@@ -1289,6 +1296,7 @@ static NTSTATUS NTAPI HwPreemptCommand(const HANDLE hAdapter, const DXGKARG_PREE
 
 static NTSTATUS NTAPI HwQueryCurrentFence(const HANDLE hAdapter, DXGKARG_QUERYCURRENTFENCE *qf)
 {
+    tr("CurFence");
     (void)hAdapter;
     qf->CurrentFence = g.last_fence;
     return STATUS_SUCCESS;
@@ -1337,6 +1345,7 @@ static NTSTATUS NTAPI HwCollectDbgInfo(const HANDLE hAdapter, const DXGKARG_COLL
 
 static NTSTATUS NTAPI HwControlInterrupt(const HANDLE hAdapter, const DXGK_INTERRUPT_TYPE type, BOOLEAN enable)
 {
+    tr("CtlIntr");
     (void)hAdapter;
     return hwd_control_interrupt(type, enable);
 }
@@ -1346,6 +1355,7 @@ static NTSTATUS NTAPI HwControlInterrupt(const HANDLE hAdapter, const DXGK_INTER
 /* An engine reset drops everything queued; Windows needs the newest fence it dropped. */
 static NTSTATUS NTAPI HwResetEngine(const HANDLE hAdapter, DXGKARG_RESETENGINE *re)
 {
+    tr("ResetEng");
     (void)hAdapter;
     KIRQL irql;
     KeAcquireSpinLock(&g.pending_lock, &irql);
@@ -1366,6 +1376,7 @@ static NTSTATUS NTAPI HwResetEngine(const HANDLE hAdapter, DXGKARG_RESETENGINE *
  * engine apart from the channels, so the answer is always: responsive, and none but itself. */
 static NTSTATUS NTAPI HwQueryEngineStatus(const HANDLE hAdapter, DXGKARG_QUERYENGINESTATUS *qs)
 {
+    tr("QEngSt");
     (void)hAdapter;
     tr("EngineStatus");
     RtlZeroMemory(&qs->EngineStatus, sizeof qs->EngineStatus);
@@ -1375,6 +1386,7 @@ static NTSTATUS NTAPI HwQueryEngineStatus(const HANDLE hAdapter, DXGKARG_QUERYEN
 
 static NTSTATUS NTAPI HwQueryDependentEngineGroup(const HANDLE hAdapter, DXGKARG_QUERYDEPENDENTENGINEGROUP *dg)
 {
+    tr("QDepGrp");
     (void)hAdapter;
     tr("DepGroup");
     dg->DependentNodeOrdinalMask = 0;
@@ -1396,6 +1408,7 @@ static NTSTATUS NTAPI HwGetNodeMetadata(const HANDLE hAdapter, UINT node, DXGKAR
  * phone's work is paced on the phone. Report the CPU's counter as both, at its own frequency. */
 static NTSTATUS NTAPI HwCalibrateGpuClock(const HANDLE hAdapter, UINT32 node, UINT32 engine, DXGKARG_CALIBRATEGPUCLOCK *cal)
 {
+    tr("Calib");
     (void)hAdapter;
     (void)node;
     (void)engine;
@@ -1409,6 +1422,7 @@ static NTSTATUS NTAPI HwCalibrateGpuClock(const HANDLE hAdapter, UINT32 node, UI
 
 static NTSTATUS NTAPI HwCancelCommand(const HANDLE hAdapter, const DXGKARG_CANCELCOMMAND *cc)
 {
+    tr("Cancel");
     (void)hAdapter;
     (void)cc;
     return STATUS_SUCCESS;
