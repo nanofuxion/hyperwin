@@ -19,7 +19,7 @@ three build configuration files into `firmware/avf-edk2/conf` and removes LTO
 from its private GCC5 release flags. The source checkout is not edited.
 
 The known local source checkout used for feasibility work is
-`/path/to/edk2` at commit `b24306f`. Its working tree
+a local edk2 checkout at commit `b24306f`. Its working tree
 has unrelated local changes; the build script only reads the source and sends
 all build output to this directory.
 

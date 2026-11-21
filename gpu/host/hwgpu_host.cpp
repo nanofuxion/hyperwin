@@ -24,6 +24,9 @@
 #include <algorithm>
 #include <deque>
 #include <atomic>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <map>
 #include <memory>
 #include <set>
@@ -1304,6 +1307,14 @@ void hwgpu_host_set_layer_size(int view_width, int view_height) {
 void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height) {
 #ifdef __ANDROID__
     if (!ahb) return;
+    // The app's watchdog (DisplayWatchdog.kt) reads this file's time: Windows' screen is reaching the layer.
+    static std::atomic<uint32_t> shown_count{0};
+    if ((shown_count.fetch_add(1, std::memory_order_relaxed) & 31) == 0) {
+        if (const char* flag = getenv("HWGPU_SCREEN_FLAG")) {
+            int fd = open(flag, O_CREAT | O_WRONLY, 0600);
+            if (fd >= 0) { futimens(fd, nullptr); close(fd); }
+        }
+    }
     if (!g_screen_shown.exchange(true, std::memory_order_relaxed)) {
         g_scanout_flags.fetch_or(HWGPU_SCANOUT_DESKTOP);
         publish_scanout_flags();

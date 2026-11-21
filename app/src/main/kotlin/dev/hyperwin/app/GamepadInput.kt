@@ -30,21 +30,21 @@ object GamepadInput : InputManager.InputDeviceListener {
     private const val STICK_MAX = 32767
     private const val TRIGGER_MAX = 255
 
-    private const val XINPUT_DPAD_UP = 0x0001
-    private const val XINPUT_DPAD_DOWN = 0x0002
-    private const val XINPUT_DPAD_LEFT = 0x0004
-    private const val XINPUT_DPAD_RIGHT = 0x0008
-    private const val XINPUT_START = 0x0010
-    private const val XINPUT_BACK = 0x0020
-    private const val XINPUT_LEFT_THUMB = 0x0040
-    private const val XINPUT_RIGHT_THUMB = 0x0080
-    private const val XINPUT_LEFT_SHOULDER = 0x0100
-    private const val XINPUT_RIGHT_SHOULDER = 0x0200
-    private const val XINPUT_GUIDE = 0x0400
-    private const val XINPUT_A = 0x1000
-    private const val XINPUT_B = 0x2000
-    private const val XINPUT_X = 0x4000
-    private const val XINPUT_Y = 0x8000
+    internal const val XINPUT_DPAD_UP = 0x0001
+    internal const val XINPUT_DPAD_DOWN = 0x0002
+    internal const val XINPUT_DPAD_LEFT = 0x0004
+    internal const val XINPUT_DPAD_RIGHT = 0x0008
+    internal const val XINPUT_START = 0x0010
+    internal const val XINPUT_BACK = 0x0020
+    internal const val XINPUT_LEFT_THUMB = 0x0040
+    internal const val XINPUT_RIGHT_THUMB = 0x0080
+    internal const val XINPUT_LEFT_SHOULDER = 0x0100
+    internal const val XINPUT_RIGHT_SHOULDER = 0x0200
+    internal const val XINPUT_GUIDE = 0x0400
+    internal const val XINPUT_A = 0x1000
+    internal const val XINPUT_B = 0x2000
+    internal const val XINPUT_X = 0x4000
+    internal const val XINPUT_Y = 0x8000
 
     private val keyMap = mapOf(
         KeyEvent.KEYCODE_BUTTON_A to XINPUT_A,
@@ -80,6 +80,14 @@ object GamepadInput : InputManager.InputDeviceListener {
     }
 
     private val pads = Array(SLOTS) { Pad(it) }
+    private var touchActive = false
+    private var touchButtons = 0
+    private var touchLt = 0
+    private var touchRt = 0
+    private var touchLx = 0
+    private var touchLy = 0
+    private var touchRx = 0
+    private var touchRy = 0
     private var appContext: Context? = null
     private val main = Handler(Looper.getMainLooper())
 
@@ -128,7 +136,7 @@ object GamepadInput : InputManager.InputDeviceListener {
     /** Streams the phone's motion while player 1 is connected, the setting is on and the app is in front. */
     private fun updateSensing() {
         val ctx = appContext ?: return
-        val want = pads[0].connected && !paused && ds4(ctx)
+        val want = (pads[0].connected || touchActive) && !paused && ds4(ctx)
         if (want == sensing) return
         val sm = ctx.getSystemService(SensorManager::class.java)
         if (want) {
@@ -236,8 +244,71 @@ object GamepadInput : InputManager.InputDeviceListener {
 
     private fun send(pad: Pad) {
         if (pad.slot == 0) updateSensing()
-        VsockInput.pad(pad.slot, pad.connected, pad.keyButtons or pad.hatButtons, maxOf(pad.axisLt, pad.keyLt),
-            maxOf(pad.axisRt, pad.keyRt), pad.lx, pad.ly, pad.rx, pad.ry)
+        val useTouch = pad.slot == 0 && touchActive
+        val connected = pad.connected || useTouch
+        val buttons = pad.keyButtons or pad.hatButtons or (if (useTouch) touchButtons else 0)
+        val lt = maxOf(pad.axisLt, pad.keyLt, if (useTouch) touchLt else 0)
+        val rt = maxOf(pad.axisRt, pad.keyRt, if (useTouch) touchRt else 0)
+        val lx = if (useTouch && touchLx != 0) touchLx else pad.lx
+        val ly = if (useTouch && touchLy != 0) touchLy else pad.ly
+        val rx = if (useTouch && touchRx != 0) touchRx else pad.rx
+        val ry = if (useTouch && touchRy != 0) touchRy else pad.ry
+        VsockInput.pad(pad.slot, connected, buttons, lt, rt, lx, ly, rx, ry)
+    }
+
+    /** Virtual touch gamepad (player 1): connects or disconnects slot 0 when no physical pad is attached. */
+    fun setTouchActive(active: Boolean) {
+        if (touchActive == active) return
+        touchActive = active
+        if (!active) {
+            touchButtons = 0; touchLt = 0; touchRt = 0
+            touchLx = 0; touchLy = 0; touchRx = 0; touchRy = 0
+        }
+        send(pads[0])
+    }
+
+    fun setTouchButton(bit: Int, down: Boolean) {
+        val next = if (down) touchButtons or bit else touchButtons and bit.inv()
+        if (next == touchButtons) return
+        touchButtons = next
+        if (!touchActive) touchActive = true
+        send(pads[0])
+    }
+
+    fun setTouchTrigger(right: Boolean, value: Int) {
+        val clamped = value.coerceIn(0, TRIGGER_MAX)
+        if (right) {
+            if (touchRt == clamped) return
+            touchRt = clamped
+        } else {
+            if (touchLt == clamped) return
+            touchLt = clamped
+        }
+        if (!touchActive) touchActive = true
+        send(pads[0])
+    }
+
+    /** Analog stick for virtual touch pad: x in -1..1 (right positive), y in -1..1 (up positive). */
+    fun setTouchStick(right: Boolean, x: Float, y: Float) {
+        val sx = stick(x)
+        val sy = stick(y)
+        if (right) {
+            if (touchRx == sx && touchRy == sy) return
+            touchRx = sx; touchRy = sy
+        } else {
+            if (touchLx == sx && touchLy == sy) return
+            touchLx = sx; touchLy = sy
+        }
+        if (!touchActive) touchActive = true
+        send(pads[0])
+    }
+
+    fun clearTouchState() {
+        val had = touchButtons != 0 || touchLt != 0 || touchRt != 0 ||
+            touchLx != 0 || touchLy != 0 || touchRx != 0 || touchRy != 0
+        touchButtons = 0; touchLt = 0; touchRt = 0
+        touchLx = 0; touchLy = 0; touchRx = 0; touchRy = 0
+        if (had && touchActive) send(pads[0])
     }
 
     /** Debug builds: a made-up controller in a slot (GuestAgent's PAD broadcast). */

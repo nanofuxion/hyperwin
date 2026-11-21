@@ -22,7 +22,7 @@ EDK2 (`edk2-aarch64-code.fd`, QEMU's AAVMF build) is only the firmware for the t
 make test          # host-side frame, audio, pad, TPM
 make dll           # ARM64 bootstrap DLLs and the ICD stub
 tools/qemu/run-probe.sh
-HYPERWIN_ISO="/path/to/windows11-arm64 r1.iso" tools/qemu/run-iso.sh
+HYPERWIN_ISO=/path/to/windows11-arm64.iso tools/qemu/run-iso.sh
 ```
 
 x86_64 builds of the same DLLs can be made on `another machine`, which has `x86_64-w64-mingw32-gcc`. The guest image is ARM64, so the DLLs that tiny11 loads are the ARM64 ones.

@@ -16,3 +16,7 @@ firmware/avf-edk2/toolchain/
 guest/efi/*.aml
 guest/efi/*.hex
 app/src/main/assets/machine/guest/gpu/usb/usbip-setup.exe
+
+keystore.properties
+*.jks
+*.keystore

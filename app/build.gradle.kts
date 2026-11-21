@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -18,6 +20,27 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
 
+    // Release signing: keystore.properties (storeFile, storePassword, keyAlias, keyPassword) in the
+    // project root or in ~/.hyperwin-release. It is never committed. Without it the release APK is unsigned.
+    val keystoreProps = Properties().apply {
+        listOf(rootProject.file("keystore.properties"), File(System.getProperty("user.home"), ".hyperwin-release/keystore.properties"))
+            .firstOrNull { it.exists() }?.inputStream()?.use { load(it) }
+    }
+    signingConfigs {
+        if (keystoreProps.containsKey("storeFile")) create("release") {
+            storeFile = file(keystoreProps.getProperty("storeFile"))
+            storePassword = keystoreProps.getProperty("storePassword")
+            keyAlias = keystoreProps.getProperty("keyAlias")
+            keyPassword = keystoreProps.getProperty("keyPassword")
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.findByName("release")
+            isMinifyEnabled = false   // the app reaches AVF by reflection
+        }
+    }
+
     ndkVersion = "27.2.12479018"
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
 
@@ -34,6 +57,7 @@ android {
                 "**/ring_test",
                 "**/bctest",
                 "**/scaledtest",
+                "**/spvtest",
             )
         }
     }

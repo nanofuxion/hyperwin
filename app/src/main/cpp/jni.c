@@ -172,6 +172,30 @@ static void put_row(uint32_t *to, const uint32_t *in, uint32_t n, int bgra)
 }
 
 /* 1 drew a frame, 0 nothing new, -1 no guest frame or no surface. */
+/* The brightest colour channel among sampled pixels of the guest frame, 0..255; -1 when there is no frame.
+ * DisplayWatchdog uses it to tell a black screen from a dark one. */
+JNIEXPORT jint JNICALL
+Java_dev_hyperwin_app_WindowBridge_nativeFramePeak(JNIEnv *env, jclass cls, jobject windowBuffer)
+{
+    struct hw_header *h = (*env)->GetDirectBufferAddress(env, windowBuffer);
+    const uint8_t *src;
+    uint32_t front, x, y, peak = 0;
+    (void)cls;
+    if (!h || !hw_mode_ok(h)) return -1;
+    front = __atomic_load_n(&h->front, __ATOMIC_ACQUIRE);
+    if (front > 1) return -1;
+    src = (const uint8_t *)h + hw_frame_off(h, front);
+    for (y = h->height / 8; y < h->height - h->height / 16; y += 4)
+        for (x = h->width / 16; x < h->width - h->width / 16; x += 4) {
+            uint32_t px = *(const uint32_t *)(src + (size_t)y * h->stride + (size_t)x * 4);
+            uint32_t m = px & 255;
+            if (((px >> 8) & 255) > m) m = (px >> 8) & 255;
+            if (((px >> 16) & 255) > m) m = (px >> 16) & 255;
+            if (m > peak) peak = m;
+        }
+    return (jint)peak;
+}
+
 JNIEXPORT jint JNICALL
 Java_dev_hyperwin_app_WindowBridge_nativePresent(JNIEnv *env, jclass cls, jobject windowBuffer)
 {

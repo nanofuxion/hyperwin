@@ -192,6 +192,21 @@ object VsockInput {
             ((if (up) 1 else 0) or (if (e0) 2 else 0)).toByte()))
     }
 
+    /** Sends a virtual keyboard press/release from on-screen touch controls. */
+    fun virtualKey(keyCode: Int, down: Boolean): Boolean =
+        key(KeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, keyCode))
+
+    /** Sends a virtual mouse button press/release from on-screen touch controls. */
+    fun virtualMouseButton(mask: Int, down: Boolean): Boolean = synchronized(lock) {
+        val next = if (down) buttons or mask else buttons and mask.inv()
+        relative(0, 0, next)
+    }
+
+    /** Sends relative mouse movement or wheel steps from on-screen touch controls. */
+    fun virtualMouseMove(dx: Int, dy: Int, wheel: Int = 0): Boolean = synchronized(lock) {
+        relative(dx, dy, buttons, wheel)
+    }
+
     /** What fingers on the guest view do. */
     enum class TouchMode { TOUCH, TRACKPAD }
     @Volatile var touchMode = TouchMode.TOUCH

@@ -198,6 +198,7 @@ static NTSTATUS status_of(int err)
     case 16: return STATUS_SHARING_VIOLATION;          /* EBUSY */
     case 19: case 6: return STATUS_NO_SUCH_DEVICE;     /* ENODEV, ENXIO: the volume went away */
     case 116: case 9: return STATUS_FILE_INVALID;      /* ESTALE, EBADF */
+    case 110: return STATUS_IO_TIMEOUT;                 /* ETIMEDOUT: the phone gave up on a stuck folder */
     default: return STATUS_UNEXPECTED_IO_ERROR;
     }
 }
@@ -324,18 +325,26 @@ static NTSTATUS open_common(FSP_FILE_SYSTEM *fs, uint32_t op, uint32_t flags, PW
     return STATUS_SUCCESS;
 }
 
+static int wants_write(UINT32 access)
+{
+    return (access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL)) != 0;
+}
+
 static NTSTATUS create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 options, UINT32 access, UINT32 attributes,
                        PSECURITY_DESCRIPTOR desc, UINT64 allocation, PVOID *ctx, FSP_FSCTL_FILE_INFO *fi)
 {
-    (void)access; (void)attributes; (void)desc; (void)allocation;
-    return open_common(fs, HWF_CREATE, options & FILE_DIRECTORY_FILE ? HWF_DIR : 0, name, ctx, fi);
+    uint32_t flags = 0;
+    (void)attributes; (void)desc; (void)allocation;
+    if (options & FILE_DIRECTORY_FILE) flags |= HWF_DIR;
+    else if (wants_write(access)) flags |= HWF_OPEN_WRITE;
+    return open_common(fs, HWF_CREATE, flags, name, ctx, fi);
 }
 
 static NTSTATUS open_file(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 options, UINT32 access, PVOID *ctx,
                           FSP_FSCTL_FILE_INFO *fi)
 {
-    (void)options; (void)access;
-    return open_common(fs, HWF_OPEN, 0, name, ctx, fi);
+    (void)options;
+    return open_common(fs, HWF_OPEN, wants_write(access) ? HWF_OPEN_WRITE : 0, name, ctx, fi);
 }
 
 /* One request on an open file that answers with its information. */
@@ -667,7 +676,7 @@ static NTSTATUS read_directory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PW
     if (fsp_acquire_dir(&f->dir_buffer, marker == NULL, &st)) {
         int i;
         uint64_t first = 0;
-        int more = 1, ok = 1;
+        int more = 1, ok = 1, pages = 0;
         if (wcscmp(f->path, L"\\")) {
             struct hwf_info self = {0};
             self.kind = HWF_KIND_DIR;
@@ -677,17 +686,20 @@ static NTSTATUS read_directory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PW
             end(s);
             ok = add_entry(&f->dir_buffer, ".", 1, &self, &st) && add_entry(&f->dir_buffer, "..", 2, &self, &st);
         }
-        while (ok && more) {
+        while (ok && more && pages < 4096) {
             struct hwf_slot *s = begin(&i, HWF_LIST, vol_of(fs));
             s->offset = first;
+            pages++;
             if (!put_path(s->path, f->path)) { end(s); st = STATUS_OBJECT_NAME_INVALID; break; }
             int err = call(s);
             if (err) { end(s); st = status_of(err); break; }
             const uint8_t *p = hwf_data(region, (uint32_t)i), *stop = p + s->out_length;
             while (ok && p + sizeof(struct hwf_entry) <= stop) {
                 const struct hwf_entry *e = (const struct hwf_entry *)p;
+                size_t step = (sizeof *e + e->name_len + 7) & ~(size_t)7;
+                if (step < sizeof *e || p + step > stop) break;
                 ok = add_entry(&f->dir_buffer, (const char *)(e + 1), e->name_len, &e->info, &st);
-                p += (sizeof *e + e->name_len + 7) & ~(size_t)7;
+                p += step;
             }
             first += s->out_a;
             more = s->more && s->out_a;
@@ -750,7 +762,7 @@ static void mount(struct volume *v, const struct hwf_volume *hv)
     p.VolumeCreationTime = ((UINT64)now.dwHighDateTime << 32) | now.dwLowDateTime;
     p.VolumeSerialNumber = 0x48570000u | (hv->id & 0xffff);
     /* Windows may cache what it learned for a second; data stays cached while unchanged. */
-    p.FileInfoTimeout = 1000;
+    p.FileInfoTimeout = 4000;
     p.CaseSensitiveSearch = 0;
     p.CasePreservedNames = 1;
     p.UnicodeOnDisk = 1;

@@ -24,4 +24,6 @@ object WindowBridge {
     external fun nativeSetSurface(surface: android.view.Surface?)
     /** Shows the guest frame if it changed: 1 drew, 0 unchanged, -1 nothing to show yet. */
     external fun nativePresent(buffer: ByteBuffer): Int
+    /** The brightest colour channel in the guest frame (0..255), or -1 when there is none. */
+    external fun nativeFramePeak(buffer: ByteBuffer): Int
 }

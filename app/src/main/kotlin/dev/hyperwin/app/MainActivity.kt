@@ -106,6 +106,86 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         GuestAudio.micChanged(this)
     }
     private var micAsked = false
+    private val controls by lazy { InputControlsView(this).apply { visibility = View.GONE } }
+
+    private fun toggleControls(edit: Boolean) {
+        if (controls.visibility == View.VISIBLE && controls.editMode == edit) {
+            controls.editMode = false; controls.visibility = View.GONE; return
+        }
+        TouchControlsManager.ensureDefaults(this)
+        val all = TouchControlsManager.listProfiles(this)
+        controls.profile = TouchControlsManager.getProfile(this, TouchControlsManager.activeProfileId(this)) ?: all.firstOrNull()
+        controls.overlayOpacity = TouchControlsManager.overlayOpacity(this)
+        controls.blockOutsideTouch = TouchControlsManager.blockOutsideTouch(this)
+        controls.onProfileChanged = { controls.profile?.let { TouchControlsManager.saveProfile(this, it) } }
+        controls.editMode = edit
+        controls.visibility = View.VISIBLE
+    }
+
+    private val importIcp = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) try {
+            val text = contentResolver.openInputStream(uri)!!.use { it.readBytes().decodeToString() }
+            val p = TouchControlsManager.importProfile(this, text)
+            TouchControlsManager.setActiveProfileId(this, p.id)
+            controls.profile = p
+            Toast.makeText(this, "Imported ${p.name}", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { Toast.makeText(this, "Not a Winlator controls file", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun menu(anchor: View, vararg actions: Pair<String, () -> Unit>) {
+        ui.removeCallbacks(collapseToolbar)
+        android.widget.PopupMenu(this, anchor).apply {
+            actions.forEachIndexed { i, a -> menu.add(0, i, i, a.first) }
+            setOnMenuItemClickListener { actions[it.itemId].second(); true }
+            setOnDismissListener { nudgeToolbar() }
+        }.show()
+    }
+
+    private fun controlsMenu(anchor: View) {
+        val shown = controls.visibility == View.VISIBLE && !controls.editMode
+        menu(anchor,
+            (if (shown) "Hide touch controls" else "Show touch controls") to { toggleControls(false) },
+            "Edit touch controls" to { toggleControls(true) },
+            "Profiles…" to { pickProfile() })
+    }
+
+    private fun pickProfile() {
+        TouchControlsManager.ensureDefaults(this)
+        val all = TouchControlsManager.listProfiles(this)
+        val apply = { p: ControlsProfile ->
+            TouchControlsManager.setActiveProfileId(this, p.id)
+            controls.profile = p
+        }
+        MaterialAlertDialogBuilder(this).setTitle("Controls profile")
+            .setItems((all.map { it.name } + listOf("New copy of current", "Rename current", "Copy current to clipboard", "Import from clipboard", "Import Winlator .icp file")).toTypedArray()) { _, i ->
+                val cur = controls.profile ?: all.firstOrNull()
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                if (i < all.size) apply(all[i])
+                else when (i - all.size) {
+                    0 -> cur?.let { apply(TouchControlsManager.duplicateProfile(this, it)) }
+                    1 -> cur?.let { p ->
+                        val input = android.widget.EditText(this).apply { setText(p.name) }
+                        MaterialAlertDialogBuilder(this).setTitle("Rename").setView(input)
+                            .setPositiveButton("Save") { _, _ -> TouchControlsManager.renameProfile(this, p, input.text.toString()) }
+                            .setNegativeButton("Cancel", null).show()
+                    }
+                    2 -> cur?.let {
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("controls", TouchControlsManager.exportProfileJson(it)))
+                        Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                    }
+                    4 -> importIcp.launch("*/*")
+                    else -> try {
+                        apply(TouchControlsManager.importProfile(this, cm.primaryClip?.getItemAt(0)?.text.toString()))
+                    } catch (e: Exception) { Toast.makeText(this, "Clipboard has no controls profile", Toast.LENGTH_SHORT).show() }
+                }
+            }
+            .setNegativeButton("Delete current") { _, _ ->
+                controls.profile?.let { TouchControlsManager.deleteProfile(this, it.id) }
+                controls.profile = TouchControlsManager.listProfiles(this).firstOrNull()
+            }
+            .setPositiveButton("Close", null).show()
+    }
+
     private val collapseToolbar = Runnable { showBar(false) }
     private val hideBooting = Runnable { booting.visibility = View.GONE }
 
@@ -166,6 +246,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         guestLayer = FrameLayout(this).apply {
             setBackgroundColor(0xff000000.toInt())
             addView(guest, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH, Gravity.CENTER))
+            addView(controls, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
         }
         guestDisplay = GuestDisplay(guest) {
             // The first changed frame after the firmware's blank one is Windows drawing.
@@ -365,15 +446,27 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(8), dp(2), dp(4), dp(2))
-                addView(action("Keyboard", R.drawable.ic_keyboard) { togglePhoneKeyboard() }.apply {
-                    contentDescription = "Show this phone's keyboard and type into Windows"
+                addView(action("Keyboard", R.drawable.ic_keyboard) {}.apply {
+                    contentDescription = "Choose this phone's keyboard or the one inside Windows"
+                    setOnClickListener { menu(it, "Android keyboard" to { togglePhoneKeyboard() }, "Windows keyboard" to { showWindowsKeyboard() }) }
                 })
-                addView(action("Windows keyboard", R.drawable.ic_keyboard) { showWindowsKeyboard() }.apply {
-                    contentDescription = "Open the on-screen keyboard inside Windows"
+                addView(action("Mouse", R.drawable.ic_drag) {}.apply {
+                    contentDescription = "Choose how fingers on the screen act: touch screen, trackpad or game mouse"
+                    setOnClickListener {
+                        val pad = VsockInput.touchMode == VsockInput.TouchMode.TRACKPAD
+                        val look = guest.hasPointerCapture()
+                        fun mode(trackpad: Boolean) {
+                            VsockInput.touchMode = if (trackpad) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
+                            prefs.edit().putBoolean(TRACKPAD, trackpad).apply()
+                            if (look) toggleGameMouse()
+                        }
+                        menu(it,
+                            (if (!pad && !look) "✓ " else "") + "Touch screen (multi-touch)" to { mode(false) },
+                            (if (pad && !look) "✓ " else "") + "Trackpad" to { mode(true) },
+                            (if (look) "✓ " else "") + "Game mouse" to { if (!look) toggleGameMouse() })
+                    }
                 })
-                addView(action("Game mouse", R.drawable.ic_drag) { toggleGameMouse() }.apply {
-                    contentDescription = "Capture the mouse for games that turn the view with it, or let it go"
-                })
+                addView(action("Controls", R.drawable.ic_gamepad) {}.also { b -> b.setOnClickListener { controlsMenu(b) } })
                 addView(action("Settings", R.drawable.ic_settings) { show(Screen.HOME) })
                 addView(Ui.iconButton(this@MainActivity, R.drawable.ic_close, "Hide controls") { showBar(false) })
             })
@@ -478,7 +571,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             val report = runCatching {
                 AvfLaunch.bootWindows(
                     this,
-                    onVmStarted = { guestDisplay.vmStarted(AvfLaunch.sharedWindow) },
+                    onVmStarted = { DisplayWatchdog.vmStarted(); guestDisplay.vmStarted(AvfLaunch.sharedWindow) },
                     onVmStopped = {
                         guestDisplay.vmStopped()
                         runOnUiThread {

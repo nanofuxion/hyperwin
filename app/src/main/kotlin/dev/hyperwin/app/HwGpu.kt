@@ -361,6 +361,8 @@ object HwGpu {
             if (dxvk != DXVK_SHIPPED) putString("HWD3D_DXVK_DIR", File(dxvkDir(ctx), dxvk).absolutePath)
             // Compiled shaders, kept between runs by the bottom wrapper (shader-cache/README.md).
             putString("HWGPU_VK_CACHE_DIR", shaderCacheDir(ctx).absolutePath)
+            // Touched while Windows' screen reaches the scanout layer; DisplayWatchdog reads its time.
+            putString("HWGPU_SCREEN_FLAG", DisplayWatchdog.flagFile(ctx).absolutePath)
             if (driver != null) putString("HWGPU_VK_DRIVER", driver.absolutePath)
             // adb shell setprop log.tag.hwgpu DEBUG: the server logs every guest request.
             if (Log.isLoggable("hwgpu", Log.DEBUG)) putString("HWGPU_TRACE", "1")

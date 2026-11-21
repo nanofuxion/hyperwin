@@ -59,8 +59,9 @@ _Static_assert(HWF_OFF + HWF_BYTES <= 0x7f00000u, "file slots end below the debu
 #define HWF_TIMES    14u  /* handle, a = access, b = write time (ns since 1970, 0 keeps it) -> info */
 
 /* request flags */
-#define HWF_DIR      1u
-#define HWF_REPLACE  2u
+#define HWF_DIR        1u
+#define HWF_REPLACE    2u
+#define HWF_OPEN_WRITE 4u  /* the Windows handle was opened for writing */
 
 /* info.kind */
 #define HWF_KIND_FILE 0u

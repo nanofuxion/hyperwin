@@ -3,7 +3,7 @@
 # PL011 and PL031; build the HYPERWIN_QEMU firmware variant first.
 set -eu
 cd "$(dirname "$0")/../.."
-ISO=${HYPERWIN_ISO:-/path/to/windows11-arm64 r1.iso}
+ISO=${HYPERWIN_ISO:?set HYPERWIN_ISO to a Windows 11 ARM64 ISO}
 FW=${HYPERWIN_FIRMWARE:-firmware/edk2-gunyah/edk2-gunyah.fd}
 ESP=${HYPERWIN_ESP:-build/qemu-esp/setup-esp.img}
 [ -f "$ISO" ] && [ -f "$FW" ] || { echo 'Missing ISO or firmware' >&2; exit 1; }

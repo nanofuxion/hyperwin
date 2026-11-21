@@ -2,7 +2,7 @@
 # Boot tiny11 ARM64 under EDK2. Does not wait for setup to finish.
 set -eu
 cd "$(dirname "$0")/../.."
-ISO="${HYPERWIN_ISO:-/path/to/windows11-arm64 r1.iso}"
+ISO="${HYPERWIN_ISO:?set HYPERWIN_ISO to a Windows 11 ARM64 ISO}"
 if [ ! -f "$ISO" ]; then
   echo "ISO not found: $ISO" >&2
   exit 1

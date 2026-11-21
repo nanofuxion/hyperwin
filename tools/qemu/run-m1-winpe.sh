@@ -3,7 +3,7 @@
 # WinPE's boot files live in a RAM disk, so this does not depend on a disk driver.
 set -eu
 cd "$(dirname "$0")/../.."
-ISO="${HYPERWIN_ISO:-/path/to/windows11-arm64 r1.iso}"
+ISO="${HYPERWIN_ISO:?set HYPERWIN_ISO to a Windows 11 ARM64 ISO}"
 EDK2="$(brew --prefix qemu)/share/qemu/edk2-aarch64-code.fd"
 if [ ! -f "$ISO" ]; then echo "ISO not found: $ISO" >&2; exit 1; fi
 if [ ! -f "$EDK2" ]; then echo "EDK2 firmware not found: $EDK2" >&2; exit 1; fi

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 FW="$ROOT/firmware/avf-edk2"
-EDK2_SOURCE=${EDK2_SOURCE:-/path/to/edk2}
+EDK2_SOURCE=${EDK2_SOURCE:?set EDK2_SOURCE to your edk2 checkout}
 LLVM_BIN=${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
 GCC_PREFIX=${GCC5_AARCH64_PREFIX:-/opt/homebrew/bin/aarch64-elf-}
 

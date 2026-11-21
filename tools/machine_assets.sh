@@ -26,10 +26,9 @@ cp "$ROOT/build/agent/hwagent.exe" "$WIN/wintun/wintun/bin/arm64/wintun.dll" "$R
 [ -f "$ROOT/gpu/work/out/vulkan_hwgpu.dll" ] && [ -f "$ROOT/gpu/work/out/vulkan_hwgpu_x86.dll" ] || bash "$ROOT/gpu/guest/mesa/build.sh"
 [ -f "$ROOT/gpu/work/out/vulkan-1.dll" ] && [ -f "$ROOT/gpu/work/out/vulkan-1_x86.dll" ] || bash "$ROOT/gpu/guest/loader/build.sh"
 [ -f "$ROOT/gpu/work/out/dx/zink/opengl32.dll" ] || bash "$ROOT/gpu/guest/dx/build.sh"
-[ -f "$ROOT/gpu/work/out/dx/test/gltest-x64.exe" ] || bash "$ROOT/gpu/guest/dx/test/build.sh"
 mkdir -p "$OUT/guest/gpu"
 cp "$ROOT/gpu/work/direct/hwgpu.sys" "$ROOT/gpu/work/out/vulkan_hwgpu.dll" "$ROOT/gpu/work/out/vulkan_hwgpu.json" \
-   "$ROOT/gpu/work/out/vktest.exe" "$ROOT/gpu/work/out/vktest-x64.exe" "$ROOT/gpu/work/out/vulkan-1.dll" "$ROOT/gpu/work/out/vulkan-1_x86.dll" "$OUT/guest/gpu/"
+   "$ROOT/gpu/work/out/vulkan-1.dll" "$ROOT/gpu/work/out/vulkan-1_x86.dll" "$OUT/guest/gpu/"
 # The input driver too, so machines made before a change get it (gpu-install.cmd swaps it in;
 # it loads at the next start). New machines already have it from drivers.json.
 cp "$ROOT/build/hwvsinput/hwvsinput.sys" "$OUT/guest/gpu/"
@@ -65,13 +64,11 @@ for f in "$ROOT"/gpu/guest/idd/hwidd.cpp "$ROOT"/gpu/guest/idd/hwidd.inf "$ROOT"
 done
 mkdir -p "$OUT/guest/gpu/hwidd"
 cp "$ROOT"/build/hwidd/pkg/* "$OUT/guest/gpu/hwidd/"
-[ -f "$ROOT/build/hwwtest.exe" ] && cp "$ROOT/build/hwwtest.exe" "$OUT/guest/gpu/"
 # USB tests (usb/README.md): the raw ring driver, its install and remove scripts, and the guest test program. They are
 # sent with the GPU files but nothing installs or starts them; the GPU and display drivers have no USB code in them.
 [ "$ROOT/build/hwusbraw/hwusbraw.sys" -nt "$ROOT/guest/drivers/hwusbraw/hwusbraw.c" ] || sh "$ROOT/guest/drivers/hwusbraw/build.sh" >/dev/null
-[ "$ROOT/build/usbprobe.exe" -nt "$ROOT/guest/tools/usbprobe.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 -I"$ROOT/include" "$ROOT/guest/tools/usbprobe.c" -o "$ROOT/build/usbprobe.exe"
 mkdir -p "$OUT/guest/gpu/usb"
-cp "$ROOT/build/hwusbraw/hwusbraw.sys" "$ROOT/build/usbprobe.exe" "$OUT/guest/gpu/usb/"
+cp "$ROOT/build/hwusbraw/hwusbraw.sys" "$OUT/guest/gpu/usb/"
 # usbip-win2 (BSD-2-Clause), the virtual USB host controller for Windows, and the watcher that attaches phone devices.
 [ -f "$ROOT/build/dl/USBip-0.9.8.1-arm64.exe" ] || curl -sL -o "$ROOT/build/dl/USBip-0.9.8.1-arm64.exe" https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-arm64.exe
 cp "$ROOT/build/dl/USBip-0.9.8.1-arm64.exe" "$OUT/guest/gpu/usb/usbip-setup.exe"
@@ -89,6 +86,7 @@ for f in "$ROOT"/gpu/guest/hwd3d/* "$ROOT/gpu/host/hwd3d/gen_thunks.py" "$ROOT/i
 done
 # DXVK, vkd3d-proton, Zink and HwD3D, which use.cmd puts beside a program (Send To in Explorer).
 cp -R "$ROOT/gpu/work/out/dx" "$OUT/guest/gpu/"
+rm -rf "$OUT/guest/gpu/dx/test"   # developer test programs stay out of the app
 perl -pe 's/\r?\n/\r\n/' "$ROOT/gpu/guest/dx/use.cmd" > "$OUT/guest/gpu/dx/use.cmd"
 cp "$ROOT/gpu/guest/dx/hasmanifest.ps1" "$OUT/guest/gpu/dx/hasmanifest.ps1"
 # The app compares this with C:\HyperWin\gpu\stamp.txt and sends the files again when they differ.

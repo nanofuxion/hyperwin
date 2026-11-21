@@ -161,12 +161,14 @@ object GuestAgent {
             EXEC_DONE -> {
                 Log.i(TAG, "exit ${le32(buf, 4)} (command ${le32(buf, 0)})")
                 if (le32(buf, 0) == gpuCheck && le32(buf, 4) != 0) syncGpu()
+                doneWatchers.remove(le32(buf, 0))?.invoke(le32(buf, 4))
             }
             FILE_RESULT -> Log.i(TAG, if (le32(buf, 0) == 1) "file written" else "file write failed")
             HELLO -> {
                 agentVersion = buf[0].toInt()
                 Log.i(TAG, "agent version ${buf[0]}, network adapter ${if (buf[1].toInt() == 1) "ready" else "missing"}")
                 if (agentVersion < VERSION) updateAgent()
+                appContext?.let { DisplayWatchdog.agentUp(it) }
                 // A boot cut short (the app closed, the phone low on memory) must not send Windows
                 // into its recovery screens, which this VM cannot run. Cheap to repeat each start.
                 exec("cmd /c bcdedit /set {current} recoveryenabled no & bcdedit /set {current} bootstatuspolicy ignoreallfailures")
@@ -213,6 +215,10 @@ object GuestAgent {
     }
 
     @Volatile private var gpuCheck = -1
+    private val doneWatchers = java.util.concurrent.ConcurrentHashMap<Int, (Int) -> Unit>()
+
+    /** Calls [onExit] with the exit code when command [id] (from [exec]) finishes. */
+    fun onceDone(id: Int, onExit: (Int) -> Unit) { doneWatchers[id] = onExit }
     private val pushLock = Any()
 
     /**

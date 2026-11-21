@@ -5,7 +5,9 @@
  * in parallel and file data goes straight between the storage and the window. FileShare.kt says
  * which volumes to share; with the all-files permission, plain paths under /storage reach them.
  */
+#define _GNU_SOURCE
 #include <jni.h>
+#include <android/log.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +16,7 @@
 #include <semaphore.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
@@ -50,14 +53,24 @@ static struct handle handles[MAX_HANDLES];
 /* ---- paths ---- */
 
 /* The phone path for a Windows path on a volume, refusing anything that leaves the volume. */
+static int volume_root(uint32_t volume, char *root, size_t size)
+{
+    root[0] = 0;
+    pthread_mutex_lock(&share_lock);
+    for (uint32_t i = 0; i < HWF_VOLUMES; i++)
+        if (shares[i].id && shares[i].id == volume) {
+            memcpy(root, shares[i].root, size < sizeof shares[i].root ? size : sizeof shares[i].root);
+            root[size - 1] = 0;
+            break;
+        }
+    pthread_mutex_unlock(&share_lock);
+    return root[0] ? 0 : ENODEV;
+}
+
 static int resolve(uint32_t volume, const char *rel, char *out, size_t size)
 {
     char root[512] = "";
-    pthread_mutex_lock(&share_lock);
-    for (uint32_t i = 0; i < HWF_VOLUMES; i++)
-        if (shares[i].id && shares[i].id == volume) memcpy(root, shares[i].root, sizeof root);
-    pthread_mutex_unlock(&share_lock);
-    if (!root[0]) return ENODEV;
+    if (volume_root(volume, root, sizeof root)) return ENODEV;
     if (rel[0] != '\\') return EINVAL;
     size_t n = strlen(root);
     if (n + 1 >= size) return ENAMETOOLONG;
@@ -116,30 +129,55 @@ static uint64_t add_handle(int fd, const char *path, int writable, int dir)
     return 0;
 }
 
+static void make_writable(const char *path, int dir);
+static void parent_writable(const char *path);
+
 /* The fd behind a handle Windows sent, or -1. With writable, reopens it for writing first:
  * files open read-only until Windows writes, so reading never counts as a change. */
 static int get_fd(uint64_t v, int writable, int *err)
 {
     uint32_t i = (uint32_t)v;
-    int fd = -1;
+    uint16_t gen;
+    int fd = -1, w = -1;
+    char path[4096];
     *err = EBADF;
     pthread_mutex_lock(&handle_lock);
-    if ((uint32_t)(v >> 48) == (session & 0xffff) && i < MAX_HANDLES && handles[i].used &&
-        handles[i].gen == (uint16_t)(v >> 32)) {
-        struct handle *h = &handles[i];
-        fd = h->fd;
+    if (!((uint32_t)(v >> 48) == (session & 0xffff) && i < MAX_HANDLES && handles[i].used &&
+          handles[i].gen == (uint16_t)(v >> 32))) {
+        pthread_mutex_unlock(&handle_lock);
+        return -1;
+    }
+    gen = handles[i].gen;
+    if (!(writable && !handles[i].writable && !handles[i].dir && handles[i].path)) {
+        fd = handles[i].fd;
+        *err = fd < 0 ? EBADF : 0;
+        pthread_mutex_unlock(&handle_lock);
+        return fd;
+    }
+    snprintf(path, sizeof path, "%s", handles[i].path);
+    pthread_mutex_unlock(&handle_lock);
+    make_writable(path, 0);
+    parent_writable(path);
+    w = open(path, O_RDWR | O_CLOEXEC);
+    pthread_mutex_lock(&handle_lock);
+    if (!(handles[i].used && handles[i].gen == gen && handles[i].path && !strcmp(handles[i].path, path))) {
+        pthread_mutex_unlock(&handle_lock);
+        if (w >= 0) close(w);
+        return -1;
+    }
+    if (w < 0) {
+        *err = errno ? errno : EIO;
+    } else if (handles[i].fd < 0) {
+        handles[i].fd = w;
+        handles[i].writable = 1;
+        fd = w;
         *err = 0;
-        if (writable && !h->writable && !h->dir) {
-            int w = open(h->path, O_RDWR | O_CLOEXEC);
-            if (w < 0) {
-                *err = errno;
-                fd = -1;
-            } else {
-                dup2(w, h->fd);
-                close(w);
-                h->writable = 1;
-            }
-        }
+    } else {
+        dup2(w, handles[i].fd);
+        close(w);
+        handles[i].writable = 1;
+        fd = handles[i].fd;
+        *err = 0;
     }
     pthread_mutex_unlock(&handle_lock);
     return fd;
@@ -160,10 +198,61 @@ static int close_handle(uint64_t v)
         handles[i].gen++;
     }
     pthread_mutex_unlock(&handle_lock);
-    if (fd < 0) return EBADF;
-    close(fd);
+    if (!path && fd < 0) return EBADF;
+    if (fd >= 0) close(fd);
     free(path);
     return 0;
+}
+
+/* Drop our own opens of this phone path so unlink and rename are not EBUSY. */
+static void release_path(const char *path)
+{
+    pthread_mutex_lock(&handle_lock);
+    for (uint32_t i = 0; i < MAX_HANDLES; i++) {
+        struct handle *h = &handles[i];
+        if (!h->used || !h->path || strcmp(h->path, path)) continue;
+        if (h->fd >= 0) close(h->fd);
+        h->fd = -1;
+        h->writable = 0;
+    }
+    pthread_mutex_unlock(&handle_lock);
+}
+
+static void retarget_path(const char *from, const char *to)
+{
+    pthread_mutex_lock(&handle_lock);
+    for (uint32_t i = 0; i < MAX_HANDLES; i++) {
+        struct handle *h = &handles[i];
+        char *next;
+        if (!h->used || !h->path || strcmp(h->path, from)) continue;
+        next = strdup(to);
+        if (!next) continue;
+        free(h->path);
+        h->path = next;
+    }
+    pthread_mutex_unlock(&handle_lock);
+}
+
+/* Android storage often has no write bit even when this app is allowed to change the file. */
+static void make_writable(const char *path, int dir)
+{
+    struct stat st;
+    mode_t mode;
+    if (stat(path, &st)) return;
+    mode = st.st_mode | (dir ? 0777 : 0666);
+    if ((st.st_mode & 0777) == (mode & 0777)) return;
+    chmod(path, mode & 0777);
+}
+
+static void parent_writable(const char *path)
+{
+    char buf[4096];
+    char *slash;
+    snprintf(buf, sizeof buf, "%s", path);
+    slash = strrchr(buf, '/');
+    if (!slash || slash == buf) return;
+    *slash = 0;
+    make_writable(buf, 1);
 }
 
 static void close_all(void)
@@ -190,25 +279,271 @@ static int fstat_info(int fd, struct hwf_info *info)
     return 0;
 }
 
+/* A stat or open that has not finished in time must not pin the request. The
+ * thread keeps the job and frees it if this side gives up. */
+struct io_job {
+    int dirfd, close_fd, flags, mode, fd, rc, state; /* 0 running, 1 waiter owns it, 2 thread frees it */
+    char path[4096];
+    struct stat st;
+};
+
+static void *stat_job(void *arg)
+{
+    struct io_job *j = arg;
+    if (fstatat(j->dirfd, j->path[0] ? j->path : ".", &j->st, j->flags)) j->rc = errno ? errno : EIO;
+    else j->rc = 0;
+    if (j->close_fd && j->dirfd >= 0) close(j->dirfd);
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&j->state, &expected, 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) free(j);
+    return NULL;
+}
+
+static void *open_job(void *arg)
+{
+    struct io_job *j = arg;
+    int fd = open(j->path, j->flags, j->mode);
+    if (fd < 0) {
+        j->rc = errno ? errno : EIO;
+        j->fd = -1;
+    } else {
+        j->rc = 0;
+        j->fd = fd;
+    }
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&j->state, &expected, 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+        if (j->fd >= 0) close(j->fd);
+        free(j);
+    }
+    return NULL;
+}
+
+/* 0 when the thread finished and the caller owns the object. -1 when the thread will free it. */
+static int wait_state(int *state, pthread_t thread, int ms)
+{
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (__atomic_load_n(state, __ATOMIC_ACQUIRE) == 1) {
+            pthread_join(thread, NULL);
+            return 0;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if (elapsed >= ms) {
+            int expected = 0;
+            if (!__atomic_compare_exchange_n(state, &expected, 2, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                pthread_join(thread, NULL);
+                return 0;
+            }
+            pthread_detach(thread);
+            return -1;
+        }
+        usleep(2000);
+    }
+}
+
+static int stat_flags(void)
+{
+    int flags = AT_SYMLINK_NOFOLLOW;
+#ifdef AT_NO_AUTOMOUNT
+    flags |= AT_NO_AUTOMOUNT;
+#endif
+    return flags;
+}
+
+/* 0 and *st filled, a positive errno, or -1 if it did not finish in time. */
+static int stat_at(int dirfd, const char *name, struct stat *st, int ms)
+{
+    struct io_job *j = calloc(1, sizeof *j);
+    pthread_t thread;
+    int waited;
+    if (!j) return ENOMEM;
+    j->fd = -1;
+    j->flags = stat_flags();
+    if (dirfd == AT_FDCWD) j->dirfd = AT_FDCWD;
+    else {
+        j->dirfd = dup(dirfd);
+        j->close_fd = 1;
+        if (j->dirfd < 0) {
+            free(j);
+            return errno ? errno : EIO;
+        }
+    }
+    snprintf(j->path, sizeof j->path, "%s", name ? name : "");
+    if (pthread_create(&thread, NULL, stat_job, j)) {
+        if (j->close_fd) close(j->dirfd);
+        free(j);
+        return EAGAIN;
+    }
+    waited = wait_state(&j->state, thread, ms);
+    if (waited) return -1;
+    if (!j->rc) *st = j->st;
+    waited = j->rc;
+    free(j);
+    return waited;
+}
+
+static int open_timeout(const char *path, int flags, int mode, int ms, int *fd_out)
+{
+    struct io_job *j = calloc(1, sizeof *j);
+    pthread_t thread;
+    int waited;
+    if (!j) return ENOMEM;
+    j->fd = -1;
+    j->flags = flags;
+    j->mode = mode;
+    snprintf(j->path, sizeof j->path, "%s", path);
+    if (pthread_create(&thread, NULL, open_job, j)) {
+        free(j);
+        return EAGAIN;
+    }
+    waited = wait_state(&j->state, thread, ms);
+    if (waited) return -1;
+    *fd_out = j->fd;
+    waited = j->rc;
+    free(j);
+    return waited;
+}
+
+/* Windows treats the drive as case-insensitive. Android paths are not. */
+static int resolve_ci(uint32_t volume, const char *rel, char *out, size_t size, int final_exact)
+{
+    char root[512], dir[4096];
+    const char *p;
+    size_t n;
+    int err = volume_root(volume, root, sizeof root);
+    if (err) return err;
+    n = strlen(root);
+    if (n + 1 > sizeof dir || n + 1 > size) return ENAMETOOLONG;
+    memcpy(dir, root, n + 1);
+    p = rel;
+    while (*p == '\\') p++;
+    if (!*p) {
+        memcpy(out, dir, n + 1);
+        return 0;
+    }
+    while (*p) {
+        const char *e = p;
+        size_t len, last = 0;
+        DIR *d;
+        struct dirent *ent;
+        int found = 0;
+        while (*e && *e != '\\') e++;
+        len = (size_t)(e - p);
+        last = !*e || !e[1];
+        while (*e == '\\') e++;
+        if (!len) {
+            p = e;
+            continue;
+        }
+        if ((len == 1 && p[0] == '.') || (len == 2 && p[0] == '.' && p[1] == '.') || memchr(p, '/', len))
+            return EINVAL;
+        if (final_exact && last) {
+            /* An existing name in another case is the file Windows asked for. */
+            d = opendir(dir);
+            if (d) {
+                while ((ent = readdir(d))) {
+                    if (strlen(ent->d_name) == len && !strncasecmp(ent->d_name, p, len)) {
+                        found = 1;
+                        if (n + 1 + len + 1 > size) {
+                            closedir(d);
+                            return ENAMETOOLONG;
+                        }
+                        memcpy(out, dir, n);
+                        out[n] = '/';
+                        memcpy(out + n + 1, ent->d_name, len);
+                        out[n + 1 + len] = 0;
+                        break;
+                    }
+                }
+                closedir(d);
+                if (found) return 0;
+            }
+            if (n + 1 + len + 1 > size) return ENAMETOOLONG;
+            memcpy(out, dir, n);
+            out[n] = '/';
+            memcpy(out + n + 1, p, len);
+            out[n + 1 + len] = 0;
+            return 0;
+        }
+        d = opendir(dir);
+        if (!d) return errno ? errno : EIO;
+        while ((ent = readdir(d))) {
+            if (strlen(ent->d_name) == len && !strncasecmp(ent->d_name, p, len)) {
+                found = 1;
+                if (n + 1 + len + 1 > sizeof dir || n + 1 + len + 1 > size) {
+                    closedir(d);
+                    return ENAMETOOLONG;
+                }
+                dir[n] = '/';
+                memcpy(dir + n + 1, ent->d_name, len);
+                n += 1 + len;
+                dir[n] = 0;
+                break;
+            }
+        }
+        closedir(d);
+        if (!found) return ENOENT;
+        p = e;
+    }
+    memcpy(out, dir, n + 1);
+    return 0;
+}
+
+static int resolve_for(uint32_t volume, const char *rel, char *out, size_t size, int creating)
+{
+    struct stat st;
+    int err = resolve(volume, rel, out, size), rc;
+    if (err) return err;
+    rc = stat_at(AT_FDCWD, out, &st, 1000);
+    if (rc == 0) return 0;
+    if (rc > 0 && rc != ENOENT) return rc;
+    if (rc < 0) return ETIMEDOUT;
+    return resolve_ci(volume, rel, out, size, creating);
+}
+
 static int do_open(struct hwf_slot *s, const char *path)
 {
     struct stat st;
-    int fd, writable = 0, dir;
+    int fd = -1, writable = 0, dir, rc;
     if (s->op == HWF_CREATE) {
         dir = !!(s->flags & HWF_DIR);
+        parent_writable(path);
         if (dir) {
-            if (mkdir(path, 0777)) return errno;
-            fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (mkdir(path, 0777)) {
+                int mk = errno;
+                if (mk == EACCES || mk == EPERM) {
+                    parent_writable(path);
+                    if (!mkdir(path, 0777)) mk = 0;
+                    else mk = errno;
+                }
+                if (mk) return mk;
+            }
+            rc = open_timeout(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, 2000, &fd);
         } else {
-            fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+            rc = open_timeout(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666, 2000, &fd);
+            if (rc == EACCES || rc == EPERM) {
+                parent_writable(path);
+                rc = open_timeout(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666, 2000, &fd);
+            }
             writable = 1;
         }
     } else {
-        if (stat(path, &st)) return errno;
+        rc = stat_at(AT_FDCWD, path, &st, 1000);
+        if (rc < 0) return ETIMEDOUT;
+        if (rc) return rc;
         dir = S_ISDIR(st.st_mode);
-        fd = open(path, (dir ? O_DIRECTORY : 0) | O_RDONLY | O_CLOEXEC);
+        if (!dir && (s->flags & HWF_OPEN_WRITE)) {
+            make_writable(path, 0);
+            rc = open_timeout(path, O_RDWR | O_CLOEXEC, 0, 2000, &fd);
+            writable = rc == 0;
+            if (rc) rc = open_timeout(path, O_RDONLY | O_CLOEXEC, 0, 2000, &fd);
+        } else {
+            rc = open_timeout(path, (dir ? O_DIRECTORY : 0) | O_RDONLY | O_CLOEXEC, 0, 2000, &fd);
+        }
     }
-    if (fd < 0) return errno;
+    if (rc < 0) return ETIMEDOUT;
+    if (rc) return rc;
     int err = fstat_info(fd, &s->info);
     if (!err && !(s->out_handle = add_handle(fd, path, writable, dir))) err = EMFILE;
     if (err) close(fd);
@@ -252,50 +587,342 @@ static int do_write(struct hwf_slot *s, const uint8_t *data)
     return fstat_info(fd, &s->info);
 }
 
-static int do_list(struct hwf_slot *s, const char *path, uint8_t *data)
+#define LIST_NAMES 65536u
+#define LIST_BUDGET_MS 800u
+#define LIST_PARALLEL 8u
+#define LIST_STAT_MS 200
+#define LIST_CACHE_MS 3000u
+
+struct list_name {
+    char *name;
+    unsigned char d_type;
+    struct stat st;
+    int stated;
+};
+
+static struct {
+    pthread_mutex_t mu;
+    char path[4096];
+    uint64_t until;
+    uint8_t *data;
+    size_t len;
+    uint64_t count;
+} list_cache = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static int list_busy;
+
+static uint64_t mono_ms(void)
 {
-    DIR *d = opendir(path);
-    if (!d) return errno;
-    uint64_t skip = s->offset, count = 0, limit = s->length;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+static size_t entry_need(size_t name_len)
+{
+    return (sizeof(struct hwf_entry) + name_len + 7u) & ~(size_t)7u;
+}
+
+static void cache_drop(void)
+{
+    pthread_mutex_lock(&list_cache.mu);
+    free(list_cache.data);
+    list_cache.data = NULL;
+    list_cache.len = 0;
+    list_cache.count = 0;
+    list_cache.path[0] = 0;
+    list_cache.until = 0;
+    pthread_mutex_unlock(&list_cache.mu);
+}
+
+/* 1 when this page came from a recent listing of the same directory. */
+static int cache_slice(const char *path, uint64_t skip, uint8_t *data, struct hwf_slot *s)
+{
+    const uint8_t *p, *end;
+    uint64_t index = 0, count = 0;
     size_t used = 0;
-    struct dirent *e;
-    s->more = 0;
-    while ((e = readdir(d))) {
+    int hit = 0;
+    pthread_mutex_lock(&list_cache.mu);
+    if (list_cache.until > mono_ms() && !strcmp(list_cache.path, path)) {
+        hit = 1;
+        p = list_cache.data;
+        end = p + list_cache.len;
+        s->more = 0;
+        while (p && p + sizeof(struct hwf_entry) <= end) {
+            const struct hwf_entry *e = (const struct hwf_entry *)p;
+            size_t need = entry_need(e->name_len);
+            if (need < sizeof *e || p + need > end) break;
+            if (index >= skip) {
+                if (used + need > HWF_DATA) {
+                    s->more = 1;
+                    break;
+                }
+                memcpy(data + used, p, need);
+                used += need;
+                count++;
+            }
+            index++;
+            p += need;
+        }
+        if (index < list_cache.count) s->more = 1;
+        s->out_length = used;
+        s->out_a = (int64_t)count;
+    }
+    pthread_mutex_unlock(&list_cache.mu);
+    return hit;
+}
+
+static void cache_store(const char *path, uint8_t *data, size_t len, uint64_t count)
+{
+    pthread_mutex_lock(&list_cache.mu);
+    free(list_cache.data);
+    snprintf(list_cache.path, sizeof list_cache.path, "%s", path);
+    list_cache.data = data;
+    list_cache.len = len;
+    list_cache.count = count;
+    list_cache.until = mono_ms() + LIST_CACHE_MS;
+    pthread_mutex_unlock(&list_cache.mu);
+}
+
+struct listed {
+    char path[4096];
+    uint8_t *data;
+    size_t len;
+    uint64_t count;
+    int rc, state;
+};
+
+static void pack_name(uint8_t **buf, size_t *len, size_t *cap, struct list_name *nm)
+{
+    size_t nlen = strlen(nm->name), need = entry_need(nlen);
+    struct hwf_entry *e;
+    uint8_t *grown;
+    if (nlen > 65535) nlen = 65535;
+    need = entry_need(nlen);
+    if (*len + need > *cap) {
+        size_t ncap = *cap ? *cap * 2 : 65536;
+        while (ncap < *len + need) ncap *= 2;
+        grown = realloc(*buf, ncap);
+        if (!grown) return;
+        *buf = grown;
+        *cap = ncap;
+    }
+    e = (struct hwf_entry *)(*buf + *len);
+    memset(e, 0, need);
+    if (nm->stated) to_info(&nm->st, &e->info);
+    else e->info.kind = nm->d_type == DT_DIR ? HWF_KIND_DIR : HWF_KIND_FILE;
+    e->name_len = (uint16_t)nlen;
+    memcpy(e + 1, nm->name, nlen);
+    *len += need;
+}
+
+static void *list_thread(void *arg)
+{
+    struct listed *L = arg;
+    DIR *d = opendir(L->path);
+    struct list_name *names = NULL;
+    size_t n = 0, capn = 0, blob_cap = 0, i = 0;
+    uint64_t start;
+    int dfd = -1;
+    if (!d) {
+        L->rc = errno ? errno : EIO;
+        goto finish;
+    }
+    dfd = dirfd(d);
+    while (n < LIST_NAMES) {
+        struct dirent *e = readdir(d);
+        size_t ncap;
+        struct list_name *grown;
+        if (!e) break;
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (skip) {
-            skip--;
-            continue;
+        if (n == capn) {
+            ncap = capn ? capn * 2 : 256;
+            grown = realloc(names, ncap * sizeof *names);
+            if (!grown) break;
+            names = grown;
+            capn = ncap;
         }
-        size_t len = strlen(e->d_name);
-        size_t need = (sizeof(struct hwf_entry) + len + 7) & ~(size_t)7;
-        if (used + need > HWF_DATA || (limit && count == limit)) {
-            s->more = 1;
-            break;
+        names[n].name = strdup(e->d_name);
+        if (!names[n].name) break;
+        names[n].d_type = e->d_type;
+        names[n].stated = 0;
+        memset(&names[n].st, 0, sizeof names[n].st);
+        n++;
+    }
+    start = mono_ms();
+    i = 0;
+    while (i < n && mono_ms() - start < LIST_BUDGET_MS) {
+        struct io_job *job[LIST_PARALLEL] = {0};
+        pthread_t thread[LIST_PARALLEL];
+        size_t at[LIST_PARALLEL];
+        unsigned k = 0, t;
+        while (k < LIST_PARALLEL && i < n && mono_ms() - start < LIST_BUDGET_MS) {
+            char child[4096];
+            int wrote;
+            if (names[i].d_type == DT_DIR) {
+                i++;
+                continue;
+            }
+            wrote = snprintf(child, sizeof child, "%s/%s", L->path, names[i].name);
+            if (wrote < 0 || wrote >= (int)sizeof child) {
+                i++;
+                continue;
+            }
+            job[k] = calloc(1, sizeof *job[k]);
+            if (!job[k]) {
+                i++;
+                break;
+            }
+            job[k]->dirfd = AT_FDCWD;
+            job[k]->flags = stat_flags();
+            job[k]->fd = -1;
+            snprintf(job[k]->path, sizeof job[k]->path, "%s", child);
+            if (pthread_create(&thread[k], NULL, stat_job, job[k])) {
+                free(job[k]);
+                job[k] = NULL;
+                i++;
+                break;
+            }
+            at[k] = i;
+            k++;
+            i++;
         }
-        struct stat st;
-        if (fstatat(dirfd(d), e->d_name, &st, 0) && fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
-        struct hwf_entry *out = (struct hwf_entry *)(data + used);
-        memset(out, 0, sizeof *out);
-        to_info(&st, &out->info);
-        out->name_len = (uint16_t)len;
-        memcpy(out + 1, e->d_name, len);
-        used += need;
-        count++;
+        for (t = 0; t < k; t++) {
+            uint64_t elapsed = mono_ms() - start;
+            int budget = elapsed >= LIST_BUDGET_MS ? 1 : (int)(LIST_BUDGET_MS - elapsed);
+            if (budget > LIST_STAT_MS) budget = LIST_STAT_MS;
+            if (wait_state(&job[t]->state, thread[t], budget)) continue;
+            if (!job[t]->rc) {
+                names[at[t]].st = job[t]->st;
+                names[at[t]].stated = 1;
+                free(job[t]);
+            } else {
+                free(job[t]);
+            }
+        }
     }
     closedir(d);
-    s->out_length = used;
-    s->out_a = (int64_t)count;
+    dfd = -1;
+    for (i = 0; i < n; i++) {
+        pack_name(&L->data, &L->len, &blob_cap, &names[i]);
+        L->count++;
+        free(names[i].name);
+    }
+    free(names);
+    names = NULL;
+    __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s names=%zu stated_budget=%ums", L->path, n,
+                        LIST_BUDGET_MS);
+    cache_store(L->path, L->data, L->len, L->count);
+    L->data = NULL;
+finish:
+    if (dfd >= 0 && d) closedir(d);
+    for (i = 0; names && i < n; i++) free(names[i].name);
+    free(names);
+    __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
+    {
+        int expected = 0;
+        if (!__atomic_compare_exchange_n(&L->state, &expected, 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) free(L);
+    }
+    return NULL;
+}
+
+static int do_list(struct hwf_slot *s, const char *path, uint8_t *data)
+{
+    struct listed *L;
+    pthread_t thread;
+    int busy = 0, waited, rc;
+    if (cache_slice(path, s->offset, data, s)) return 0;
+    if (!__atomic_compare_exchange_n(&list_busy, &busy, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        uint64_t start = mono_ms();
+        while (mono_ms() - start < 8000) {
+            if (cache_slice(path, s->offset, data, s)) return 0;
+            usleep(20000);
+        }
+        return ETIMEDOUT;
+    }
+    L = calloc(1, sizeof *L);
+    if (!L) {
+        __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
+        return ENOMEM;
+    }
+    snprintf(L->path, sizeof L->path, "%s", path);
+    if (pthread_create(&thread, NULL, list_thread, L)) {
+        free(L);
+        __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
+        return EAGAIN;
+    }
+    waited = wait_state(&L->state, thread, 8000);
+    if (waited) {
+        if (cache_slice(path, s->offset, data, s)) return 0;
+        __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s timed out", path);
+        return ETIMEDOUT;
+    }
+    rc = L->rc;
+    free(L);
+    if (rc) return rc;
+    if (!cache_slice(path, s->offset, data, s)) return EIO;
     return 0;
+}
+
+static int same_file(const char *a, const char *b)
+{
+    struct stat sa, sb;
+    if (stat(a, &sa) || stat(b, &sb)) return 0;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
 static int do_rename(struct hwf_slot *s, const char *from, const char *to)
 {
-    struct stat a, b;
-    if (!(s->flags & HWF_REPLACE) && !stat(to, &b)) {
-        /* The same file under another case is a rename, not a clash. */
-        if (stat(from, &a) || a.st_dev != b.st_dev || a.st_ino != b.st_ino) return EEXIST;
+    struct stat dest;
+    int replacing = !stat(to, &dest);
+    if (replacing && !(s->flags & HWF_REPLACE) && !same_file(from, to)) return EEXIST;
+    if (replacing && (s->flags & HWF_REPLACE) && !same_file(from, to) && !S_ISDIR(dest.st_mode)) {
+        release_path(to);
+        make_writable(to, 0);
+        unlink(to);
     }
-    return rename(from, to) ? errno : 0;
+    if (!rename(from, to)) {
+        retarget_path(from, to);
+        return 0;
+    }
+    if (errno == EBUSY || errno == EACCES || errno == EPERM) {
+        release_path(from);
+        release_path(to);
+        parent_writable(to);
+        make_writable(from, 0);
+        if (!rename(from, to)) {
+            retarget_path(from, to);
+            return 0;
+        }
+    }
+    return errno ? errno : EIO;
+}
+
+static int do_remove(const char *path, int dir)
+{
+    int err;
+    if (dir) {
+        if (!rmdir(path)) return 0;
+        err = errno;
+        if (err == EACCES || err == EPERM || err == EBUSY) {
+            release_path(path);
+            make_writable(path, 1);
+            parent_writable(path);
+            if (!rmdir(path)) return 0;
+            err = errno;
+        }
+        return err ? err : EIO;
+    }
+    if (!unlink(path)) return 0;
+    err = errno;
+    if (err == EBUSY || err == EACCES || err == EPERM) {
+        release_path(path);
+        make_writable(path, 0);
+        parent_writable(path);
+        if (!unlink(path)) return 0;
+        err = errno;
+    }
+    return err ? err : EIO;
 }
 
 static int serve(struct hwf_slot *s, uint8_t *data)
@@ -316,22 +943,28 @@ static int serve(struct hwf_slot *s, uint8_t *data)
     }
     case HWF_STAT: {
         struct stat st;
-        if ((err = resolve(s->volume, s->path, path, sizeof path))) return err;
-        if (stat(path, &st)) return errno;
+        int rc;
+        if ((err = resolve_for(s->volume, s->path, path, sizeof path, 0))) return err;
+        rc = stat_at(AT_FDCWD, path, &st, 1000);
+        if (rc < 0) return ETIMEDOUT;
+        if (rc) return rc;
         to_info(&st, &s->info);
         return 0;
     }
     case HWF_OPEN:
     case HWF_CREATE:
-        if ((err = resolve(s->volume, s->path, path, sizeof path))) return err;
+        if (s->op == HWF_CREATE) cache_drop();
+        if ((err = resolve_for(s->volume, s->path, path, sizeof path, s->op == HWF_CREATE))) return err;
         return do_open(s, path);
     case HWF_CLOSE:
         return close_handle(s->handle);
     case HWF_READ:
         return do_read(s, data);
     case HWF_WRITE:
+        cache_drop();
         return do_write(s, data);
     case HWF_RESIZE:
+        cache_drop();
         if ((fd = get_fd(s->handle, 1, &err)) < 0) return err;
         if (ftruncate(fd, (off_t)s->offset)) return errno;
         return fstat_info(fd, &s->info);
@@ -343,14 +976,16 @@ static int serve(struct hwf_slot *s, uint8_t *data)
         fdatasync(fd);
         return fstat_info(fd, &s->info);
     case HWF_LIST:
-        if ((err = resolve(s->volume, s->path, path, sizeof path))) return err;
+        if ((err = resolve_for(s->volume, s->path, path, sizeof path, 0))) return err;
         return do_list(s, path, data);
     case HWF_REMOVE:
-        if ((err = resolve(s->volume, s->path, path, sizeof path))) return err;
-        return (s->flags & HWF_DIR ? rmdir(path) : unlink(path)) ? errno : 0;
+        cache_drop();
+        if ((err = resolve_for(s->volume, s->path, path, sizeof path, 0))) return err;
+        return do_remove(path, s->flags & HWF_DIR);
     case HWF_RENAME:
-        if ((err = resolve(s->volume, s->path, path, sizeof path)) ||
-            (err = resolve(s->volume, s->path2, path2, sizeof path2)))
+        cache_drop();
+        if ((err = resolve_for(s->volume, s->path, path, sizeof path, 0)) ||
+            (err = resolve_for(s->volume, s->path2, path2, sizeof path2, 1)))
             return err;
         return do_rename(s, path, path2);
     case HWF_TIMES: {
