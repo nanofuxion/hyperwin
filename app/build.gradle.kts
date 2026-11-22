@@ -80,6 +80,9 @@ val gpuHostLibs by tasks.registering(Exec::class) {
 tasks.named("preBuild") { dependsOn(gpuHostLibs) }
 
 dependencies {
+    // Shizuku grants the two virtual machine permissions once (VmAccess.kt).
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     // Material Design 3 widgets and dynamic colour for the setup and settings screens.
     implementation("com.google.android.material:material:1.12.0")
 }

@@ -28,3 +28,14 @@ HYPERWIN_ISO=/path/to/windows11-arm64.iso tools/qemu/run-iso.sh
 x86_64 builds of the same DLLs can be made on `another machine`, which has `x86_64-w64-mingw32-gcc`. The guest image is ARM64, so the DLLs that tiny11 loads are the ARM64 ones.
 
 The Android app is `dev.hyperwin.app`. It stages the answer file, builds the gfxstream `GpuConfig`, allocates the shared window, and wraps the TPM seed. It is not installed on a device from here.
+
+## First start
+
+Android only lets a shell switch on the two permissions that start virtual machines. The app asks for them once.
+Install [Shizuku](https://shizuku.rikka.app/), start it from Wireless debugging, then tap Start Windows and Allow.
+Without Shizuku, run this once from a computer:
+
+```
+adb shell pm grant dev.hyperwin.app android.permission.MANAGE_VIRTUAL_MACHINE
+adb shell pm grant dev.hyperwin.app android.permission.USE_CUSTOM_VIRTUAL_MACHINE
+```

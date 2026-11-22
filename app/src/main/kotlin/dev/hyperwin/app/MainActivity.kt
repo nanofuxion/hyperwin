@@ -561,6 +561,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
 
     private fun startWindows(restart: Boolean = false, attempt: Int = 1) {
         if (starting || AvfLaunch.machine != null) return     // one Windows at a time: they share a disk
+        if (!VmAccess.granted(this)) { VmAccess.ensure(this) { startWindows(restart, attempt) }; return }
         starting = true
         show(Screen.WINDOWS)
         bootingText.text = if (restart) "Windows is restarting" else "Starting Windows"
