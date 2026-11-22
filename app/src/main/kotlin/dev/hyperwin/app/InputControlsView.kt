@@ -138,7 +138,7 @@ class InputControlsView(context: Context) : View(context) {
     private fun rt(el: ControlElement): ElementRuntime = runtime.getOrPut(el) { ElementRuntime() }
 
     /** Winlator-style grid unit based on viewport height. */
-    fun snappingSize(): Float = (min(width, height).coerceAtLeast(360) / 22f).coerceIn(16f, 64f)
+    fun snappingSize(): Float = (min(width, height).coerceAtLeast(360) / 22f * 0.75f).coerceIn(12f, 48f)   // smaller than the first size: the controls overlapped
 
     override fun setVisibility(visibility: Int) {
         val wasVisible = this.visibility == VISIBLE

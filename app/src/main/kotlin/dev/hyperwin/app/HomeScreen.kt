@@ -173,7 +173,7 @@ class HomeScreen(
                 setOnTouchListener(dragHandle(row, box, list) { apply() })
             }, LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
             val summary = when (e.id) {
-                "vortek" -> "Winlator's fixes for Mali. Needed by DXVK and vkd3d-proton on Mali. Includes BC textures."
+                "vortek" -> "Winlator's driver fixes. DXVK and vkd3d-proton need them on Mali and some other GPUs. Includes BC textures."
                 "bcn" -> "Decodes compressed BC textures the driver lacks."
                 HwGpu.PHONE -> "This phone's own driver."
                 else -> "A driver added from a file."

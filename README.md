@@ -11,6 +11,17 @@
 
 The full guide, with every step, the toolbar and the settings, is [USAGE.md](USAGE.md).
 
+## Screenshots
+
+AIO Graphics Test demos running in Windows on a Pixel 6 Pro, with the Vortek and BC texture fixes.
+
+| | |
+| --- | --- |
+| ![Dolphin demo](docs/screenshots/aio-dolphin.jpg) | ![Tessellation demo](docs/screenshots/aio-tessellation.jpg) |
+| ![Compute particles demo](docs/screenshots/aio-compute-particles.jpg) | ![Touch controls over a demo](docs/screenshots/touch-controls.jpg) |
+
+The last picture shows the virtual gamepad on top of a demo.
+
 ## How it works
 
 Windows ARM64 in an Android AVF virtual machine. The desktop can stay on Windows' own software compositor. Games reach the phone GPU through the virtio-gpu device AVF already creates when `GpuConfig` is set to gfxstream Vulkan. That is the same device SweetCider probed (`1af4:1050`, gfxstream-vulkan capset).
@@ -39,3 +50,8 @@ HYPERWIN_ISO=/path/to/windows11-arm64.iso tools/qemu/run-iso.sh
 x86_64 builds of the same DLLs can be made on `another machine`, which has `x86_64-w64-mingw32-gcc`. The guest image is ARM64, so the DLLs Windows loads are the ARM64 ones.
 
 The Android app is `dev.hyperwin.app`. It stages the answer file, builds the gfxstream `GpuConfig`, allocates the shared window, and wraps the TPM seed.
+
+## Thanks
+
+- [AIO Graphics Test](https://github.com/The412Banner/AIO-Graphics-Test) by The412Banner ([@The412Banner](https://github.com/The412Banner)). The demos in the screenshots come from it, and it is how this project checks Direct3D, Vulkan and OpenGL.
+- [Winlator](https://github.com/brunodev85/winlator) by brunodev85 ([@brunodev85](https://github.com/brunodev85)). It inspired this app. The touch controls and their profile files follow Winlator's format. The Vortek fixes come from its renderer, and it is the reference this project compares against when something goes wrong.

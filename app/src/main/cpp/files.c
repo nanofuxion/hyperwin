@@ -321,6 +321,7 @@ static void *open_job(void *arg)
 static int wait_state(int *state, pthread_t thread, int ms)
 {
     struct timespec start, now;
+    unsigned polls = 0;
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
         if (__atomic_load_n(state, __ATOMIC_ACQUIRE) == 1) {
@@ -338,8 +339,35 @@ static int wait_state(int *state, pthread_t thread, int ms)
             pthread_detach(thread);
             return -1;
         }
-        usleep(2000);
+        /* A stat or open answers in about 100 us, so look again soon. Sleeping a fixed 2 ms here cost
+         * every open on the drive several milliseconds. Only a stalled storage falls back to 2 ms. */
+        usleep(polls < 40 ? 25 : polls < 80 ? 200 : 2000);
+        polls++;
     }
+}
+
+/* Storage that answers is asked directly: a helper thread per stat or open cost more than the call
+ * itself. One answer slower than SLOW_MS sends the next minute of calls back through helper threads,
+ * which can give up on a stalled storage and let Windows have an error. */
+#define SLOW_MS 150
+#define SLOW_HOLD_MS 60000
+static long slow_until_ms;
+
+static long now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+static int direct_ok(void)
+{
+    return now_ms() >= __atomic_load_n(&slow_until_ms, __ATOMIC_RELAXED);
+}
+
+static void note_time(long start)
+{
+    if (now_ms() - start > SLOW_MS) __atomic_store_n(&slow_until_ms, now_ms() + SLOW_HOLD_MS, __ATOMIC_RELAXED);
 }
 
 static int stat_flags(void)
@@ -354,6 +382,12 @@ static int stat_flags(void)
 /* 0 and *st filled, a positive errno, or -1 if it did not finish in time. */
 static int stat_at(int dirfd, const char *name, struct stat *st, int ms)
 {
+    if (direct_ok()) {
+        long t0 = now_ms();
+        int rc = fstatat(dirfd, name && name[0] ? name : ".", st, stat_flags()) ? (errno ? errno : EIO) : 0;
+        note_time(t0);
+        return rc;
+    }
     struct io_job *j = calloc(1, sizeof *j);
     pthread_t thread;
     int waited;
@@ -385,6 +419,14 @@ static int stat_at(int dirfd, const char *name, struct stat *st, int ms)
 
 static int open_timeout(const char *path, int flags, int mode, int ms, int *fd_out)
 {
+    if (direct_ok()) {
+        long t0 = now_ms();
+        int fd = open(path, flags, mode);
+        int rc = fd < 0 ? (errno ? errno : EIO) : 0;
+        note_time(t0);
+        *fd_out = fd;
+        return rc;
+    }
     struct io_job *j = calloc(1, sizeof *j);
     pthread_t thread;
     int waited;
