@@ -219,6 +219,8 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             }
         }
         GamepadInput.register(this)
+        // A fresh process holds no VM, so one still running from an earlier session cannot be resumed.
+        if (AvfLaunch.machine == null && VmAccess.granted(this)) Thread { AvfLaunch.killStale(this) }.start()
 
         guest = GuestView(this).apply {
             contentDescription = "Windows display. Touch works as a touch screen, or as a trackpad in trackpad mode. " +

@@ -284,6 +284,28 @@ object AvfLaunch {
         }
     }
 
+    /**
+     * Stops any of this app's VMs that still run while this process has none attached, for example
+     * after the app was killed or crashed: nothing can resume such a VM, and it would hold the disk.
+     */
+    fun killStale(ctx: Context) {
+        if (machine != null) return
+        runCatching {
+            val vmmClass = Class.forName(PKG + "VirtualMachineManager")
+            val vmm = ctx.getSystemService(vmmClass) ?: return
+            for (name in NAMES + "hyperwin") {
+                if (machine != null) return
+                val vm = runCatching { vmmClass.getMethod("get", String::class.java).invoke(vmm, name) }.getOrNull() ?: continue
+                val running = vm.javaClass.getMethod("getStatus").invoke(vm) == 1   // STATUS_RUNNING
+                if (running) {
+                    Log.w(TAG, "stopping stale VM $name")
+                    runCatching { vm.javaClass.getMethod("stop").invoke(vm) }
+                }
+                if (running) runCatching { vmmClass.getMethod("delete", String::class.java).invoke(vmm, name) }
+            }
+        }
+    }
+
     fun stopWindows(onVmStopped: () -> Unit = {}): String {
         val vm = machine ?: return "No running VM is attached to this app session."
         return try {
