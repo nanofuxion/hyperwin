@@ -92,6 +92,16 @@ struct hwgpu_ctl {
      * "Batching submits"). Zero when a process claims the channel. */
     uint64_t submits_to_phone;
     uint64_t submits_to_guest;
+    /* Guest -> phone: fullscreen direct-scanout state and hardware cursor overlay position.
+     * Added at the end of hwgpu_ctl so all earlier field offsets stay binary-compatible. */
+    uint32_t scanout_active;   /* 1 while this channel owns fullscreen direct scanout, 0 when hidden */
+    uint32_t cursor_visible;   /* 1 when Windows' cursor is showing over the fullscreen window */
+    int32_t  cursor_x;         /* cursor screen X relative to the monitor's left edge */
+    int32_t  cursor_y;         /* cursor screen Y relative to the monitor's top edge */
+    uint32_t cursor_mon_w;     /* monitor width in guest screen pixels */
+    uint32_t cursor_mon_h;     /* monitor height in guest screen pixels */
+    uint32_t cursor_seq;       /* bumped by guest whenever cursor state changes */
+    uint32_t cursor_reserved;
 };
 #define HWGPU_SCANOUT_VSYNC 1u
 /* phone: the screen shows Windows' desktop as DWM draws it on the GPU (the HyperWin screen). A
@@ -136,6 +146,9 @@ static inline int hwgpu_claim(void *window, uint32_t *generation)
             continue;
         c->tx_head = c->tx_tail = c->rx_head = c->rx_tail = 0;
         c->submits_to_phone = c->submits_to_guest = 0;
+        c->scanout_active = c->cursor_visible = 0;
+        c->cursor_x = c->cursor_y = 0;
+        c->cursor_mon_w = c->cursor_mon_h = c->cursor_seq = c->cursor_reserved = 0;
         c->slot = i;
         __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELAXED);
         *generation = __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELAXED);
@@ -157,12 +170,20 @@ static inline size_t hwgpu_write_some(uint8_t *data, uint32_t capacity, uint64_t
 {
     const uint64_t h = __atomic_load_n(head, __ATOMIC_RELAXED);
     const uint64_t used = h - __atomic_load_n(tail, __ATOMIC_ACQUIRE);
+#if defined(__i386__) || defined(__x86_64__)
+    /* Under ARM64 Prism x86/x64 emulation, plain loads/stores lack hardware barriers unless
+     * sequenced with a full fence (mfence / lock), which Prism lowers to ARM64 DMB ISH. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
     if (used >= capacity) return 0;
     const size_t n = bytes < capacity - used ? bytes : (size_t)(capacity - used);
     const size_t at = (size_t)(h % capacity);
     const size_t first = n < capacity - at ? n : capacity - at;
     __builtin_memcpy(data + at, src, first);
     if (n > first) __builtin_memcpy(data, (const uint8_t *)src + first, n - first);
+#if defined(__i386__) || defined(__x86_64__)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
     __atomic_store_n(head, h + n, __ATOMIC_RELEASE);
     return n;
 }
@@ -172,12 +193,18 @@ static inline size_t hwgpu_read_some(const uint8_t *data, uint32_t capacity, uin
 {
     const uint64_t t = __atomic_load_n(tail, __ATOMIC_RELAXED);
     const uint64_t avail = __atomic_load_n(head, __ATOMIC_ACQUIRE) - t;
+#if defined(__i386__) || defined(__x86_64__)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
     if (!avail) return 0;
     const size_t n = bytes < avail ? bytes : (size_t)avail;
     const size_t at = (size_t)(t % capacity);
     const size_t first = n < capacity - at ? n : capacity - at;
     __builtin_memcpy(dst, data + at, first);
     if (n > first) __builtin_memcpy((uint8_t *)dst + first, data, n - first);
+#if defined(__i386__) || defined(__x86_64__)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
     __atomic_store_n(tail, t + n, __ATOMIC_RELEASE);
     return n;
 }
@@ -263,5 +290,324 @@ static inline int hwgpu_read_all(void *chan, uint32_t generation, int from_phone
     return 1;
 }
 #endif /* HWGPU_KERNEL */
+
+#if defined(_WIN32) && !defined(HWGPU_KERNEL) && defined(HWGPU_WIN32_FULLSCREEN_HELPER)
+#include <stdlib.h>
+#include <string.h>
+/* Shared guest helper for Vulkan, OpenGL (Zink), D3D12 (vkd3d), D3D10/11 and D3D9:
+ *   1. Detects whether a window fills its monitor and is unoccluded by any visible non-cloaked
+ *      window above it (exclusive fullscreen or borderless fullscreen).
+ *   2. Tracks the Windows cursor shape and position in hwgpu_ctl so the phone can show a cursor
+ *      sublayer above the fullscreen game.
+ *   3. Runs a lightweight background watcher while fullscreen is active so that if a popup,
+ *      Alt-Tab, touch keyboard, or dialog covers the game while its render thread is paused,
+ *      scanout_active drops to 0 within ~32 ms and the phone restores the DWM desktop at once. */
+
+static inline int hwgpu_window_fills_screen(HWND wnd)
+{
+    if (!wnd || !IsWindow(wnd) || !IsWindowVisible(wnd) || IsIconic(wnd)) return 0;
+    HWND root = GetAncestor(wnd, GA_ROOT);
+    if (!root) root = wnd;
+    HWND fg = GetForegroundWindow();
+    if (!fg || (fg != wnd && fg != root)) return 0;
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    RECT rc;
+    POINT tl = {0, 0};
+    if (!GetMonitorInfoA(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi) ||
+        !GetClientRect(wnd, &rc) || !ClientToScreen(wnd, &tl))
+        return 0;
+    if (!(tl.x <= mi.rcMonitor.left && tl.y <= mi.rcMonitor.top &&
+          tl.x + rc.right >= mi.rcMonitor.right && tl.y + rc.bottom >= mi.rcMonitor.bottom))
+        return 0;
+    typedef HRESULT(WINAPI * cloaked_fn)(HWND, DWORD, PVOID, DWORD);
+    static cloaked_fn get_attr;
+    static int looked;
+    if (!looked) {
+        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        get_attr = dwm ? (cloaked_fn)(void *)GetProcAddress(dwm, "DwmGetWindowAttribute") : NULL;
+        looked = 1;
+    }
+    for (HWND w = GetWindow(root, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
+        if (!IsWindowVisible(w) || IsIconic(w)) continue;
+        DWORD cloaked = 0;
+        if (get_attr && SUCCEEDED(get_attr(w, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked))) && cloaked)
+            continue;
+        RECT wr, both;
+        if (GetWindowRect(w, &wr) && IntersectRect(&both, &wr, &mi.rcMonitor)) {
+            /* Ignore zero-area or transparent tool helper windows owned by the game itself that
+             * have no visible region; any real popup/dialog/overlay blocks fullscreen scanout. */
+            LONG ex = GetWindowLongA(w, GWL_EXSTYLE);
+            if ((ex & WS_EX_TRANSPARENT) && (ex & WS_EX_LAYERED)) {
+                BYTE alpha = 255;
+                DWORD flags = 0;
+                if (GetLayeredWindowAttributes(w, NULL, &alpha, &flags) && (flags & LWA_ALPHA) && alpha == 0)
+                    continue;
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* A windowed program whose client area is showing: the phone may show its frames on a layer of their
+ * own, over the desktop, at the client rect, and Windows never sees the pixels. Walks the windows above
+ * it; a window that covers a whole edge strip of what is left (the taskbar, the screen's edge) only trims
+ * the visible part, anything else refuses. client_out: the client rect in screen pixels (it may run past
+ * the screen). vis_out: the part to show, in client pixels. */
+static inline int hwgpu_window_overlay_ok(HWND wnd, RECT *client_out, RECT *vis_out)
+{
+    if (!wnd || !IsWindow(wnd) || !IsWindowVisible(wnd) || IsIconic(wnd)) return 0;
+    HWND root = GetAncestor(wnd, GA_ROOT);
+    if (!root) root = wnd;
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    RECT rc, cr, vis;
+    POINT tl = {0, 0};
+    if (!GetMonitorInfoA(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi) ||
+        !GetClientRect(wnd, &rc) || !ClientToScreen(wnd, &tl))
+        return 0;
+    cr.left = tl.x;
+    cr.top = tl.y;
+    cr.right = tl.x + rc.right;
+    cr.bottom = tl.y + rc.bottom;
+    if (cr.right <= cr.left || cr.bottom <= cr.top || !IntersectRect(&vis, &cr, &mi.rcMonitor))
+        return 0;
+    typedef HRESULT(WINAPI * cloaked_fn)(HWND, DWORD, PVOID, DWORD);
+    static cloaked_fn get_attr;
+    static int looked;
+    if (!looked) {
+        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        get_attr = dwm ? (cloaked_fn)(void *)GetProcAddress(dwm, "DwmGetWindowAttribute") : NULL;
+        looked = 1;
+    }
+    for (HWND w = GetWindow(root, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
+        if (!IsWindowVisible(w) || IsIconic(w)) continue;
+        DWORD cloaked = 0;
+        if (get_attr && SUCCEEDED(get_attr(w, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked))) && cloaked)
+            continue;
+        RECT o, both;
+        if (!GetWindowRect(w, &o) || !IntersectRect(&both, &o, &vis)) continue;
+        LONG ex = GetWindowLongA(w, GWL_EXSTYLE);
+        if ((ex & WS_EX_TRANSPARENT) && (ex & WS_EX_LAYERED)) {
+            BYTE alpha = 255;
+            DWORD flags = 0;
+            if (GetLayeredWindowAttributes(w, NULL, &alpha, &flags) && (flags & LWA_ALPHA) && alpha == 0)
+                continue;
+        }
+        if (o.left <= vis.left && o.right >= vis.right) {
+            if (o.top <= vis.top) vis.top = o.bottom < vis.bottom ? o.bottom : vis.bottom;
+            else if (o.bottom >= vis.bottom) vis.bottom = o.top > vis.top ? o.top : vis.top;
+            else return 0;
+        } else if (o.top <= vis.top && o.bottom >= vis.bottom) {
+            if (o.left <= vis.left) vis.left = o.right < vis.right ? o.right : vis.right;
+            else if (o.right >= vis.right) vis.right = o.left > vis.left ? o.left : vis.left;
+            else return 0;
+        } else {
+            return 0;
+        }
+        if (vis.right <= vis.left || vis.bottom <= vis.top) return 0;
+    }
+    if (client_out) *client_out = cr;
+    if (vis_out) {
+        vis_out->left = vis.left - cr.left;
+        vis_out->top = vis.top - cr.top;
+        vis_out->right = vis.right - cr.left;
+        vis_out->bottom = vis.bottom - cr.top;
+    }
+    return 1;
+}
+
+static int g_hwgpu_watch_overlay;
+
+static inline int hwgpu_extract_cursor_rgba(HCURSOR hcur, uint32_t *out_w, uint32_t *out_h,
+                                            int32_t *out_hx, int32_t *out_hy, uint32_t rgba[64 * 64])
+{
+    if (!hcur) return 0;
+    ICONINFO ii;
+    memset(&ii, 0, sizeof(ii));
+    if (!GetIconInfo(hcur, &ii)) return 0;
+    BITMAP bm;
+    memset(&bm, 0, sizeof(bm));
+    HBITMAP hbm = ii.hbmColor ? ii.hbmColor : ii.hbmMask;
+    if (!hbm || !GetObjectA(hbm, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        return 0;
+    }
+    uint32_t src_w = (uint32_t)bm.bmWidth;
+    uint32_t src_h = (uint32_t)(ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2);
+    if (!src_w || !src_h) {
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        return 0;
+    }
+    uint32_t cw = src_w > 64 ? 64 : src_w;
+    uint32_t ch = src_h > 64 ? 64 : src_h;
+    *out_w = cw;
+    *out_h = ch;
+    *out_hx = (int32_t)ii.xHotspot;
+    *out_hy = (int32_t)ii.yHotspot;
+    memset(rgba, 0, 64 * 64 * sizeof(uint32_t));
+
+    HDC hdc = GetDC(NULL);
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = (LONG)src_w;
+    bi.bmiHeader.biHeight = -(LONG)(ii.hbmColor ? src_h : src_h * 2);
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    uint32_t total_rows = ii.hbmColor ? src_h : src_h * 2;
+    uint32_t *cbuf = (uint32_t *)calloc((size_t)src_w * total_rows, sizeof(uint32_t));
+    uint32_t *mbuf = (uint32_t *)calloc((size_t)src_w * total_rows, sizeof(uint32_t));
+    if (cbuf && mbuf && hdc) {
+        if (ii.hbmColor) {
+            GetDIBits(hdc, ii.hbmColor, 0, src_h, cbuf, &bi, DIB_RGB_COLORS);
+            if (ii.hbmMask) GetDIBits(hdc, ii.hbmMask, 0, src_h, mbuf, &bi, DIB_RGB_COLORS);
+            int has_alpha = 0;
+            for (uint32_t i = 0; i < src_w * src_h; i++) {
+                if (cbuf[i] & 0xFF000000u) { has_alpha = 1; break; }
+            }
+            for (uint32_t y = 0; y < ch; y++) {
+                for (uint32_t x = 0; x < cw; x++) {
+                    uint32_t c = cbuf[y * src_w + x];
+                    uint32_t m = ii.hbmMask ? mbuf[y * src_w + x] : 0;
+                    uint32_t a = has_alpha ? (c >> 24) : ((m & 0xFFFFFFu) == 0 ? 0xFFu : ((c & 0xFFFFFFu) ? 0xFFu : 0x00u));
+                    uint32_t r = (c >> 16) & 0xFFu, g = (c >> 8) & 0xFFu, b = c & 0xFFu;
+                    rgba[y * cw + x] = r | (g << 8) | (b << 16) | (a << 24);
+                }
+            }
+        } else if (ii.hbmMask) {
+            GetDIBits(hdc, ii.hbmMask, 0, src_h * 2, mbuf, &bi, DIB_RGB_COLORS);
+            for (uint32_t y = 0; y < ch; y++) {
+                for (uint32_t x = 0; x < cw; x++) {
+                    uint32_t and_m = mbuf[y * src_w + x] & 0xFFFFFFu;
+                    uint32_t xor_m = mbuf[(y + src_h) * src_w + x] & 0xFFFFFFu;
+                    uint32_t px = 0;
+                    if (and_m == 0 && xor_m == 0) px = 0xFF000000u;
+                    else if (and_m == 0 && xor_m != 0) px = 0xFFFFFFFFu;
+                    else if (and_m != 0 && xor_m != 0) px = 0xFFFFFFFFu;
+                    rgba[y * cw + x] = px;
+                }
+            }
+        }
+    }
+    free(cbuf);
+    free(mbuf);
+    if (hdc) ReleaseDC(NULL, hdc);
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    return 1;
+}
+
+static struct hwgpu_ctl * volatile g_hwgpu_watch_ctl;
+static HWND volatile g_hwgpu_watch_wnd;
+static HANDLE g_hwgpu_watch_thread;
+static HCURSOR g_hwgpu_last_hcursor;
+
+static inline void hwgpu_publish_cursor_pos(struct hwgpu_ctl *ctl, HWND wnd, CURSORINFO *out_ci)
+{
+    CURSORINFO ci;
+    memset(&ci, 0, sizeof(ci));
+    ci.cbSize = sizeof(ci);
+    int vis = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor != NULL;
+    if (out_ci) *out_ci = ci;
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    int32_t cx = 0, cy = 0;
+    uint32_t mw = 0, mh = 0;
+    if (wnd && GetMonitorInfoA(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        cx = (int32_t)(ci.ptScreenPos.x - mi.rcMonitor.left);
+        cy = (int32_t)(ci.ptScreenPos.y - mi.rcMonitor.top);
+        mw = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
+        mh = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    }
+    if ((int)ctl->cursor_visible != vis || ctl->cursor_x != cx || ctl->cursor_y != cy ||
+        ctl->cursor_mon_w != mw || ctl->cursor_mon_h != mh) {
+        ctl->cursor_x = cx;
+        ctl->cursor_y = cy;
+        ctl->cursor_mon_w = mw;
+        ctl->cursor_mon_h = mh;
+        __atomic_store_n(&ctl->cursor_visible, (uint32_t)vis, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&ctl->cursor_seq, 1u, __ATOMIC_RELEASE);
+    }
+}
+
+static DWORD WINAPI hwgpu_fullscreen_watch_proc(LPVOID param)
+{
+    (void)param;
+    int unfocused = 0;
+    for (;;) {
+        hwgpu_pause(16000);
+        struct hwgpu_ctl *ctl = g_hwgpu_watch_ctl;
+        HWND wnd = g_hwgpu_watch_wnd;
+        if (!ctl || !wnd) {
+            unfocused = 0;
+            continue;
+        }
+        if (g_hwgpu_watch_overlay ? hwgpu_window_overlay_ok(wnd, NULL, NULL) : hwgpu_window_fills_screen(wnd)) {
+            unfocused = 0;
+            hwgpu_publish_cursor_pos(ctl, wnd, NULL);
+        } else if (++unfocused >= 2) {
+            /* Covered by another window or lost focus while not presenting: drop scanout at once. */
+            g_hwgpu_watch_wnd = NULL;
+            __atomic_store_n(&ctl->cursor_visible, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&ctl->scanout_active, 0u, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&ctl->cursor_seq, 1u, __ATOMIC_RELEASE);
+            InvalidateRect(wnd, NULL, FALSE);
+            unfocused = 0;
+        }
+    }
+    return 0;
+}
+
+static inline void hwgpu_update_cursor_ex(
+    struct hwgpu_ctl *ctl, HWND wnd,
+    void (*send_shape)(uint32_t w, uint32_t h, int32_t hx, int32_t hy, const uint32_t *rgba), int overlay)
+{
+    if (!ctl || !wnd) return;
+    g_hwgpu_watch_overlay = overlay;
+    __atomic_store_n(&ctl->scanout_active, 1u, __ATOMIC_RELEASE);
+    g_hwgpu_watch_ctl = ctl;
+    g_hwgpu_watch_wnd = wnd;
+    if (!g_hwgpu_watch_thread) {
+        HANDLE th = CreateThread(NULL, 0, hwgpu_fullscreen_watch_proc, NULL, 0, NULL);
+        if (th) g_hwgpu_watch_thread = th;
+    }
+    CURSORINFO ci;
+    hwgpu_publish_cursor_pos(ctl, wnd, &ci);
+    if ((ci.flags & CURSOR_SHOWING) && ci.hCursor && ci.hCursor != g_hwgpu_last_hcursor && send_shape) {
+        uint32_t cw = 0, ch = 0, rgba[64 * 64];
+        int32_t hx = 0, hy = 0;
+        if (hwgpu_extract_cursor_rgba(ci.hCursor, &cw, &ch, &hx, &hy, rgba)) {
+            g_hwgpu_last_hcursor = ci.hCursor;
+            send_shape(cw, ch, hx, hy, rgba);
+        }
+    }
+}
+
+static inline void hwgpu_update_fullscreen_cursor(
+    struct hwgpu_ctl *ctl, HWND wnd,
+    void (*send_shape)(uint32_t w, uint32_t h, int32_t hx, int32_t hy, const uint32_t *rgba))
+{
+    hwgpu_update_cursor_ex(ctl, wnd, send_shape, 0);
+}
+
+static inline void hwgpu_stop_fullscreen_watch(struct hwgpu_ctl *ctl)
+{
+    g_hwgpu_watch_wnd = NULL;
+    if (ctl) {
+        __atomic_store_n(&ctl->cursor_visible, 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&ctl->scanout_active, 0u, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&ctl->cursor_seq, 1u, __ATOMIC_RELEASE);
+    }
+}
+#endif /* _WIN32 && !HWGPU_KERNEL && HWGPU_WIN32_FULLSCREEN_HELPER */
 
 #endif

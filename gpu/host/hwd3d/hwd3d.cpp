@@ -13,11 +13,13 @@
 #include <hw_d3d.h>
 #include <hwgpu_ring.h>
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <mutex>
 #include <android/hardware_buffer.h>
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <vulkan/vulkan.h>
+#include <pthread.h>
 #include <sched.h>
 #include <chrono>
 #include <stdlib.h>
@@ -46,23 +48,49 @@ extern "C" void* hwgpu_host_d3d_window_acquire(void);
 extern "C" void hwgpu_host_d3d_window_release(void* window);
 extern "C" void hwgpu_host_d3d_show(int on);
 extern "C" int hwgpu_host_vsync(void);
-// DXVK, loaded at run time (setup_dxvk): the version the app's Direct3D setting names, or the shipped one.
+// DXVK, loaded at run time (setup_dxvk): desktop/shell always uses built-in DXVK-Sarek;
+// games use HWD3D_DXVK_DIR when set and valid, otherwise the built-in DXVK-Sarek.
 namespace {
 constexpr unsigned kDxvkAbi = 1;  // dxvk-android.patch's hwd3d_abi_version
 struct Dxvk {
+    std::string label;
     HRESULT(WINAPI* create_factory)(REFIID, void**) = nullptr;
     PFN_D3D11_CREATE_DEVICE create_device = nullptr;
     void (*set_program)(const char*, const char*) = nullptr;
+    void (*set_program_d3d11)(const char*, const char*) = nullptr;
+    void (*set_program_d3d9)(const char*, const char*) = nullptr;
+    HRESULT(WINAPI* create9ex)(UINT, IDirect3D9Ex**) = nullptr;
+    void (*d9_get_vk_handles)(IDirect3DDevice9Ex*, VkInstance*, VkPhysicalDevice*, VkDevice*) = nullptr;
+    HRESULT (*d9_blit_to_vkimage)(IDirect3DDevice9Ex*, IDirect3DSurface9*, VkImage, uint32_t, uint32_t, uint32_t) = nullptr;
+    void apply_program(const std::string& exe, const std::string& conf) const {
+        if (set_program) set_program(exe.c_str(), conf.c_str());
+        if (set_program_d3d11) set_program_d3d11(exe.c_str(), conf.c_str());
+        if (set_program_d3d9) set_program_d3d9(exe.c_str(), conf.c_str());
+    }
 };
-Dxvk g_dxvk;
+Dxvk g_dxvk_desktop;
+Dxvk g_dxvk_games;
 }  // namespace
 extern "C" void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
 extern "C" void hwgpu_host_heap_free(void* p);
 extern "C" void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height);
+extern "C" void hwgpu_host_show_game_buffer(uint32_t slot, uint32_t generation, void* ahb, uint32_t width, uint32_t height, int vsync);
+extern "C" void hwgpu_host_hide_game_buffer(uint32_t slot);
+extern "C" void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uint32_t height, int32_t x, int32_t y, uint32_t cw, uint32_t ch, const uint32_t* crop);
+extern "C" void hwgpu_host_set_cursor_shape(uint32_t slot, uint32_t width, uint32_t height, int32_t hot_x, int32_t hot_y,
+                                            const void* rgba);
 
 namespace {
 
 void* const BAD = reinterpret_cast<void*>(uintptr_t(1));
+
+// Staged arrays touched by one D3D9 call, so a captured frame can be replayed without the guest.
+struct D9StageGrab {
+    std::vector<uint64_t> pos;
+    std::vector<uint32_t> len;
+    std::vector<uint8_t> bytes;
+    void clear() { pos.clear(); len.clear(); bytes.clear(); }
+};
 
 // Reads a request's arguments. Past the end it reads zeroes and clears ok.
 struct Rd {
@@ -72,6 +100,7 @@ struct Rd {
     uint64_t stage_cap = 0;          // its data bytes
     uint64_t stage_end = 0;          // the furthest staged byte this request used
     uint64_t staged = 0;             // bytes it took from there
+    D9StageGrab* d9grab = nullptr;   // when set, staged arrays are copied for the frame sample
     const void* take(uint64_t n) {
         uint64_t padded = (n + 3) & ~3ull;
         if (uint64_t(end - p) < padded) {
@@ -111,7 +140,13 @@ struct Rd {
             stage_end = std::max(stage_end, pos + bytes);
             staged += bytes;
             *n = count;
-            return stage + HWD3D_STAGING_DATA + at;
+            const uint8_t* src = stage + HWD3D_STAGING_DATA + at;
+            if (d9grab) {
+                d9grab->pos.push_back(pos);
+                d9grab->len.push_back(uint32_t(bytes));
+                d9grab->bytes.insert(d9grab->bytes.end(), src, src + bytes);
+            }
+            return src;
         }
         const void* at = take(count * el);
         if (at) *n = count;
@@ -183,9 +218,19 @@ struct Chan {
     void* window = nullptr;                    // the surface, while this program has it
     uint32_t swapchain = 0;
     std::string exe, conf;                     // the program this channel draws for, and its dxvk.conf
+    const Dxvk* dxvk = nullptr;                // resolved DXVK set (desktop built-in vs games)
+    bool is_desktop = true;                    // desktop/shell program (stock driver, no layers, no vsync wait)
     struct D9State* d9 = nullptr;              // Direct3D 9 objects (hwd3d9.inc)
     uint8_t* stage = nullptr;                  // the staging area in the heap (hw_d3d.h)
     uint64_t stage_size = 0;
+    uint8_t* readback_ptr() const {
+        return (stage && stage_size > HWD3D_STAGING_DATA + HWD3D_QUERY_PAGE + HWD3D_READBACK_SIZE)
+                   ? (stage + stage_size - HWD3D_QUERY_PAGE - HWD3D_READBACK_SIZE)
+                   : nullptr;
+    }
+    ID3D11Texture2D* readback_stage = nullptr;
+    ID3D11Device* readback_dev = nullptr;
+    uint32_t readback_w = 0, readback_h = 0, readback_fmt = 0;
     // Queries ended and not yet answered in the query page.
     struct Pending {
         ID3D11Asynchronous* q;  // a reference of its own
@@ -193,6 +238,11 @@ struct Chan {
         uint32_t slot, seq;
     };
     std::vector<Pending> pending;
+    struct PendingD9 {
+        IDirect3DQuery9* q;     // a reference of its own
+        uint32_t slot, seq;
+    };
+    std::vector<PendingD9> pending_d9;
     struct OpenedShare {
         uint32_t handle = 0;
         std::shared_ptr<Shared> shared;
@@ -201,9 +251,36 @@ struct Chan {
     };
     std::vector<OpenedShare> opened_shares;
 
+    // 3-buffer AHardwareBuffer ring for fullscreen direct scanout (D3D10/11 and D3D9).
+    struct ScanRingBuf {
+        AHardwareBuffer* ahb = nullptr;
+        ID3D11Texture2D* tex11 = nullptr;
+        VkDevice vk_dev = VK_NULL_HANDLE;
+        VkImage vk_img = VK_NULL_HANDLE;
+        VkDeviceMemory vk_mem = VK_NULL_HANDLE;
+        uint32_t vk_fmt = 0;
+        PFN_vkDestroyImage destroy_image = nullptr;
+        PFN_vkFreeMemory free_memory = nullptr;
+    };
+    ScanRingBuf scan_ring[3];
+    uint32_t scan_w = 0, scan_h = 0, scan_idx = 0;
+    void* scan_dev = nullptr;
+
+    void free_scan_ring() {
+        for (auto& b : scan_ring) {
+            if (b.tex11) { b.tex11->Release(); b.tex11 = nullptr; }
+            if (b.vk_img && b.destroy_image) { b.destroy_image(b.vk_dev, b.vk_img, nullptr); b.vk_img = VK_NULL_HANDLE; }
+            if (b.vk_mem && b.free_memory) { b.free_memory(b.vk_dev, b.vk_mem, nullptr); b.vk_mem = VK_NULL_HANDLE; }
+            if (b.ahb) { AHardwareBuffer_release(b.ahb); b.ahb = nullptr; }
+            b = ScanRingBuf{};
+        }
+        scan_w = scan_h = 0;
+        scan_dev = nullptr;
+    }
+
     // Writes the results the GPU has for ended queries into the query page.
     void poll_queries() {
-        if (pending.empty()) return;
+        if (pending.empty() && pending_d9.empty()) return;
         auto* page = reinterpret_cast<hwd3d_query_slot*>(stage + stage_size - HWD3D_QUERY_PAGE);
         for (auto p = pending.begin(); p != pending.end();) {
             uint8_t data[HWD3D_QUERY_DATA];
@@ -219,6 +296,20 @@ struct Chan {
             p->q->Release();
             p->ctx->Release();
             p = pending.erase(p);
+        }
+        for (auto p = pending_d9.begin(); p != pending_d9.end();) {
+            uint8_t data[8] = {};
+            UINT size = std::min<UINT>(p->q->GetDataSize(), 8);
+            if (p->q->GetData(size ? data : nullptr, size, 0) != S_OK) {
+                ++p;
+                continue;
+            }
+            hwd3d_query_slot& s = page[p->slot];
+            memcpy(s.data, data, size);
+            s.size = size;
+            __atomic_store_n(&s.seq, p->seq, __ATOMIC_RELEASE);
+            p->q->Release();
+            p = pending_d9.erase(p);
         }
     }
 
@@ -339,7 +430,14 @@ struct Chan {
 
     // What the program still held, newest first, as it would have let go.
     void release_all() {
+        hwgpu_host_hide_game_buffer(slot);
         idle();
+        free_scan_ring();
+        if (readback_stage) {
+            readback_stage->Release();
+            readback_stage = nullptr;
+        }
+        readback_dev = nullptr;
         for (auto& os : opened_shares)
             if (os.tex) os.tex->Release();
         opened_shares.clear();
@@ -348,6 +446,8 @@ struct Chan {
             p.ctx->Release();
         }
         pending.clear();
+        for (auto& p : pending_d9) p.q->Release();
+        pending_d9.clear();
         if (immediate) {
             for (auto& m : maps) immediate->Unmap(static_cast<ID3D11Resource*>(m.res), m.sub);
             maps.clear();
@@ -539,7 +639,9 @@ int32_t hc_ID3D11DeviceContext_UpdateSubresource(Chan& c, void* self, Rd& r, Wr&
 // guest sends them back at Unmap when it wrote.
 int32_t hc_ID3D11DeviceContext_Map(Chan& c, void* self, Rd& r, Wr& w) {
     void* p = c.obj(r.u32(), HI_ID3D11Resource);
-    uint32_t sub = r.u32(), type = r.u32(), flags = r.u32();
+    uint32_t sub = r.u32(), type = r.u32(), raw_flags = r.u32();
+    bool staged_ok = (raw_flags & HWD3D_MAP_STAGED_OK) != 0;
+    uint32_t flags = raw_flags & ~HWD3D_MAP_STAGED_OK;
     HRESULT hr = S_OK;
     if (!r.ok || !p || p == BAD) hr = E_INVALIDARG;
     for (auto& m : c.maps)
@@ -568,8 +670,13 @@ int32_t hc_ID3D11DeviceContext_Map(Chan& c, void* self, Rd& r, Wr& w) {
     w.u32(m.RowPitch);
     w.u32(m.DepthPitch);
     w.u32(uint32_t(size));
-    w.u32(reads);
-    if (reads) w.put(m.pData, size);
+    if (reads && staged_ok && c.readback_ptr() && size <= HWD3D_READBACK_SIZE) {
+        memcpy(c.readback_ptr(), m.pData, size);
+        w.u32(HWD3D_STAGED);
+    } else {
+        w.u32(reads ? HWD3D_INLINE : 0);
+        if (reads) w.put(m.pData, size);
+    }
     return hr;
 }
 
@@ -682,12 +789,14 @@ int32_t hc_ID3D11DeviceContext_GetData(Chan& c, void* self, Rd& r, Wr& w) {
     return hr;
 }
 
-// "Limit to screen refresh" (the app's switch) holds a program that asks for no wait to one
-// frame per refresh, as the sgpu scanout does.
+// "Limit to screen refresh" (the app's switch) holds a game that asks for no wait to one
+// frame per refresh, as the sgpu scanout does. The desktop never waits for VSync.
 int32_t hc_IDXGISwapChain_Present(Chan& c, void* self, Rd& r, Wr&) {
     uint32_t sync = r.u32(), flags = r.u32();
     if (!r.ok) return E_INVALIDARG;
-    if (!sync && hwgpu_host_vsync()) sync = 1;
+    chan_dxvk(c);
+    if (c.is_desktop) sync = 0;
+    else if (!sync && hwgpu_host_vsync()) sync = 1;
     c.presents++;
     return static_cast<IDXGISwapChain*>(self)->Present(sync, flags);
 }
@@ -742,52 +851,106 @@ int32_t hc_IDXGIAdapter1_GetDesc1(Chan&, void* self, Rd&, Wr& w) { return adapte
 
 // ---- the channel ----
 
-// Opens DXVK's two libraries from dir (or by name, from the app's own libraries when dir is null),
-// dxgi first so d3d11's link to it finds the same copy. False when one is missing or its ABI differs.
-bool load_dxvk(const char* dir) {
-    auto open = [&](const char* name) -> void* {
-        std::string path = dir ? std::string(dir) + "/" + name : std::string(name);
-        void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+// Finds a library matching "<prefix>*.so" in dir (supports both plain libdxvk_dxgi.so and
+// version-stamped libdxvk_dxgi-<ver>.so).
+std::string find_dxvk_lib(const char* dir, const char* prefix) {
+    std::string exact = std::string(dir) + "/" + prefix + ".so";
+    if (access(exact.c_str(), R_OK) == 0) return exact;
+    DIR* dp = opendir(dir);
+    if (!dp) return {};
+    size_t plen = strlen(prefix);
+    std::string found;
+    while (dirent* e = readdir(dp)) {
+        const char* n = e->d_name;
+        size_t nl = strlen(n);
+        if (nl > plen + 3 && strncmp(n, prefix, plen) == 0 && strcmp(n + nl - 3, ".so") == 0) {
+            found = std::string(dir) + "/" + n;
+            break;
+        }
+    }
+    closedir(dp);
+    return found;
+}
+
+// Opens a DXVK set from dir (or built-in Sarek *_builtin.so when dir is null) with RTLD_LOCAL
+// so two DXVK builds (built-in desktop + optional games build) coexist in one process.
+bool load_dxvk_set(const char* dir, Dxvk& out) {
+    out = Dxvk{};
+    auto open_lib = [&](const char* prefix) -> void* {
+        std::string path = dir ? find_dxvk_lib(dir, prefix) : (std::string(prefix) + "_builtin.so");
+        if (path.empty()) {
+            LOG("DXVK: %s*.so not found in %s", prefix, dir ? dir : "the app");
+            return nullptr;
+        }
+        void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (!h) LOG("DXVK: %s: %s", path.c_str(), dlerror());
         return h;
     };
-    void* dxgi = open("libdxvk_dxgi.so");
+    void* dxgi = open_lib("libdxvk_dxgi");
     if (!dxgi) return false;
     auto abi = reinterpret_cast<unsigned (*)()>(dlsym(dxgi, "hwd3d_abi_version"));
     if (!abi || abi() != kDxvkAbi) {
-        LOG("DXVK in %s was built for HwD3D ABI %u, this renderer speaks %u: refused", dir ? dir : "the app", abi ? abi() : 0, kDxvkAbi);
+        LOG("DXVK in %s was built for HwD3D ABI %u, this renderer speaks %u: refused", dir ? dir : "built-in", abi ? abi() : 0, kDxvkAbi);
         dlclose(dxgi);
         return false;
     }
-    void* d3d11 = open("libdxvk_d3d11.so");
+    void* d3d11 = open_lib("libdxvk_d3d11");
     if (!d3d11) {
         dlclose(dxgi);
         return false;
     }
-    g_dxvk.create_factory = reinterpret_cast<decltype(g_dxvk.create_factory)>(dlsym(dxgi, "CreateDXGIFactory1"));
-    g_dxvk.create_device = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(dlsym(d3d11, "D3D11CreateDevice"));
-    g_dxvk.set_program = reinterpret_cast<decltype(g_dxvk.set_program)>(dlsym(dxgi, "hwd3d_set_program"));
-    return g_dxvk.create_factory && g_dxvk.create_device && g_dxvk.set_program;
+    out.create_factory = reinterpret_cast<decltype(out.create_factory)>(dlsym(dxgi, "CreateDXGIFactory1"));
+    out.create_device = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(dlsym(d3d11, "D3D11CreateDevice"));
+    out.set_program = reinterpret_cast<decltype(out.set_program)>(dlsym(dxgi, "hwd3d_set_program"));
+    out.set_program_d3d11 = reinterpret_cast<decltype(out.set_program_d3d11)>(dlsym(d3d11, "hwd3d_set_program"));
+    if (void* d3d9 = open_lib("libdxvk_d3d9")) {
+        out.create9ex = reinterpret_cast<decltype(out.create9ex)>(dlsym(d3d9, "Direct3DCreate9Ex"));
+        out.set_program_d3d9 = reinterpret_cast<decltype(out.set_program_d3d9)>(dlsym(d3d9, "hwd3d_set_program"));
+        out.d9_get_vk_handles = reinterpret_cast<decltype(out.d9_get_vk_handles)>(dlsym(d3d9, "hwd3d9_get_vk_handles"));
+        out.d9_blit_to_vkimage = reinterpret_cast<decltype(out.d9_blit_to_vkimage)>(dlsym(d3d9, "hwd3d9_blit_to_vkimage"));
+    }
+    out.label = dir ? dir : "built-in DXVK-Sarek";
+    return out.create_factory && out.create_device && out.set_program;
+}
+
+bool is_desktop_program(const std::string& exe) {
+    if (exe.empty()) return true;  // no HWD3D_OP_PROGRAM received -> built-in
+    std::string low = exe;
+    for (char& ch : low) {
+        if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
+        else if (ch == '/') ch = '\\';
+    }
+    // Anything under %SystemRoot% (e.g. C:\Windows\), such as dwm.exe, WUDFHost.exe, explorer.exe.
+    if (low.size() >= 11 && low[1] == ':' && low.compare(2, 9, "\\windows\\") == 0) return true;
+    // Microsoft shell apps outside C:\Windows\ (SystemApps / WindowsApps).
+    size_t slash = low.find_last_of('\\');
+    std::string base = (slash == std::string::npos) ? low : low.substr(slash + 1);
+    static const char* const kShellApps[] = {
+        "startmenuexperiencehost.exe",
+        "shellexperiencehost.exe",
+        "searchhost.exe",
+        "textinputhost.exe",
+        "systemsettings.exe",
+    };
+    for (const char* app : kShellApps) {
+        if (base == app) return true;
+    }
+    return false;
 }
 
 void setup_dxvk() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
     static bool done = false;
     if (done) return;
     done = true;
-    const char* dir = getenv("HWD3D_DXVK_DIR");
-    if (!(dir && load_dxvk(dir))) {
-        if (dir) LOG("DXVK: falling back to the shipped one");
-        g_dxvk = Dxvk{};
-        load_dxvk(nullptr);
-    }
-    LOG("DXVK from %s", g_dxvk.create_factory ? (dir && getenv("HWD3D_DXVK_DIR") ? dir : "the app") : "nowhere");
     // Vulkan comes from the same driver wrapper gfxstream uses (Vortek's fixes, the shader cache).
     if (!getenv("HWGPU_VK_LOADER") && getenv("ANDROID_EMU_VK_LOADER_PATH"))
         setenv("HWGPU_VK_LOADER", getenv("ANDROID_EMU_VK_LOADER_PATH"), 1);
     // DXVK writes under $XDG_CACHE_HOME; this process has no home.
     if (!getenv("XDG_CACHE_HOME")) {
-        const char* dir = getenv("HWGPU_VK_CACHE_DIR");
-        setenv("XDG_CACHE_HOME", dir ? dir : "/data/local/tmp", 1);
+        const char* cdir = getenv("HWGPU_VK_CACHE_DIR");
+        setenv("XDG_CACHE_HOME", cdir ? cdir : "/data/local/tmp", 1);
     }
     // DXVK logs to files: dxgi.log and d3d11.log in the cache folder. adb shell setprop
     // debug.hwd3d.log info (or debug) says more.
@@ -795,16 +958,44 @@ void setup_dxvk() {
     __system_property_get("debug.hwd3d.log", level);
     if (!getenv("DXVK_LOG_LEVEL")) setenv("DXVK_LOG_LEVEL", level[0] ? level : "warn", 1);
     if (!getenv("DXVK_LOG_PATH")) setenv("DXVK_LOG_PATH", getenv("XDG_CACHE_HOME"), 1);
+
+    load_dxvk_set(nullptr, g_dxvk_desktop);
+    const char* dir = getenv("HWD3D_DXVK_DIR");
+    if (dir && dir[0]) {
+        if (!load_dxvk_set(dir, g_dxvk_games)) {
+            LOG("DXVK games (%s) failed to load; falling back to built-in DXVK-Sarek", dir);
+            g_dxvk_games = g_dxvk_desktop;
+        }
+    } else {
+        g_dxvk_games = g_dxvk_desktop;
+    }
+    LOG("DXVK desktop=%s (d3d9=%s), games=%s (d3d9=%s)",
+        g_dxvk_desktop.create_factory ? g_dxvk_desktop.label.c_str() : "none",
+        g_dxvk_desktop.create9ex ? "yes" : "no",
+        g_dxvk_games.create_factory ? g_dxvk_games.label.c_str() : "none",
+        g_dxvk_games.create9ex ? "yes" : "no");
+}
+
+const Dxvk& chan_dxvk(Chan& c) {
+    setup_dxvk();
+    if (!c.dxvk) {
+        bool desktop = is_desktop_program(c.exe);
+        c.is_desktop = desktop;
+        c.dxvk = desktop ? &g_dxvk_desktop : &g_dxvk_games;
+        LOG("channel %u: '%s' -> %s (%s, vulkan=%s)", c.slot, c.exe.empty() ? "<unknown>" : c.exe.c_str(),
+            desktop ? "desktop" : "games", c.dxvk->label.c_str(), desktop ? "stock libvulkan.so" : "games stack");
+    }
+    return *c.dxvk;
 }
 
 int32_t create_factory(Chan& c, Rd& r, Wr& w) {
     uint32_t want = r.u32();
     if (!r.ok || want >= HI_COUNT) return E_INVALIDARG;
-    setup_dxvk();
-    if (g_dxvk.set_program) g_dxvk.set_program(c.exe.c_str(), c.conf.c_str());
+    const Dxvk& dx = chan_dxvk(c);
+    dx.apply_program(c.exe, c.conf);
     void* f = nullptr;
-    if (!g_dxvk.create_factory) return E_FAIL;
-    HRESULT hr = g_dxvk.create_factory(hi_iid[want], &f);
+    if (!dx.create_factory) return E_FAIL;
+    HRESULT hr = dx.create_factory(hi_iid[want], &f);
     w.u32(SUCCEEDED(hr) ? c.put(f, int(want)) : 0);
     return hr;
 }
@@ -815,13 +1006,13 @@ int32_t create_device(Chan& c, uint32_t adapter_h, Rd& r, Wr& w) {
     uint64_t n = 0;
     auto* levels = static_cast<const D3D_FEATURE_LEVEL*>(r.arr(sizeof(D3D_FEATURE_LEVEL), &n));
     if (!r.ok || adapter == BAD || n > 16) return E_INVALIDARG;
-    setup_dxvk();
-    if (g_dxvk.set_program) g_dxvk.set_program(c.exe.c_str(), c.conf.c_str());
+    const Dxvk& dx = chan_dxvk(c);
+    dx.apply_program(c.exe, c.conf);
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     D3D_FEATURE_LEVEL level{};
-    if (!g_dxvk.create_device) return E_FAIL;
-    HRESULT hr = g_dxvk.create_device(static_cast<IDXGIAdapter*>(adapter),
+    if (!dx.create_device) return E_FAIL;
+    HRESULT hr = dx.create_device(static_cast<IDXGIAdapter*>(adapter),
                                    adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels,
                                    UINT(n), D3D11_SDK_VERSION, &dev, &level, &ctx);
     LOG("channel %u: D3D11CreateDevice 0x%x, feature level 0x%x", c.slot, unsigned(hr), unsigned(level));
@@ -883,15 +1074,22 @@ std::mutex g_shared_lock;
 std::map<uint32_t, std::shared_ptr<Shared>> g_shared;
 uint32_t g_next_share = 1;
 
-// The Vulkan entry DXVK itself uses (vulkan_loader.cpp in dxvk-android.patch).
-PFN_vkGetInstanceProcAddr vk_gipa() {
-    static PFN_vkGetInstanceProcAddr gipa;
-    if (gipa) return gipa;
+// The Vulkan entry DXVK itself uses (vulkan_loader.cpp): stock libvulkan.so for the desktop,
+// HWGPU_VK_LOADER (or stock fallback) for games.
+PFN_vkGetInstanceProcAddr vk_gipa(bool desktop) {
+    static PFN_vkGetInstanceProcAddr gipa_stock, gipa_games;
+    if (desktop) {
+        if (!gipa_stock)
+            if (void* l = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL))
+                gipa_stock = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(l, "vkGetInstanceProcAddr"));
+        return gipa_stock;
+    }
+    if (gipa_games) return gipa_games;
     if (const char* wrapper = getenv("HWGPU_VK_LOADER"))
-        if (void* l = dlopen(wrapper, RTLD_NOW)) gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(l, "vk_icdGetInstanceProcAddr"));
-    if (!gipa)
-        if (void* l = dlopen("libvulkan.so", RTLD_NOW)) gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(l, "vkGetInstanceProcAddr"));
-    return gipa;
+        if (void* l = dlopen(wrapper, RTLD_NOW | RTLD_LOCAL))
+            gipa_games = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(l, "vk_icdGetInstanceProcAddr"));
+    if (!gipa_games) gipa_games = vk_gipa(true);
+    return gipa_games;
 }
 
 // An imported image whose texture has gone. DXVK may still have commands in flight that use it (it
@@ -984,14 +1182,14 @@ uint32_t ahb_desc_format(AHardwareBuffer* ahb) {
 }
 
 // The buffer as a texture of this device.
-HRESULT wrap_ahb(ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_DESC& d, ID3D11Texture2D** out) {
+HRESULT wrap_ahb(bool desktop, ID3D11Device* dev, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_DESC& d, ID3D11Texture2D** out) {
     HwVkInteropDevice1* interop = nullptr;
     if (FAILED(dev->QueryInterface(kHwVkInteropGuid, reinterpret_cast<void**>(&interop))) || !interop) return E_NOINTERFACE;
     VkInstance inst;
     VkPhysicalDevice phys;
     VkDevice vkd;
     interop->GetVulkanHandles(&inst, &phys, &vkd);
-    PFN_vkGetInstanceProcAddr gipa = vk_gipa();
+    PFN_vkGetInstanceProcAddr gipa = vk_gipa(desktop);
     auto gdpa = gipa ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(inst, "vkGetDeviceProcAddr")) : nullptr;
 #define VKF(name) auto name = gdpa ? reinterpret_cast<PFN_##name>(gdpa(vkd, #name)) : nullptr
     VKF(vkGetAndroidHardwareBufferPropertiesANDROID);
@@ -1146,10 +1344,12 @@ int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     AHardwareBuffer_Desc ad{d.Width, d.Height, 1, fmt,
                             AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY, 0, 0, 0};
-    // A driver added from a file (HWGPU_VK_DRIVER, such as PanVK-AI) reads the buffer's layout without the phone's gralloc
-    // and can only take a linear one. CPU usage keeps Mali's gralloc from compressing the buffer (AFBC).
+    // A driver added from a file for games (HWGPU_VK_DRIVER, such as PanVK-AI) reads the buffer's layout without the phone's
+    // gralloc and can only take a linear one. CPU usage keeps Mali's gralloc from compressing the buffer (AFBC). The desktop
+    // always runs on the phone's stock driver, so only game-created shared surfaces need this.
     static const bool custom_driver = getenv("HWGPU_VK_DRIVER") && *getenv("HWGPU_VK_DRIVER");
-    if (custom_driver) ad.usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
+    chan_dxvk(c);
+    if (!c.is_desktop && custom_driver) ad.usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
     AHardwareBuffer* ahb = nullptr;
     if (AHardwareBuffer_allocate(&ad, &ahb) != 0) {
         ad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
@@ -1159,7 +1359,7 @@ int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
         }
     }
     ID3D11Texture2D* tex = nullptr;
-    HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
+    HRESULT hr = wrap_ahb(c.is_desktop, dev, ahb, d, &tex);
     std::shared_ptr<Shared> sp;
     bool fallback = false;
     if (FAILED(hr)) {
@@ -1270,10 +1470,11 @@ int32_t open_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
         d = sp->desc;
     }
     if (!sp->cpu_fallback) {
+        chan_dxvk(c);
         AHardwareBuffer* ahb = sp->ahb;
         AHardwareBuffer_acquire(ahb);
         ID3D11Texture2D* tex = nullptr;
-        HRESULT hr = wrap_ahb(dev, ahb, d, &tex);
+        HRESULT hr = wrap_ahb(c.is_desktop, dev, ahb, d, &tex);
         AHardwareBuffer_release(ahb);   // the imported memory holds its own reference
         if (FAILED(hr)) return hr;
         w.u32(c.put(tex, HI_ID3D11Texture2D));
@@ -1373,7 +1574,168 @@ int32_t finish(Chan& c) {
     return SUCCEEDED(hr) ? 0 : hr;
 }
 
-int32_t scanout(Chan& c, Rd& r) {
+int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
+    if (call.method == 3) {
+        // Windowed D3D10/11 game present via shared staging memory: copy backbuffer to a cached staging
+        // texture, write tightly-packed BGRA pixels straight into c.readback_ptr(), and unmap on the host.
+        uint32_t src_h = r.u32(), swap_rb = r.u32();
+        auto* dev = static_cast<ID3D11Device*>(c.obj(call.object, HI_ID3D11Device));
+        auto* src_res = static_cast<ID3D11Resource*>(c.obj(src_h, HI_ID3D11Resource));
+        uint8_t* dst_base = c.readback_ptr();
+        if (!r.ok || !dev || dev == BAD || !src_res || src_res == BAD || !c.immediate || !dst_base) return E_INVALIDARG;
+        ID3D11Texture2D* src_tex = nullptr;
+        if (FAILED(src_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&src_tex))) || !src_tex)
+            return E_INVALIDARG;
+        D3D11_TEXTURE2D_DESC sd{};
+        src_tex->GetDesc(&sd);
+        uint64_t dst_pitch = uint64_t(sd.Width) * 4;
+        uint64_t total = dst_pitch * sd.Height;
+        if (!sd.Width || !sd.Height || total > HWD3D_READBACK_SIZE) {
+            src_tex->Release();
+            return E_INVALIDARG;
+        }
+        if (!c.readback_stage || c.readback_dev != dev || c.readback_w != sd.Width || c.readback_h != sd.Height ||
+            c.readback_fmt != uint32_t(sd.Format)) {
+            if (c.readback_stage) {
+                c.readback_stage->Release();
+                c.readback_stage = nullptr;
+            }
+            D3D11_TEXTURE2D_DESC td = {sd.Width, sd.Height, 1, 1, sd.Format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+            HRESULT chr = dev->CreateTexture2D(&td, nullptr, &c.readback_stage);
+            if (FAILED(chr) || !c.readback_stage) {
+                src_tex->Release();
+                return FAILED(chr) ? chr : E_FAIL;
+            }
+            c.readback_dev = dev;
+            c.readback_w = sd.Width;
+            c.readback_h = sd.Height;
+            c.readback_fmt = uint32_t(sd.Format);
+        }
+        c.immediate->CopyResource(c.readback_stage, src_tex);
+        src_tex->Release();
+        D3D11_MAPPED_SUBRESOURCE m{};
+        HRESULT mhr = c.immediate->Map(c.readback_stage, 0, D3D11_MAP_READ, 0, &m);
+        if (FAILED(mhr) || !m.pData) return FAILED(mhr) ? mhr : E_FAIL;
+        const auto* src_bytes = static_cast<const uint8_t*>(m.pData);
+        if (!swap_rb) {
+            if (m.RowPitch == dst_pitch) {
+                memcpy(dst_base, src_bytes, size_t(total));
+            } else {
+                for (uint32_t y = 0; y < sd.Height; y++)
+                    memcpy(dst_base + size_t(y) * dst_pitch, src_bytes + size_t(y) * m.RowPitch, size_t(dst_pitch));
+            }
+        } else {
+            for (uint32_t y = 0; y < sd.Height; y++) {
+                const auto* srow = reinterpret_cast<const uint32_t*>(src_bytes + size_t(y) * m.RowPitch);
+                auto* drow = reinterpret_cast<uint32_t*>(dst_base + size_t(y) * dst_pitch);
+                for (uint32_t x = 0; x < sd.Width; x++) {
+                    uint32_t v = srow[x];
+                    drow[x] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
+                }
+            }
+        }
+        c.immediate->Unmap(c.readback_stage, 0);
+        wr.u32(uint32_t(dst_pitch));
+        wr.u32(sd.Height);
+        c.presents++;
+        return S_OK;
+    }
+    if (call.method == 2) {
+        hwgpu_host_hide_game_buffer(c.slot);
+        return S_OK;
+    }
+    if (call.method == 1 || call.method == 4) {
+        // Fullscreen D3D10/11 game present: copy the backbuffer texture into a 3-buffer AHardwareBuffer
+        // scanout ring on the GPU and hand it straight to the phone's layer. Method 4 is a windowed program:
+        // the same ring, shown on a layer over the desktop at the window's client rect.
+        const bool overlay = call.method == 4;
+        uint32_t src_h = r.u32();
+        int32_t ov_x = 0, ov_y = 0;
+        uint32_t ov_w = 0, ov_h = 0, ov_crop[4] = {0, 0, 0, 0};
+        if (overlay) {
+            ov_x = int32_t(r.u32());
+            ov_y = int32_t(r.u32());
+            ov_w = r.u32();
+            ov_h = r.u32();
+            ov_crop[0] = r.u32();
+            ov_crop[1] = r.u32();
+            ov_crop[2] = r.u32();
+            ov_crop[3] = r.u32();
+        }
+        auto* dev = static_cast<ID3D11Device*>(c.obj(call.object, HI_ID3D11Device));
+        auto* src_res = static_cast<ID3D11Resource*>(c.obj(src_h, HI_ID3D11Resource));
+        if (!r.ok || !dev || dev == BAD || !src_res || src_res == BAD || !c.immediate) return E_INVALIDARG;
+        ID3D11Texture2D* src_tex = nullptr;
+        if (FAILED(src_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&src_tex))) || !src_tex)
+            return E_INVALIDARG;
+        D3D11_TEXTURE2D_DESC sd{};
+        src_tex->GetDesc(&sd);
+        if (!sd.Width || !sd.Height) {
+            src_tex->Release();
+            return E_INVALIDARG;
+        }
+        // The phone's layer reads the bytes as RGBA: a BGRA backbuffer would come out with red and blue swapped.
+        if (overlay && sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+            sd.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+            src_tex->Release();
+            return E_NOTIMPL;
+        }
+        chan_dxvk(c);
+        if (c.scan_dev != dev || c.scan_w != sd.Width || c.scan_h != sd.Height || !c.scan_ring[0].tex11) {
+            c.idle();
+            c.free_scan_ring();
+            D3D11_TEXTURE2D_DESC rd{};
+            rd.Width = sd.Width;
+            rd.Height = sd.Height;
+            rd.MipLevels = 1;
+            rd.ArraySize = 1;
+            rd.Format = (sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+                            ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                            : DXGI_FORMAT_R8G8B8A8_UNORM;
+            rd.SampleDesc = {1, 0};
+            rd.Usage = D3D11_USAGE_DEFAULT;
+            rd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            static const bool custom_driver = getenv("HWGPU_VK_DRIVER") && *getenv("HWGPU_VK_DRIVER");
+            for (int i = 0; i < 3; i++) {
+                AHardwareBuffer_Desc ad{sd.Width, sd.Height, 1, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                                        AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                                            AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                                            (!c.is_desktop && custom_driver ? AHARDWAREBUFFER_USAGE_CPU_READ_RARELY : 0),
+                                        0, 0, 0};
+                if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) != 0) {
+                    ad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
+                    if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) != 0) {
+                        c.free_scan_ring();
+                        src_tex->Release();
+                        return E_OUTOFMEMORY;
+                    }
+                }
+                if (FAILED(wrap_ahb(c.is_desktop, dev, c.scan_ring[i].ahb, rd, &c.scan_ring[i].tex11)) || !c.scan_ring[i].tex11) {
+                    c.free_scan_ring();
+                    src_tex->Release();
+                    return E_FAIL;
+                }
+            }
+            c.scan_dev = dev;
+            c.scan_w = sd.Width;
+            c.scan_h = sd.Height;
+            LOG("channel %u: fullscreen D3D11 scanout ring %ux%u ready", c.slot, sd.Width, sd.Height);
+        }
+        auto& buf = c.scan_ring[c.scan_idx++ % 3];
+        c.immediate->CopyResource(buf.tex11, src_tex);
+        src_tex->Release();
+        HwVkInteropDevice1* interop = nullptr;
+        if (SUCCEEDED(dev->QueryInterface(kHwVkInteropGuid, reinterpret_cast<void**>(&interop))) && interop) {
+            interop->FlushRenderingCommands();
+            interop->Release();
+        } else {
+            c.immediate->Flush();
+        }
+        if (overlay) hwgpu_host_show_window_buffer(c.slot, buf.ahb, sd.Width, sd.Height, ov_x, ov_y, ov_w, ov_h, ov_crop);
+        else hwgpu_host_show_game_buffer(c.slot, c.generation, buf.ahb, sd.Width, sd.Height, hwgpu_host_vsync());
+        c.presents++;
+        return S_OK;
+    }
     uint32_t id = r.u32();
     std::shared_ptr<Shared> sp;
     AHardwareBuffer* ahb = nullptr;
@@ -1493,6 +1855,15 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
         const char* at = reinterpret_cast<const char*>(m.data() + sizeof p);
         c.exe.assign(at, p.path_bytes);  // Windows' path: DXVK's profiles match it with backslashes
         c.conf.assign(at + pad_path, p.conf_bytes);
+        {
+            size_t slash = c.exe.find_last_of("\\/");
+            std::string base = (slash == std::string::npos) ? c.exe : c.exe.substr(slash + 1);
+            if (!base.empty()) {
+                char tname[16]{};
+                strncpy(tname, base.c_str(), 15);
+                pthread_setname_np(pthread_self(), tname);
+            }
+        }
         LOG("channel %u: program %s%s", c.slot, c.exe.c_str(), c.conf.empty() ? "" : ", with a dxvk.conf");
         return true;
     }
@@ -1513,14 +1884,15 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
     case HWD3D_OP_SCANOUT:
     case HWD3D_OP_SET_CB1:
     case HWD3D_OP_D9:
+    case HWD3D_OP_CURSOR:
     case HWD3D_OP_FINISH: {
         if (m.size() < sizeof(hwd3d_call)) return false;
         hwd3d_call call;
         memcpy(&call, m.data(), sizeof call);
         Rd r{m.data() + sizeof call, m.data() + m.size()};
-        if (c.stage) {
+        if (c.stage && c.stage_size > HWD3D_STAGING_DATA + HWD3D_QUERY_PAGE + HWD3D_READBACK_SIZE) {
             r.stage = c.stage;
-            r.stage_cap = c.stage_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
+            r.stage_cap = c.stage_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE - HWD3D_READBACK_SIZE;
         }
         int32_t st = handle_call(c, h, call, r, w);
         if (r.stage_end) {
@@ -1556,7 +1928,15 @@ int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, 
         } else if (h.op == HWD3D_OP_OPEN_SHARED) {
             st = open_shared(c, call.object, r, w);
         } else if (h.op == HWD3D_OP_SCANOUT) {
-            st = scanout(c, r);
+            st = scanout(c, call, r, w);
+        } else if (h.op == HWD3D_OP_CURSOR) {
+            uint32_t cw = r.u32(), ch = r.u32();
+            int32_t hx = int32_t(r.u32()), hy = int32_t(r.u32());
+            uint64_t n = 0;
+            const void* rgba = r.arr(4, &n);
+            if (r.ok && rgba && cw && ch && cw <= 64 && ch <= 64 && n == uint64_t(cw) * ch)
+                hwgpu_host_set_cursor_shape(c.slot, cw, ch, hx, hy, rgba);
+            st = S_OK;
         } else if (h.op == HWD3D_OP_FINISH) {
             st = finish(c);
         } else if (h.op == HWD3D_OP_D9) {
@@ -1584,9 +1964,23 @@ bool read_message(Chan& c, std::vector<uint8_t>& m, size_t have) {
     uint32_t size, magic;
     memcpy(&size, m.data(), sizeof size);
     memcpy(&magic, m.data() + 4, sizeof magic);
-    if (magic != HWD3D_MAGIC || size < sizeof(hwd3d_msg) || size > HWD3D_MAX_MSG || size % 4 || size < have) return false;
+    if (magic != HWD3D_MAGIC || size < sizeof(hwd3d_msg) || size > HWD3D_MAX_MSG || size % 4 || size < have) {
+        uint32_t w2 = 0, w3 = 0;
+        if (have >= 16) { memcpy(&w2, m.data() + 8, 4); memcpy(&w3, m.data() + 12, 4); }
+        auto* ctl = hwgpu_chan_ctl(c.chan);
+        LOG("channel %u: read_message fail: w0=0x%x w1=0x%x w2=0x%x w3=0x%x have=%zu received=%llu tx_h=%llu tx_t=%llu",
+            c.slot, size, magic, w2, w3, have, (unsigned long long)c.received,
+            (unsigned long long)__atomic_load_n(&ctl->tx_head, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&ctl->tx_tail, __ATOMIC_RELAXED));
+        return false;
+    }
     m.resize(size);
-    return size == have || hwgpu_read_all(c.chan, c.generation, 0, m.data() + have, size - have);
+    if (size != have && !hwgpu_read_all(c.chan, c.generation, 0, m.data() + have, size - have)) {
+        LOG("channel %u: read_message body EOF: size=%u have=%zu received=%llu",
+            c.slot, size, have, (unsigned long long)c.received);
+        return false;
+    }
+    return true;
 }
 
 uint64_t now_ns() {
@@ -1607,7 +2001,7 @@ void wait_request(Chan& ch) {
            hwgpu_alive(c, ch.generation)) {
         ch.poll_queries();
         if (now_ns() - start < 200000ull) sched_yield();
-        else if (!ch.pending.empty()) hwgpu_pause(100);
+        else if (!ch.pending.empty() || !ch.pending_d9.empty()) hwgpu_pause(100);
         else hwgpu_backoff(&misses);
     }
 }
@@ -1622,14 +2016,27 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
     c.generation = generation;
     std::vector<uint8_t> m(static_cast<const uint8_t*>(first), static_cast<const uint8_t*>(first) + first_len);
     bool ok = read_message(c, m, first_len) && handle(c, m);
+    uint32_t prev_op = 0, prev_method = 0, prev_size = 0, prev_seq = 0;
     while (ok) {
+        if (m.size() >= sizeof(hwd3d_msg)) {
+            hwd3d_msg ph;
+            memcpy(&ph, m.data(), sizeof ph);
+            prev_op = ph.op; prev_size = ph.size; prev_seq = ph.seq;
+            if (m.size() >= sizeof(hwd3d_call)) {
+                hwd3d_call pc;
+                memcpy(&pc, m.data(), sizeof pc);
+                prev_method = pc.method;
+            }
+        }
         m.resize(sizeof(hwd3d_msg));
         wait_request(c);
         if (!hwgpu_read_all(chan, generation, 0, m.data(), sizeof(hwd3d_msg))) break;  // the channel ended
         ok = read_message(c, m, sizeof(hwd3d_msg)) && handle(c, m);
         c.poll_queries();
     }
-    if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation)) LOG("channel %u: bad HwD3D stream, dropping it", slot);
+    if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation))
+        LOG("channel %u: bad HwD3D stream, dropping it (prev op=0x%x method=%u size=%u seq=%u)",
+            slot, prev_op, prev_method, prev_size, prev_seq);
     d9_release(c);
     drop_shared(slot);
     c.release_all();

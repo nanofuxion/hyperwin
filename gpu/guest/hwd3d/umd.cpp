@@ -6,6 +6,7 @@
  * The table of entries comes from the driver header, read at build time by gen_umd.py into
  * gpu/work/umd-gen. Every entry exists from the first build: the ones not written here log their name
  * once and return an error. Nothing from that header is copied into this file. */
+#define HWGPU_WIN32_FULLSCREEN_HELPER 1
 #include "wire.h"
 
 #include <initializer_list>
@@ -136,6 +137,12 @@ struct Dev {
     HANDLE kctx;          /* the kernel context the runtime wants a driver to have */
     UINT flags;
     struct Obj *pstage;   /* the staging copy a windowed present reads back, kept at the last size */
+    HWND present_win;
+    uint32_t present_w, present_h;
+    bool scanning_out;    /* fullscreen direct scanout active on the phone's layer */
+    bool overlay_on;      /* a windowed present on the phone's own layer (no readback), scanning_out is set too */
+    bool overlay_bad;     /* the phone refused it: back to the read-back for this device */
+    uint32_t overlay_n;
     struct Obj *cur_vs, *cur_layout;  /* bound by the runtime: the phone gets the matching vertex shader variant */
     uint32_t bound_vs;    /* the phone's vertex shader handle last bound */
 };
@@ -588,11 +595,18 @@ static void map_phone(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, UINT
 {
     Dev *d = DV(hd);
     Obj *o = OB(hr);
+    if (!g_stage && !g_stage_tried) {
+        AcquireSRWLockExclusive(&g_lock);
+        ensure_staging();
+        ReleaseSRWLockExclusive(&g_lock);
+    }
     struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_Map);
     put32(b, o->h);
     put32(b, sub);
     put32(b, type);
-    put32(b, (flags & D3D10_DDI_MAP_FLAG_DONOTWAIT) ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0);
+    uint32_t mf = (flags & D3D10_DDI_MAP_FLAG_DONOTWAIT) ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0;
+    if (g_readback) mf |= HWD3D_MAP_STAGED_OK;
+    put32(b, mf);
     struct rd r;
     HRESULT res = (HRESULT)call_wait(b, &r);
     uint32_t row_pitch = take32(&r), depth_pitch = take32(&r), size = take32(&r), has = take32(&r);
@@ -606,7 +620,8 @@ static void map_phone(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, UINT
     m->row_pitch = row_pitch;
     m->depth_pitch = depth_pitch;
     m->local = 0;
-    if (has) take(&r, m->mem, size);
+    if (has == HWD3D_STAGED && g_readback && size <= HWD3D_READBACK_SIZE) memcpy(m->mem, g_readback, size);
+    else if (has) take(&r, m->mem, size);
     call_end(&r);
     out->pData = m->mem;
     out->RowPitch = row_pitch;
@@ -2239,6 +2254,7 @@ struct FindWin {
     DWORD pid;
     UINT w, h;
     HWND best;
+    HWND fallback;
 };
 
 static BOOL CALLBACK find_win(HWND w, LPARAM lp)
@@ -2247,10 +2263,26 @@ static BOOL CALLBACK find_win(HWND w, LPARAM lp)
     DWORD pid = 0;
     GetWindowThreadProcessId(w, &pid);
     RECT rc;
-    if (pid != f->pid || !IsWindowVisible(w) || !GetClientRect(w, &rc)) return TRUE;
-    if ((UINT)rc.right != f->w || (UINT)rc.bottom != f->h) return TRUE;
-    if (!f->best || w == GetForegroundWindow()) f->best = w;
+    if (pid != f->pid || !IsWindowVisible(w) || IsIconic(w) || !GetClientRect(w, &rc)) return TRUE;
+    if (rc.right <= 0 || rc.bottom <= 0) return TRUE;
+    if ((UINT)rc.right == f->w && (UINT)rc.bottom == f->h) {
+        if (!f->best || w == GetForegroundWindow()) f->best = w;
+        return TRUE;
+    }
+    if (hwgpu_window_fills_screen(w) || (!f->fallback && w == GetForegroundWindow()))
+        f->fallback = w;
     return TRUE;
+}
+
+static void send_cursor_shape(uint32_t w, uint32_t h, int32_t hx, int32_t hy, const uint32_t *rgba)
+{
+    struct wbuf *b = begin(0, 0, HWD3D_OP_CURSOR);
+    put32(b, w);
+    put32(b, h);
+    put32(b, (uint32_t)hx);
+    put32(b, (uint32_t)hy);
+    put_arr(b, rgba, (uint64_t)w * h, 4);
+    call_async(b);
 }
 
 static HRESULT present_surface(Dev *d, Obj *src);
@@ -2321,11 +2353,132 @@ static HRESULT present_surface(Dev *d, Obj *src)
     if (fmt != DXGI_FORMAT_R8G8B8A8_UNORM && fmt != DXGI_FORMAT_B8G8R8A8_UNORM && fmt != DXGI_FORMAT_B8G8R8X8_UNORM &&
         fmt != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && fmt != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
         return S_OK;
-    FindWin f = {GetCurrentProcessId(), w, h, nullptr};
-    EnumWindows(find_win, reinterpret_cast<LPARAM>(&f));
-    if (!f.best) {
+    HWND win = d->present_win;
+    if (!win || d->present_w != w || d->present_h != h || !IsWindow(win) || !IsWindowVisible(win)) {
+        FindWin f = {GetCurrentProcessId(), w, h, nullptr, nullptr};
+        EnumWindows(find_win, reinterpret_cast<LPARAM>(&f));
+        win = f.best ? f.best : f.fallback;
+        if (win) {
+            d->present_win = win;
+            d->present_w = w;
+            d->present_h = h;
+        }
+    }
+    if (!win) {
+        if (d->scanning_out) {
+            d->scanning_out = false;
+            d->overlay_on = false;
+            if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+            call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
+        }
         ulog("hwd3d_umd: present: no window of %ux%u\n", w, h);
         return S_OK;
+    }
+    bool full = hwgpu_window_fills_screen(win) != 0;
+    if (full && src->h && d->overlay_on) {   /* from the window's layer to the whole screen */
+        d->overlay_on = false;
+        d->scanning_out = false;
+        call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
+    }
+    if (!full && src->h && !d->overlay_bad && (fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+        /* Nothing covers the window: its frames stay on the phone, on a layer at the client rect. No
+         * read-back, no GDI, DWM has nothing new to compose. Every second frame waits for the answer, which
+         * keeps the guest no more than two frames ahead of the phone. */
+        RECT cr = {}, vr = {};
+        if (hwgpu_window_overlay_ok(win, &cr, &vr) && (UINT)(cr.right - cr.left) == w && (UINT)(cr.bottom - cr.top) == h) {
+            if (d->scanning_out && !d->overlay_on) {   /* from the whole screen to the window's layer */
+                d->scanning_out = false;
+                if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+                call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
+            }
+            if (g_chan) hwgpu_update_cursor_ex(hwgpu_chan_ctl(g_chan), win, send_cursor_shape, 1);
+            struct wbuf *ob = begin(d->hdev, 4, HWD3D_OP_SCANOUT);
+            put32(ob, src->h);
+            put32(ob, (uint32_t)cr.left);
+            put32(ob, (uint32_t)cr.top);
+            put32(ob, w);
+            put32(ob, h);
+            put32(ob, (uint32_t)vr.left);
+            put32(ob, (uint32_t)vr.top);
+            put32(ob, (uint32_t)vr.right);
+            put32(ob, (uint32_t)vr.bottom);
+            if (!d->overlay_on || (++d->overlay_n & 1) == 0) {
+                struct rd orr;
+                HRESULT ohr = (HRESULT)call_wait(ob, &orr);
+                call_end(&orr);
+                if (SUCCEEDED(ohr)) {
+                    if (!d->overlay_on) ulog("hwd3d_umd: windowed present on its own layer (%ux%u)\n", w, h);
+                    d->overlay_on = true;
+                    d->scanning_out = true;
+                    return S_OK;
+                }
+                d->overlay_bad = true;
+                d->overlay_on = false;
+                d->scanning_out = false;
+                if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+                call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
+                ulog("hwd3d_umd: the phone refused a windowed present on its own layer: 0x%08lx\n", (unsigned long)ohr);
+            } else {
+                call_async(ob);
+                return S_OK;
+            }
+        }
+    }
+    if (full && src->h) {
+        if (g_chan) hwgpu_update_fullscreen_cursor(hwgpu_chan_ctl(g_chan), win, send_cursor_shape);
+        struct wbuf *sb = begin(d->hdev, 1, HWD3D_OP_SCANOUT);
+        put32(sb, src->h);
+        if (!d->scanning_out || (++d->overlay_n & 1) == 0) {
+            struct rd sr;
+            HRESULT shr = (HRESULT)call_wait(sb, &sr);
+            call_end(&sr);
+            if (SUCCEEDED(shr)) {
+                if (!d->scanning_out) {
+                    d->scanning_out = true;
+                    ulog("hwd3d_umd: fullscreen direct scanout on (%ux%u)\n", w, h);
+                }
+                return S_OK;
+            }
+        } else {
+            call_async(sb);
+            return S_OK;
+        }
+    }
+    if (d->scanning_out) {
+        d->scanning_out = false;
+        d->overlay_on = false;
+        if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+        call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
+        ulog("hwd3d_umd: direct scanout off, returning to windowed GDI\n");
+    }
+    if (!g_stage && !g_stage_tried) {
+        AcquireSRWLockExclusive(&g_lock);
+        ensure_staging();
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    if (g_readback && src->h && (uint64_t)w * h * 4 <= HWD3D_READBACK_SIZE) {
+        uint32_t swap_rb = (fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ? 1u : 0u;
+        struct wbuf *wb = begin(d->hdev, 3, HWD3D_OP_SCANOUT);
+        put32(wb, src->h);
+        put32(wb, swap_rb);
+        struct rd wr;
+        HRESULT whr = (HRESULT)call_wait(wb, &wr);
+        uint32_t pitch = take32(&wr), rows = take32(&wr);
+        if (SUCCEEDED(whr) && pitch && rows) {
+            HDC dc = GetDC(win);
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+            bi.bmiHeader.biWidth = (LONG)(pitch / 4);
+            bi.bmiHeader.biHeight = -(LONG)rows;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            SetDIBitsToDevice(dc, 0, 0, w, rows, 0, 0, 0, rows, g_readback, &bi, DIB_RGB_COLORS);
+            ReleaseDC(win, dc);
+            call_end(&wr);
+            return S_OK;
+        }
+        call_end(&wr);
     }
     if (!d->pstage || d->pstage->r.width != w || d->pstage->r.height != h || d->pstage->r.format != fmt) {
         if (d->pstage) {
@@ -2363,7 +2516,7 @@ static HRESULT present_surface(Dev *d, Obj *src)
     D3D10DDI_MAPPED_SUBRESOURCE m = {};
     map_phone(hd, hr, 0, D3D10_DDI_MAP_READ, 0, &m);
     if (m.pData) {
-        HDC dc = GetDC(f.best);
+        HDC dc = GetDC(win);
         BITMAPINFO bi = {};
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
         bi.bmiHeader.biWidth = (LONG)(m.RowPitch / 4);
@@ -2373,16 +2526,16 @@ static HRESULT present_surface(Dev *d, Obj *src)
         bi.bmiHeader.biCompression = BI_RGB;
         if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
             uint8_t *p = static_cast<uint8_t *>(m.pData);  /* the copy is ours: swap red and blue in place */
-            for (uint32_t y = 0; y < h; y++)
+            for (uint32_t y = 0; y < h; y++) {
+                uint32_t *row = reinterpret_cast<uint32_t *>(p + (size_t)y * m.RowPitch);
                 for (uint32_t x = 0; x < w; x++) {
-                    uint8_t *px = p + (size_t)y * m.RowPitch + x * 4;
-                    uint8_t t = px[0];
-                    px[0] = px[2];
-                    px[2] = t;
+                    uint32_t v = row[x];
+                    row[x] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
                 }
+            }
         }
         SetDIBitsToDevice(dc, 0, 0, w, h, 0, 0, 0, h, m.pData, &bi, DIB_RGB_COLORS);
-        ReleaseDC(f.best, dc);
+        ReleaseDC(win, dc);
     }
     u_Unmap(hd, hr, 0);
     return S_OK;

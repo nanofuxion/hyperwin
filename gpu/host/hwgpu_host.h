@@ -44,6 +44,14 @@ void hwgpu_host_heap_free(void* p);
 uint64_t hwgpu_host_scanout_frames(void);
 /* A frame from Windows' screen driver, an AHardwareBuffer, onto the scanout layer. */
 void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height);
+/* A fullscreen game's frame (an AHardwareBuffer) from channel slot, shown directly on the scanout layer
+ * above the desktop until hwgpu_host_hide_game_buffer(slot) or the channel closes. */
+void hwgpu_host_show_game_buffer(uint32_t slot, uint32_t generation, void* ahb, uint32_t width, uint32_t height, int vsync);
+void hwgpu_host_hide_game_buffer(uint32_t slot);
+void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uint32_t height, int32_t x, int32_t y, uint32_t cw, uint32_t ch, const uint32_t* crop);
+/* Updates the cursor image (RGBA8888, up to 64x64) shown over a fullscreen game. */
+void hwgpu_host_set_cursor_shape(uint32_t slot, uint32_t width, uint32_t height, int32_t hot_x, int32_t hot_y,
+                                 const void* rgba);
 
 #ifdef __cplusplus
 }

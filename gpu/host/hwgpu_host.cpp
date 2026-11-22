@@ -228,22 +228,37 @@ std::map<uint32_t, void*> g_ahb;  // resource -> its AHardwareBuffer, our own re
 struct Frame {
     void* ahb = nullptr;  // a reference of the frame's own
     uint32_t slot = 0, generation = 0, index = 0, seq = 0, width = 0, height = 0;
+    uint64_t desk_gen = 0;
     bool vsync = false;
 };
 
 std::atomic<bool> g_screen_shown{false};  // DWM's desktop reaches the layer (hwgpu_host_show_buffer)
+std::atomic<int> g_game_scanout_slot{-1}; // >= 0 while a fullscreen game owns g_scan.layer
+std::atomic<int> g_overlay_slot{-1};      // >= 0 while a windowed program's frames sit on the overlay layer
 // Desktop buffers (hwgpu_host_show_buffer) the compositor has not released yet. Windows draws its next
 // frame into a buffer it showed before, and a driver that does not see the display's fences (PanVK-AI on
 // kbase) would draw into one still being scanned out.
 std::mutex g_desk_lock;
 std::condition_variable g_desk_cv;
 int g_desk_held = 0;
+uint64_t g_desk_gen = 1;
 
 struct Scan {
     std::mutex lock;
 #ifdef __ANDROID__
     ASurfaceControl* layer = nullptr;
+    ASurfaceControl* cursor_layer = nullptr;
+    ASurfaceControl* overlay_layer = nullptr;  // a windowed program's frames, over the desktop at its client rect
+    bool overlay_visible = false;
+    AHardwareBuffer* cursor_ahb = nullptr;
+    AHardwareBuffer* last_desk_ahb = nullptr;
 #endif
+    uint32_t last_desk_w = 0, last_desk_h = 0;
+    uint32_t cursor_w = 32, cursor_h = 32;
+    int32_t cursor_hot_x = 0, cursor_hot_y = 0;
+    uint32_t cursor_last_seq = 0;
+    bool cursor_visible = false;
+    bool cursor_buffer_dirty = true;
     int view_w = 0, view_h = 0;
     bool visible = false;
     bool inflight = false;    // without release callbacks: a transaction applied, not yet done
@@ -253,6 +268,134 @@ struct Scan {
     std::deque<Frame> paced;  // vsync frames waiting for that
     uint64_t frames = 0;
 } g_scan;
+
+#ifdef __ANDROID__
+// Hides the overlay layer (g_scan.lock held) when `slot` owns it, or for any slot when slot < 0.
+void hide_overlay_locked(int slot) {
+    if (slot >= 0 && g_overlay_slot.load(std::memory_order_relaxed) != slot) return;
+    g_overlay_slot.store(-1, std::memory_order_release);
+    if (g_scan.overlay_layer && g_scan.overlay_visible) {
+        ASurfaceTransaction* t = ASurfaceTransaction_create();
+        ASurfaceTransaction_setBuffer(t, g_scan.overlay_layer, nullptr, -1);
+        ASurfaceTransaction_setVisibility(t, g_scan.overlay_layer, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        ASurfaceTransaction_apply(t);
+        ASurfaceTransaction_delete(t);
+    }
+    g_scan.overlay_visible = false;
+}
+
+// Ensures g_scan.cursor_ahb exists (64x64 RGBA8888), initialized with a default white/black-outline arrow.
+void ensure_cursor_ahb_locked() {
+    if (g_scan.cursor_ahb) return;
+    AHardwareBuffer_Desc d{64, 64, 1, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                           AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                               AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+                           0, 0, 0};
+    if (AHardwareBuffer_allocate(&d, &g_scan.cursor_ahb) != 0) {
+        d.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
+        if (AHardwareBuffer_allocate(&d, &g_scan.cursor_ahb) != 0) return;
+    }
+    AHardwareBuffer_describe(g_scan.cursor_ahb, &d);
+    void* dst = nullptr;
+    if (AHardwareBuffer_lock(g_scan.cursor_ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &dst) == 0 && dst) {
+        memset(dst, 0, size_t(d.stride) * 64 * 4);
+        // Simple 12x19 arrow cursor fallback before the guest sends its first HCURSOR shape.
+        static const char* const kArrow[19] = {
+            "X...........",
+            "XX..........",
+            "X.X.........",
+            "X..X........",
+            "X...X.......",
+            "X....X......",
+            "X.....X.....",
+            "X......X....",
+            "X.......X...",
+            "X........X..",
+            "X.....XXXXX.",
+            "X..X..X.....",
+            "X.X.X..X....",
+            "XX..X..X....",
+            "X....X..X...",
+            ".....X..X...",
+            "......X..X..",
+            "......X..X..",
+            ".......XX...",
+        };
+        auto* px = static_cast<uint32_t*>(dst);
+        for (int y = 0; y < 19; y++) {
+            for (int x = 0; x < 12; x++) {
+                char c = kArrow[y][x];
+                if (c == 'X') px[y * d.stride + x] = 0xFF000000u;
+                else if (c == '.') {
+                    // Inside the arrow polygon if to the left of the diagonal/stem
+                    bool inside = false;
+                    for (int rx = x + 1; rx < 12; rx++) if (kArrow[y][rx] == 'X') { inside = true; break; }
+                    if (inside && x > 0) px[y * d.stride + x] = 0xFFFFFFFFu;
+                }
+            }
+        }
+        AHardwareBuffer_unlock(g_scan.cursor_ahb, nullptr);
+    }
+    g_scan.cursor_buffer_dirty = true;
+}
+
+// Updates the hardware cursor child layer above g_scan.layer (g_scan.lock held).
+void update_cursor_locked(int slot) {
+    if (!g_scan.cursor_layer || !g_window) return;
+    if (slot < 0 || slot >= int(HWGPU_CHANNELS) ||
+        (g_game_scanout_slot.load(std::memory_order_relaxed) != slot &&
+         g_overlay_slot.load(std::memory_order_relaxed) != slot)) {
+        if (g_scan.cursor_visible) {
+            ASurfaceTransaction* t = ASurfaceTransaction_create();
+            ASurfaceTransaction_setVisibility(t, g_scan.cursor_layer, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+            ASurfaceTransaction_apply(t);
+            ASurfaceTransaction_delete(t);
+            g_scan.cursor_visible = false;
+        }
+        return;
+    }
+    hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(uint32_t(slot)));
+    uint32_t seq = __atomic_load_n(&c->cursor_seq, __ATOMIC_ACQUIRE);
+    bool vis = __atomic_load_n(&c->cursor_visible, __ATOMIC_ACQUIRE) != 0 &&
+               __atomic_load_n(&c->scanout_active, __ATOMIC_ACQUIRE) != 0;
+    if (!vis) {
+        if (g_scan.cursor_visible) {
+            ASurfaceTransaction* t = ASurfaceTransaction_create();
+            ASurfaceTransaction_setVisibility(t, g_scan.cursor_layer, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+            ASurfaceTransaction_apply(t);
+            ASurfaceTransaction_delete(t);
+            g_scan.cursor_visible = false;
+        }
+        g_scan.cursor_last_seq = seq;
+        return;
+    }
+    ensure_cursor_ahb_locked();
+    if (!g_scan.cursor_ahb) return;
+    uint32_t mw = c->cursor_mon_w ? c->cursor_mon_w : (g_scan.shown.width ? g_scan.shown.width : 1920);
+    uint32_t mh = c->cursor_mon_h ? c->cursor_mon_h : (g_scan.shown.height ? g_scan.shown.height : 1080);
+    float sx = (g_scan.view_w > 0 && mw) ? float(g_scan.view_w) / float(mw) : 1.0f;
+    float sy = (g_scan.view_h > 0 && mh) ? float(g_scan.view_h) / float(mh) : 1.0f;
+    int px = int(float(c->cursor_x - g_scan.cursor_hot_x) * sx);
+    int py = int(float(c->cursor_y - g_scan.cursor_hot_y) * sy);
+
+    ASurfaceTransaction* t = ASurfaceTransaction_create();
+    if (g_scan.cursor_buffer_dirty) {
+        ASurfaceTransaction_setBuffer(t, g_scan.cursor_layer, g_scan.cursor_ahb, -1);
+        ASurfaceTransaction_setBufferTransparency(t, g_scan.cursor_layer, ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT);
+        ASurfaceTransaction_setZOrder(t, g_scan.cursor_layer, 1);
+        g_scan.cursor_buffer_dirty = false;
+    }
+    ASurfaceTransaction_setPosition(t, g_scan.cursor_layer, px, py);
+    ASurfaceTransaction_setScale(t, g_scan.cursor_layer, sx, sy);
+    if (!g_scan.cursor_visible) {
+        ASurfaceTransaction_setVisibility(t, g_scan.cursor_layer, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+        g_scan.cursor_visible = true;
+    }
+    ASurfaceTransaction_apply(t);
+    ASurfaceTransaction_delete(t);
+    g_scan.cursor_last_seq = seq;
+}
+#endif
 
 // Tells the guest it may draw into the frame's buffer again. Counts only go up, so a late release
 // of an older showing never takes back a newer one.
@@ -273,7 +416,7 @@ void release_frame(Frame& f) {
     publish_free(f);
     if (f.slot == HWGPU_CHANNELS) {
         std::lock_guard<std::mutex> l(g_desk_lock);
-        g_desk_held--;
+        if (f.desk_gen == g_desk_gen && g_desk_held > 0) g_desk_held--;
         g_desk_cv.notify_all();
     }
 #ifdef __ANDROID__
@@ -376,8 +519,16 @@ void scan_submit(const Frame& f) {
 #ifdef __ANDROID__
     if (g_scan.layer) {
         if (g_set_buffer_with_release) {
-            if (frame.vsync && g_scan.committing) g_scan.paced.push_back(frame);
-            else apply_locked(frame);
+            if (frame.vsync && g_scan.committing) {
+                g_scan.paced.push_back(frame);
+            } else {
+                if (!frame.vsync) {
+                    for (auto& old : g_scan.paced) release_frame(old);
+                    g_scan.paced.clear();
+                    g_scan.committing = false;
+                }
+                apply_locked(frame);
+            }
         } else if (!g_scan.inflight) {
             apply_locked(frame);
         } else {
@@ -411,13 +562,45 @@ void forget_shown_locked() {
     }
 }
 
-// Hides the layer. With a channel, only when that channel's frames are the ones up.
+// Hides the layer, or restores the DWM desktop when a fullscreen game leaves scanout.
 void scan_hide(int slot) {
     std::lock_guard<std::mutex> l(g_scan.lock);
-    if (slot >= 0 && !(g_scan.has_shown && int(g_scan.shown.slot) == slot) &&
+    int active_game = g_game_scanout_slot.load(std::memory_order_relaxed);
+    if (slot >= 0 && active_game != slot &&
+        !(g_scan.has_shown && int(g_scan.shown.slot) == slot) &&
         !(g_scan.has_queued && int(g_scan.queued.slot) == slot))
         return;
+    if (slot < 0 || active_game == slot) {
+        g_game_scanout_slot.store(-1, std::memory_order_release);
 #ifdef __ANDROID__
+        update_cursor_locked(-1);
+#endif
+    }
+    forget_shown_locked();
+#ifdef __ANDROID__
+    // If a fullscreen game yielded scanout and we have DWM's latest desktop frame, put the desktop
+    // back on the layer at once instead of hiding the layer (which would expose the boot screen).
+    if (slot >= 0 && g_scan.layer && g_scan.last_desk_ahb) {
+        AHardwareBuffer_acquire(g_scan.last_desk_ahb);
+        Frame desk{};
+        desk.ahb = g_scan.last_desk_ahb;
+        desk.slot = HWGPU_CHANNELS;
+        desk.width = g_scan.last_desk_w;
+        desk.height = g_scan.last_desk_h;
+        desk.vsync = false;
+        {
+            std::lock_guard<std::mutex> dl(g_desk_lock);
+            desk.desk_gen = g_desk_gen;
+            g_desk_held++;
+        }
+        if (g_set_buffer_with_release || !g_scan.inflight) {
+            apply_locked(desk);
+        } else {
+            g_scan.queued = desk;
+            g_scan.has_queued = true;
+        }
+        return;
+    }
     if (g_scan.layer && g_scan.visible) {
         ASurfaceTransaction* t = ASurfaceTransaction_create();
         ASurfaceTransaction_setVisibility(t, g_scan.layer, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
@@ -426,7 +609,6 @@ void scan_hide(int slot) {
     }
 #endif
     g_scan.visible = false;
-    forget_shown_locked();
 }
 
 void drop_ahb(uint32_t res) {
@@ -480,6 +662,12 @@ void drop_resource(Slot& s, uint32_t res) {
 
 // Frees everything one Windows process made.
 void drop_slot(Slot& s) {
+#ifdef __ANDROID__
+    {
+        std::lock_guard<std::mutex> l(g_scan.lock);
+        hide_overlay_locked(int(&s - g_slots));
+    }
+#endif
     scan_hide(int(&s - g_slots));
     for (auto res : std::set<uint32_t>(s.resources)) drop_resource(s, res);
     for (auto c : s.contexts) stream_renderer_context_destroy(c);
@@ -866,11 +1054,8 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         const auto* p = as<sgpu_scanout>(m);
         if (!p || p->index >= HWGPU_SCANOUT_BUFFERS) return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
         if (!g_scanout_ok) return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
-        // While DWM's desktop is on the layer (hwgpu_host_show_buffer), a program's frames would cover
-        // every other window. Refused, the program's driver draws into its window instead.
-        if (p->resource_id && g_screen_shown.load(std::memory_order_relaxed))
-            return reply(l, *hdr, VGPU_RESP_ERR_UNSPEC);
         if (!p->resource_id) {
+            __atomic_store_n(&hwgpu_chan_ctl(l.chan)->scanout_active, 0u, __ATOMIC_RELEASE);
             scan_hide(int(l.slot));
             break;
         }
@@ -884,10 +1069,24 @@ bool handle(const Link& l, const std::vector<uint8_t>& m) {
         auto* ahb = static_cast<AHardwareBuffer*>(it->second);
         AHardwareBuffer_Desc d{};
         AHardwareBuffer_describe(ahb, &d);
+        __atomic_store_n(&hwgpu_chan_ctl(l.chan)->scanout_active, 1u, __ATOMIC_RELEASE);
+        g_game_scanout_slot.store(int(l.slot), std::memory_order_release);
         AHardwareBuffer_acquire(ahb);
-        scan_submit(Frame{ahb, l.slot, l.generation, p->index, p->seq, d.width, d.height,
+        scan_submit(Frame{ahb, l.slot, l.generation, p->index, p->seq, d.width, d.height, 0,
                           (p->flags & SGPU_SCANOUT_VSYNC) != 0});
+        {
+            std::lock_guard<std::mutex> sl(g_scan.lock);
+            update_cursor_locked(int(l.slot));
+        }
 #endif
+        break;
+    }
+    case SGPU_CMD_CURSOR: {
+        const auto* c = as<sgpu_cursor>(m);
+        if (!c || !c->width || !c->height || c->width > 64 || c->height > 64 ||
+            m.size() < sizeof(*c) + uint64_t(c->width) * c->height * 4)
+            return reply(l, *hdr, VGPU_RESP_ERR_INVALID_PARAMETER);
+        hwgpu_host_set_cursor_shape(l.slot, c->width, c->height, c->hot_x, c->hot_y, m.data() + sizeof(*c));
         break;
     }
     default:
@@ -1018,6 +1217,19 @@ void serve_loop() {
         for (uint32_t i = 0; i < HWGPU_CHANNELS; i++) {
             busy |= serve_one(i);
             open |= g_slots[i].generation != 0;
+        }
+        int gs = g_game_scanout_slot.load(std::memory_order_relaxed);
+        if (gs >= 0 && gs < int(HWGPU_CHANNELS)) {
+            hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(uint32_t(gs)));
+            if (__atomic_load_n(&c->guest_state, __ATOMIC_ACQUIRE) != HWGPU_CONNECTED ||
+                !__atomic_load_n(&c->scanout_active, __ATOMIC_ACQUIRE)) {
+                scan_hide(gs);
+            } else if (__atomic_load_n(&c->cursor_seq, __ATOMIC_ACQUIRE) != g_scan.cursor_last_seq) {
+#ifdef __ANDROID__
+                std::lock_guard<std::mutex> sl(g_scan.lock);
+                update_cursor_locked(gs);
+#endif
+            }
         }
         if (busy) {
             misses = 0;
@@ -1193,8 +1405,27 @@ int hwgpu_host_set_layer(void* layer, int view_width, int view_height) {
     g_scan.has_shown = false;
     g_scan.inflight = false;
     g_scan.visible = false;
+    if (g_scan.cursor_layer) {
+        ASurfaceControl_release(g_scan.cursor_layer);
+        g_scan.cursor_layer = nullptr;
+    }
+    if (g_scan.overlay_layer) {
+        ASurfaceControl_release(g_scan.overlay_layer);
+        g_scan.overlay_layer = nullptr;
+    }
+    g_scan.overlay_visible = false;
+    g_overlay_slot.store(-1, std::memory_order_release);
+    g_scan.cursor_visible = false;
+    g_scan.cursor_buffer_dirty = true;
     if (g_scan.layer) ASurfaceControl_release(g_scan.layer);
     g_scan.layer = sc;  // the caller's reference passes to us
+    if (sc) g_scan.cursor_layer = ASurfaceControl_create(sc, "hyperwin-cursor");
+    {
+        std::lock_guard<std::mutex> dl(g_desk_lock);
+        g_desk_gen++;
+        g_desk_held = 0;
+        g_desk_cv.notify_all();
+    }
 #else
     (void)layer;
 #endif
@@ -1319,26 +1550,157 @@ void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height) {
         g_scanout_flags.fetch_or(HWGPU_SCANOUT_DESKTOP);
         publish_scanout_flags();
     }
+    {
+        std::lock_guard<std::mutex> sl(g_scan.lock);
+        AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahb));
+        if (g_scan.last_desk_ahb) AHardwareBuffer_release(g_scan.last_desk_ahb);
+        g_scan.last_desk_ahb = static_cast<AHardwareBuffer*>(ahb);
+        g_scan.last_desk_w = width;
+        g_scan.last_desk_h = height;
+    }
+    int os = g_overlay_slot.load(std::memory_order_acquire);
+    if (os >= 0 && os < int(HWGPU_CHANNELS) && g_window) {
+        hwgpu_ctl* oc = hwgpu_chan_ctl(chan_base(uint32_t(os)));
+        if (__atomic_load_n(&oc->guest_state, __ATOMIC_ACQUIRE) != HWGPU_CONNECTED ||
+            __atomic_load_n(&oc->scanout_active, __ATOMIC_ACQUIRE) == 0) {
+            std::lock_guard<std::mutex> sl(g_scan.lock);
+            hide_overlay_locked(os);
+            update_cursor_locked(-1);
+        }
+    }
+    int gs = g_game_scanout_slot.load(std::memory_order_acquire);
+    if (gs >= 0 && gs < int(HWGPU_CHANNELS) && g_window) {
+        hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(uint32_t(gs)));
+        if (__atomic_load_n(&c->guest_state, __ATOMIC_ACQUIRE) == HWGPU_CONNECTED &&
+            __atomic_load_n(&c->scanout_active, __ATOMIC_ACQUIRE) != 0) {
+            return;  // a fullscreen game owns the layer right now; saved in last_desk_ahb for when it leaves
+        }
+        scan_hide(gs);
+    }
     AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahb));
     Frame f;
     f.ahb = ahb;
     f.slot = HWGPU_CHANNELS;   // not a guest channel's buffer: nothing to tell when it is free
     f.width = width;
     f.height = height;
+    f.vsync = false;           // desktop frames never wait for VSync: shown as soon as they arrive
+    uint64_t my_gen = 0;
     {
         std::lock_guard<std::mutex> l(g_desk_lock);
+        my_gen = g_desk_gen;
         g_desk_held++;
     }
+    f.desk_gen = my_gen;
     scan_submit(f);
-    // Return once the compositor let go of every earlier desktop buffer (at most a refresh), so the next
-    // frame Windows draws never lands in a buffer still on the screen. Only with release callbacks,
-    // which also come for buffers the compositor dropped.
-    if (g_set_buffer_with_release) {
-        std::unique_lock<std::mutex> l(g_desk_lock);
-        g_desk_cv.wait_for(l, std::chrono::milliseconds(50), [] { return g_desk_held <= 1; });
-    }
 #else
     (void)ahb; (void)width; (void)height;
+#endif
+}
+
+void hwgpu_host_show_game_buffer(uint32_t slot, uint32_t generation, void* ahb, uint32_t width, uint32_t height, int vsync) {
+#ifdef __ANDROID__
+    if (!ahb || slot >= HWGPU_CHANNELS) return;
+    {
+        std::lock_guard<std::mutex> sl(g_scan.lock);
+        hide_overlay_locked(-1);
+    }
+    if (g_window) {
+        hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(slot));
+        __atomic_store_n(&c->scanout_active, 1u, __ATOMIC_RELEASE);
+    }
+    g_game_scanout_slot.store(int(slot), std::memory_order_release);
+    AHardwareBuffer_acquire(static_cast<AHardwareBuffer*>(ahb));
+    Frame f{};
+    f.ahb = ahb;
+    f.slot = slot;
+    f.generation = generation;
+    f.index = HWGPU_SCANOUT_BUFFERS;  // not using scanout_free[]: libhwd3d manages its own ring
+    f.width = width;
+    f.height = height;
+    f.vsync = vsync != 0;
+    scan_submit(f);
+    {
+        std::lock_guard<std::mutex> sl(g_scan.lock);
+        update_cursor_locked(int(slot));
+    }
+#else
+    (void)slot; (void)generation; (void)ahb; (void)width; (void)height; (void)vsync;
+#endif
+}
+
+// A windowed program's frame: its own layer over the desktop, at the client rect (guest screen pixels).
+void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uint32_t height, int32_t x, int32_t y,
+                                   uint32_t cw, uint32_t ch, const uint32_t* crop) {
+#ifdef __ANDROID__
+    if (!ahb || slot >= HWGPU_CHANNELS || !width || !height) return;
+    std::lock_guard<std::mutex> sl(g_scan.lock);
+    if (!g_scan.layer) return;
+    if (!g_scan.overlay_layer) g_scan.overlay_layer = ASurfaceControl_create(g_scan.layer, "hyperwin-window");
+    if (!g_scan.overlay_layer) return;
+    if (g_window) __atomic_store_n(&hwgpu_chan_ctl(chan_base(slot))->scanout_active, 1u, __ATOMIC_RELEASE);
+    g_overlay_slot.store(int(slot), std::memory_order_release);
+    ASurfaceTransaction* t = ASurfaceTransaction_create();
+    ASurfaceTransaction_setBuffer(t, g_scan.overlay_layer, static_cast<AHardwareBuffer*>(ahb), -1);
+    ASurfaceTransaction_setBufferTransparency(t, g_scan.overlay_layer, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+    ASurfaceTransaction_setPosition(t, g_scan.overlay_layer, x, y);
+    ASurfaceTransaction_setScale(t, g_scan.overlay_layer, float(cw) / float(width), float(ch) / float(height));
+    if (crop && crop[2] > crop[0] && crop[3] > crop[1]) {
+        ARect cr{int32_t(crop[0]), int32_t(crop[1]), int32_t(crop[2]), int32_t(crop[3])};
+        ASurfaceTransaction_setCrop(t, g_scan.overlay_layer, cr);
+    }
+    ASurfaceTransaction_setZOrder(t, g_scan.overlay_layer, 0);
+    if (!g_scan.overlay_visible) ASurfaceTransaction_setVisibility(t, g_scan.overlay_layer, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+    ASurfaceTransaction_apply(t);
+    ASurfaceTransaction_delete(t);
+    g_scan.overlay_visible = true;
+    g_scan.frames++;
+    update_cursor_locked(int(slot));
+#else
+    (void)slot; (void)ahb; (void)width; (void)height; (void)x; (void)y; (void)cw; (void)ch; (void)crop;
+#endif
+}
+
+void hwgpu_host_hide_game_buffer(uint32_t slot) {
+    if (slot < HWGPU_CHANNELS && g_window) {
+        hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(slot));
+        __atomic_store_n(&c->scanout_active, 0u, __ATOMIC_RELEASE);
+    }
+#ifdef __ANDROID__
+    {
+        std::lock_guard<std::mutex> l(g_scan.lock);
+        hide_overlay_locked(int(slot));
+        if (g_game_scanout_slot.load(std::memory_order_relaxed) != int(slot)) update_cursor_locked(-1);
+    }
+#endif
+    scan_hide(int(slot));
+}
+
+void hwgpu_host_set_cursor_shape(uint32_t slot, uint32_t width, uint32_t height, int32_t hot_x, int32_t hot_y,
+                                 const void* rgba) {
+#ifdef __ANDROID__
+    if (!rgba || !width || !height || width > 64 || height > 64) return;
+    std::lock_guard<std::mutex> l(g_scan.lock);
+    ensure_cursor_ahb_locked();
+    if (!g_scan.cursor_ahb) return;
+    AHardwareBuffer_Desc d{};
+    AHardwareBuffer_describe(g_scan.cursor_ahb, &d);
+    void* dst = nullptr;
+    if (AHardwareBuffer_lock(g_scan.cursor_ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &dst) == 0 && dst) {
+        memset(dst, 0, size_t(d.stride) * 64 * 4);
+        const auto* src = static_cast<const uint32_t*>(rgba);
+        auto* out = static_cast<uint32_t*>(dst);
+        for (uint32_t y = 0; y < height; y++)
+            memcpy(out + size_t(y) * d.stride, src + size_t(y) * width, width * 4);
+        AHardwareBuffer_unlock(g_scan.cursor_ahb, nullptr);
+    }
+    g_scan.cursor_w = width;
+    g_scan.cursor_h = height;
+    g_scan.cursor_hot_x = hot_x;
+    g_scan.cursor_hot_y = hot_y;
+    g_scan.cursor_buffer_dirty = true;
+    update_cursor_locked(int(slot));
+#else
+    (void)slot; (void)width; (void)height; (void)hot_x; (void)hot_y; (void)rgba;
 #endif
 }
 

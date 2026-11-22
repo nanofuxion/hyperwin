@@ -71,7 +71,7 @@ struct Res {
     uint32_t kind;             /* HWD3D9_* kind */
     D3DDDIFORMAT format;
     uint32_t levels;
-    bool sysmem, gpu_writes, buffer;
+    bool sysmem, gpu_writes, buffer, uploaded, dirty;
     std::vector<Sub> subs;
 };
 
@@ -84,6 +84,19 @@ struct Dev {
     const uint8_t *um_ib;             /* user-memory indices (SetIndicesUm) */
     uint32_t um_isize;
     Res *rts[4];
+    HWND present_win;
+    uint32_t present_w, present_h;
+    bool scanning_out;
+    bool overlay_on;
+    bool overlay_bad;
+    uint32_t overlay_n;
+};
+
+struct D9Query {
+    uint32_t h;
+    uint32_t qslot1;
+    uint32_t qseq;
+    bool qflushed;
 };
 
 struct Adapter {
@@ -405,19 +418,33 @@ static void fetch(Dev *d, Res *o, UINT sub)
 {
     Sub &s = o->subs[sub];
     if (s.cpu_ok || !o->h) return;
+    if (!g_stage && !g_stage_tried) {
+        AcquireSRWLockExclusive(&g_lock);
+        ensure_staging();
+        ReleaseSRWLockExclusive(&g_lock);
+    }
     struct wbuf *b = req(d->h, HWD3D9_READ);
     put32(b, o->h);
-    put32(b, sub);
+    put32(b, g_readback ? (sub | HWD3D_MAP_STAGED_OK) : sub);
     struct rd r;
     HRESULT hr = (HRESULT)call_wait(b, &r);
-    uint32_t pitch = take32(&r), rows = take32(&r), n = take32(&r);
-    if (SUCCEEDED(hr)) {
+    uint32_t pitch = take32(&r), rows = take32(&r), raw_n = take32(&r);
+    bool staged = (raw_n & 0x80000000u) != 0;
+    uint32_t n = raw_n & ~0x80000000u;
+    if (SUCCEEDED(hr) && pitch && rows && n) {
         s.mem.resize(s.slice * s.d);
-        std::vector<uint8_t> tmp(n);
-        take(&r, tmp.data(), n);
+        const uint8_t *src = nullptr;
+        std::vector<uint8_t> tmp;
+        if (staged && g_readback && n <= HWD3D_READBACK_SIZE) {
+            src = g_readback;
+        } else {
+            tmp.resize(n);
+            take(&r, tmp.data(), n);
+            src = tmp.data();
+        }
         uint32_t rb = std::min(pitch, s.pitch);
         for (uint32_t y = 0; y < rows && (size_t)(y + 1) * s.pitch <= s.mem.size(); y++)
-            memcpy(s.mem.data() + (size_t)y * s.pitch, tmp.data() + (size_t)y * pitch, rb);
+            memcpy(s.mem.data() + (size_t)y * s.pitch, src + (size_t)y * pitch, rb);
         s.cpu_ok = true;
     }
     call_end(&r);
@@ -472,6 +499,7 @@ static HRESULT APIENTRY LockSpanned(HANDLE hd, D3DDDIARG_LOCK *a)
     HRESULT hr = Lock(hd, a);
     if (FAILED(hr) || a->Flags.ReadOnly) return hr;
     Res *o = RS(a->hResource);
+    if (o->sysmem && o->buffer) o->dirty = true;
     Sub &s = o->subs[a->SubResourceIndex];
     LockSpan sp = {};
     if (o->buffer && a->Flags.RangeValid) {
@@ -629,23 +657,60 @@ static HRESULT APIENTRY SetPixelShaderConstB(HANDLE hd, const D3DDDIARG_SETPIXEL
     return consts(DV(hd), HWD3D9_PS_B, a->Register, a->Count, v, 1);
 }
 
+/* Materializes a system-memory VB or IB on the phone and syncs its bytes when changed. */
+static void ensure_sysmem_buf(Dev *d, Res *o, uint32_t kind, uint32_t fmt)
+{
+    if (!o || o->subs.empty()) return;
+    Sub &s = o->subs[0];
+    if (!s.w) return;
+    if (!o->h) {
+        hwd3d9_res q = {};
+        q.kind = kind;
+        q.format = fmt;
+        q.pool = D3DPOOL_DEFAULT;
+        q.width = s.w;
+        q.height = 1;
+        q.depth = 1;
+        q.levels = 1;
+        q.lockable = 1;
+        struct wbuf *b = req(d->h, HWD3D9_CREATE_RES);
+        put(b, &q, sizeof q);
+        struct rd r;
+        HRESULT hr = (HRESULT)call_wait(b, &r);
+        o->h = take32(&r);
+        call_end(&r);
+        if (FAILED(hr) || !o->h) {
+            o->h = 0;
+            return;
+        }
+        o->uploaded = false;
+    }
+    const uint8_t *src = s.sys ? s.sys : (s.mem.size() >= s.w ? s.mem.data() : nullptr);
+    if (!src) return;
+    if (!o->uploaded || o->dirty) {
+        struct wbuf *w = req(d->h, HWD3D9_WRITE);
+        put32(w, o->h);
+        put32(w, 0);
+        hwd3d9_box box = {1, 0, 0, 0, s.w, 1, 1};
+        put(w, &box, sizeof box);
+        put32(w, s.w);
+        put32(w, s.w);
+        put_arr(w, src, s.w, 1);
+        send(w);
+        o->uploaded = true;
+        o->dirty = false;
+    }
+}
+
 static HRESULT APIENTRY SetStreamSource(HANDLE hd, const D3DDDIARG_SETSTREAMSOURCE *a)
 {
     Dev *d = DV(hd);
     if (a->Stream == d->um_stream) d->um_vb = nullptr;
-    /* A vertex buffer in system memory (Direct3D 8 and older keep their transformed vertices in one) has
-     * nothing on the phone: it is drawn like a user-memory stream. */
     Res *vbr = a->hVertexBuffer ? RS(a->hVertexBuffer) : nullptr;
-    if (vbr && !vbr->h && !vbr->subs.empty() && (vbr->subs[0].sys || !vbr->subs[0].mem.empty())) {
-        const uint8_t *base = vbr->subs[0].sys ? static_cast<const uint8_t *>(vbr->subs[0].sys) : vbr->subs[0].mem.data();
-        d->um_vb = base + a->Offset;
-        d->um_stride = a->Stride;
-        d->um_stream = a->Stream;
-        return S_OK;
-    }
+    if (vbr && vbr->sysmem) ensure_sysmem_buf(d, vbr, HWD3D9_VB, 0);
     struct wbuf *b = req(d->h, HWD3D9_STREAM);
     put32(b, a->Stream);
-    put32(b, a->hVertexBuffer ? RS(a->hVertexBuffer)->h : 0);
+    put32(b, vbr ? vbr->h : 0);
     put32(b, a->Offset);
     put32(b, a->Stride);
     send(b);
@@ -666,8 +731,13 @@ static HRESULT APIENTRY SetIndices(HANDLE hd, const D3DDDIARG_SETINDICES *a)
 {
     Dev *d = DV(hd);
     d->um_ib = nullptr;
+    Res *ibr = a->hIndexBuffer ? RS(a->hIndexBuffer) : nullptr;
+    if (ibr && ibr->sysmem) {
+        uint32_t fmt = (a->Stride == 4 || (uint32_t)ibr->format == 102) ? D3DFMT_INDEX32 : D3DFMT_INDEX16;
+        ensure_sysmem_buf(d, ibr, HWD3D9_IB, fmt);
+    }
     struct wbuf *b = req(d->h, HWD3D9_INDICES);
-    put32(b, a->hIndexBuffer ? RS(a->hIndexBuffer)->h : 0);
+    put32(b, ibr ? ibr->h : 0);
     send(b);
     return S_OK;
 }
@@ -1095,27 +1165,80 @@ static HRESULT APIENTRY GenerateMipSubLevels(HANDLE hd, const D3DDDIARG_GENERATE
 
 static HRESULT APIENTRY CreateQuery(HANDLE hd, D3DDDIARG_CREATEQUERY *a)
 {
+    if (!g_stage && !g_stage_tried) {
+        AcquireSRWLockExclusive(&g_lock);
+        ensure_staging();
+        ReleaseSRWLockExclusive(&g_lock);
+    }
     struct wbuf *b = req(DV(hd)->h, HWD3D9_QUERY);
     put32(b, (uint32_t)a->QueryType);
     struct rd r;
     HRESULT hr = (HRESULT)call_wait(b, &r);
     uint32_t h = take32(&r);
     call_end(&r);
-    a->hQuery = (HANDLE)(uintptr_t)h;
-    return SUCCEEDED(hr) && h ? S_OK : E_FAIL;
+    if (FAILED(hr) || !h) return E_FAIL;
+    D9Query *q = new D9Query{h, 0, 0, false};
+    if (g_qpage) {
+        AcquireSRWLockExclusive(&g_lock);
+        for (uint32_t i = 0; i < HWD3D_QUERY_SLOTS; i++) {
+            if (!g_qused[i]) {
+                g_qused[i] = 1;
+                q->qslot1 = i + 1;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    a->hQuery = (HANDLE)q;
+    return S_OK;
+}
+static HRESULT APIENTRY DestroyQuery(HANDLE hd, HANDLE hq)
+{
+    D9Query *q = (D9Query *)hq;
+    if (!q) return S_OK;
+    if (q->qslot1) {
+        AcquireSRWLockExclusive(&g_lock);
+        g_qused[q->qslot1 - 1] = 0;
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    uint32_t h = q->h;
+    delete q;
+    return DeleteHandle(hd, (HANDLE)(uintptr_t)h);
 }
 static HRESULT APIENTRY IssueQuery(HANDLE hd, const D3DDDIARG_ISSUEQUERY *a)
 {
+    D9Query *q = (D9Query *)a->hQuery;
+    if (!q) return S_OK;
+    uint32_t flags = a->Flags.Begin ? D3DISSUE_BEGIN : D3DISSUE_END;
+    if (flags == D3DISSUE_END && q->qslot1) {
+        if (!++q->qseq) q->qseq = 1;
+        q->qflushed = false;
+    }
     struct wbuf *b = req(DV(hd)->h, HWD3D9_QUERY_ISSUE);
-    put32(b, (uint32_t)(uintptr_t)a->hQuery);
-    put32(b, a->Flags.Begin ? D3DISSUE_BEGIN : D3DISSUE_END);
+    put32(b, q->h);
+    put32(b, flags);
+    if (flags == D3DISSUE_END && q->qslot1) {
+        put32(b, q->qslot1 - 1);
+        put32(b, q->qseq);
+    }
     send(b);
     return S_OK;
 }
 static HRESULT APIENTRY GetQueryData(HANDLE hd, const D3DDDIARG_GETQUERYDATA *a)
 {
+    D9Query *q = (D9Query *)a->hQuery;
+    if (!q) return E_INVALIDARG;
+    if (q->qslot1 && q->qseq && g_qpage) {
+        volatile struct hwd3d_query_slot *slot = &g_qpage[q->qslot1 - 1];
+        if (__atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE) == q->qseq) {
+            uint32_t n = slot->size < 8 ? slot->size : 8;
+            if (a->pData && n) memcpy(a->pData, (const void *)slot->data, n < 4 ? n : 4);
+            return S_OK;
+        }
+        return D3DERR_WASSTILLDRAWING;
+    }
     struct wbuf *b = req(DV(hd)->h, HWD3D9_QUERY_DATA);
-    put32(b, (uint32_t)(uintptr_t)a->hQuery);
+    put32(b, q->h);
     put32(b, 8);
     struct rd r;
     HRESULT hr = (HRESULT)call_wait(b, &r);
@@ -1130,8 +1253,8 @@ static HRESULT APIENTRY GetQueryData(HANDLE hd, const D3DDDIARG_GETQUERYDATA *a)
 
 /* ---- present ---- */
 
-/* The frame is read back and drawn into the program's window, the one of its size (umd.cpp's find_win).
- * As with Direct3D 11 blts, the copy goes when DXGI and Direct3D 9 can flip on this adapter. */
+/* The frame stays on the phone's GPU whenever the window is visible (fullscreen or windowed overlay).
+ * Falls back to staged readback + GDI when another window covers the middle of the client rect. */
 static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
 {
     D9LOG("hwd3d_umd: d9 Present\n");
@@ -1139,22 +1262,128 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
     Res *s = RS(a->hSrcResource);
     if (!s || !s->h || s->subs.empty()) return S_OK;
     const Sub &ss = s->subs[a->SrcSubResourceIndex < s->subs.size() ? a->SrcSubResourceIndex : 0];
-    FindWin f = {GetCurrentProcessId(), ss.w, ss.h, nullptr};
-    EnumWindows(find_win, reinterpret_cast<LPARAM>(&f));
-    if (!f.best) {
+    HWND win = d->present_win;
+    if (!win || d->present_w != ss.w || d->present_h != ss.h || !IsWindow(win) || !IsWindowVisible(win)) {
+        FindWin f = {GetCurrentProcessId(), ss.w, ss.h, nullptr, nullptr};
+        EnumWindows(find_win, reinterpret_cast<LPARAM>(&f));
+        win = f.best ? f.best : f.fallback;
+        if (win) {
+            d->present_win = win;
+            d->present_w = ss.w;
+            d->present_h = ss.h;
+        }
+    }
+    if (!win) {
+        if (d->scanning_out) {
+            d->scanning_out = false;
+            d->overlay_on = false;
+            if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+            struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
+            put32(hb, 0);
+            put32(hb, 0);
+            send(hb);
+        }
         D9LOG("hwd3d_umd: Direct3D 9 present: no window of %ux%u\n", ss.w, ss.h);
         return S_OK;
     }
+    bool full = hwgpu_window_fills_screen(win) != 0;
+    if (full && d->overlay_on) {
+        d->overlay_on = false;
+        d->scanning_out = false;
+        struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
+        put32(hb, 0);
+        put32(hb, 0);
+        send(hb);
+    }
+    if (!full && !d->overlay_bad) {
+        RECT cr = {}, vr = {};
+        if (hwgpu_window_overlay_ok(win, &cr, &vr) &&
+            (UINT)(cr.right - cr.left) == ss.w && (UINT)(cr.bottom - cr.top) == ss.h) {
+            if (d->scanning_out && !d->overlay_on) {
+                d->scanning_out = false;
+                if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+                struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
+                put32(hb, 0);
+                put32(hb, 0);
+                send(hb);
+            }
+            if (g_chan) hwgpu_update_cursor_ex(hwgpu_chan_ctl(g_chan), win, send_cursor_shape, 1);
+            struct wbuf *ob = req(d->h, HWD3D9_PRESENT);
+            put32(ob, s->h);
+            put32(ob, a->SrcSubResourceIndex | 0x80000000u);
+            put32(ob, (uint32_t)cr.left);
+            put32(ob, (uint32_t)cr.top);
+            put32(ob, ss.w);
+            put32(ob, ss.h);
+            put32(ob, (uint32_t)vr.left);
+            put32(ob, (uint32_t)vr.top);
+            put32(ob, (uint32_t)vr.right);
+            put32(ob, (uint32_t)vr.bottom);
+            if (!d->overlay_on || (++d->overlay_n & 1) == 0) {
+                if (SUCCEEDED(wait_status(ob))) {
+                    if (!d->overlay_on) ulog("hwd3d_umd: Direct3D 9 windowed present on its own layer (%ux%u)\n", ss.w, ss.h);
+                    d->overlay_on = true;
+                    d->scanning_out = true;
+                    return S_OK;
+                }
+                d->overlay_bad = true;
+                d->overlay_on = false;
+                d->scanning_out = false;
+                if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+                struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
+                put32(hb, 0);
+                put32(hb, 0);
+                send(hb);
+            } else {
+                send(ob);
+                return S_OK;
+            }
+        }
+    }
+    if (full) {
+        if (g_chan) hwgpu_update_fullscreen_cursor(hwgpu_chan_ctl(g_chan), win, send_cursor_shape);
+        struct wbuf *sb = req(d->h, HWD3D9_PRESENT);
+        put32(sb, s->h);
+        put32(sb, a->SrcSubResourceIndex);
+        if (!d->scanning_out || (++d->overlay_n & 1) == 0) {
+            if (SUCCEEDED(wait_status(sb))) {
+                if (!d->scanning_out) {
+                    d->scanning_out = true;
+                    ulog("hwd3d_umd: Direct3D 9 fullscreen direct scanout on (%ux%u)\n", ss.w, ss.h);
+                }
+                return S_OK;
+            }
+        } else {
+            send(sb);
+            return S_OK;
+        }
+    }
+    if (d->scanning_out) {
+        d->scanning_out = false;
+        d->overlay_on = false;
+        if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+        struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
+        put32(hb, 0);
+        put32(hb, 0);
+        send(hb);
+        ulog("hwd3d_umd: Direct3D 9 direct scanout off, returning to windowed GDI\n");
+    }
+    if (!g_stage && !g_stage_tried) {
+        AcquireSRWLockExclusive(&g_lock);
+        ensure_staging();
+        ReleaseSRWLockExclusive(&g_lock);
+    }
     struct wbuf *b = req(d->h, HWD3D9_READ);
     put32(b, s->h);
-    put32(b, a->SrcSubResourceIndex);
+    put32(b, g_readback ? (a->SrcSubResourceIndex | HWD3D_MAP_STAGED_OK) : a->SrcSubResourceIndex);
     struct rd r;
     HRESULT hr = (HRESULT)call_wait(b, &r);
-    uint32_t pitch = take32(&r), rows = take32(&r), n = take32(&r);
-    if (SUCCEEDED(hr) && pitch && rows) {
-        std::vector<uint8_t> px(n);
-        take(&r, px.data(), n);
-        HDC dc = GetDC(f.best);
+    uint32_t pitch = take32(&r), rows = take32(&r), raw_n = take32(&r);
+    bool staged = (raw_n & 0x80000000u) != 0;
+    uint32_t n = raw_n & ~0x80000000u;
+    const uint8_t *pixels = (staged && g_readback && n <= HWD3D_READBACK_SIZE) ? g_readback : ((size_t)(r.end - r.p) >= n ? r.p : nullptr);
+    if (SUCCEEDED(hr) && pitch && rows && n && pixels) {
+        HDC dc = GetDC(win);
         BITMAPINFO bi = {};
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
         bi.bmiHeader.biWidth = (LONG)(pitch / 4);
@@ -1162,8 +1391,8 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
-        SetDIBitsToDevice(dc, 0, 0, ss.w, rows, 0, 0, 0, rows, px.data(), &bi, DIB_RGB_COLORS);
-        ReleaseDC(f.best, dc);
+        SetDIBitsToDevice(dc, 0, 0, ss.w, rows, 0, 0, 0, rows, pixels, &bi, DIB_RGB_COLORS);
+        ReleaseDC(win, dc);
     }
     call_end(&r);
     return S_OK;
@@ -1180,6 +1409,14 @@ static HRESULT APIENTRY ValidateDevice(HANDLE, D3DDDIARG_VALIDATETEXTURESTAGESTA
 static HRESULT APIENTRY DestroyDevice(HANDLE hd)
 {
     Dev *d = DV(hd);
+    if (d->scanning_out) {
+        d->scanning_out = false;
+        if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
+        struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
+        put32(hb, 0);
+        put32(hb, 0);
+        send(hb);
+    }
     release_handle(d->h);
     delete d;
     return S_OK;
@@ -1270,7 +1507,7 @@ static HRESULT APIENTRY CreateDevice(HANDLE ha, D3DDDIARG_CREATEDEVICE *a)
     t->pfnBlt = Blt;
     t->pfnColorFill = ColorFill;
     t->pfnCreateQuery = CreateQuery;
-    t->pfnDestroyQuery = DeleteHandle;
+    t->pfnDestroyQuery = DestroyQuery;
     t->pfnIssueQuery = IssueQuery;
     t->pfnGetQueryData = GetQueryData;
     t->pfnSetRenderTarget = SetRenderTarget;

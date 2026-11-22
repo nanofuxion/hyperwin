@@ -95,6 +95,7 @@
 #define SGPU_CMD_SURFACE     0x1004u  /* sgpu_surface -> OK_NODATA */
 #define SGPU_CMD_PRESENT     0x1005u  /* sgpu_present -> OK_NODATA (frame to shared window) */
 #define SGPU_CMD_SCANOUT     0x1006u  /* sgpu_scanout -> OK_NODATA (GPU frame straight to the screen) */
+#define SGPU_CMD_CURSOR      0x1007u  /* sgpu_cursor + width*height*4 RGBA bytes -> OK_NODATA */
 #define SGPU_RESP_OK_HELLO   0x1180u
 #define SGPU_HELLO_SCANOUT   (1u << 0) /* sgpu_hello_resp.hdr.flags: SGPU_CMD_SCANOUT works */
 #define SGPU_RESP_OK_DATA    0x1181u  /* vgpu_hdr, u32 len, len bytes */
@@ -294,6 +295,15 @@ struct sgpu_scanout {                  /* the phone's compositor shows the resou
 /* Show every frame, each for at least one refresh, in order (FIFO). Without it a newer frame
  * replaces one not yet on screen. */
 #define SGPU_SCANOUT_VSYNC 1u
+
+struct sgpu_cursor {                   /* followed by width * height * 4 RGBA bytes */
+	struct vgpu_hdr hdr;
+	uint32_t width;
+	uint32_t height;
+	int32_t hot_x;
+	int32_t hot_y;
+};
+
 /* What a guest driver leaves in the first bytes of such an IOSurface for its window server. */
 #define SGPU_SURFACE_MAGIC "SWEETMTL"
 #pragma pack(pop)

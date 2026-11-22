@@ -23,6 +23,7 @@ static void *g_chan;
 static uint32_t g_gen, g_seq;
 static struct hww *g_adapter;          /* the WDDM adapter, when the channel came from it */
 static uint8_t *g_stage;               /* the staging area (hw_d3d.h), or null */
+static uint8_t *g_readback;            /* phone->guest readback window in g_stage (HWD3D_READBACK_SIZE) */
 static uint64_t g_stage_cap, g_stage_pos;
 static volatile struct hwd3d_query_slot *g_qpage;  /* query results (hw_d3d.h), or null */
 static uint8_t g_qused[HWD3D_QUERY_SLOTS];
@@ -159,19 +160,29 @@ static int chan_alive(void)
     return hwgpu_alive(c, g_gen);
 }
 
+static ULONGLONG g_last_connect_try;
+
 static void reconnect_if_lost(void)
 {
-    if (!g_ok || chan_alive()) return;
+    if (g_ok && chan_alive()) return;
+    if (getenv("HWD3D_OFF")) return;
+    ULONGLONG now = GetTickCount64();
+    if (!g_ok && g_last_connect_try && now - g_last_connect_try < 250) return;
     AcquireSRWLockExclusive(&g_lock);
-    if (!chan_alive()) {
-        hlog("hwd3d: the phone's GPU restarted, opening a new channel\n");
-        g_ok = 0;
-        g_stage = NULL;
-        g_stage_cap = g_stage_pos = 0;
-        g_qpage = NULL;
-        memset(g_qused, 0, sizeof g_qused);
-        g_stage_tried = 0;
-        connect_channel();
+    if (!g_ok || !chan_alive()) {
+        now = GetTickCount64();
+        if (g_ok || !g_last_connect_try || now - g_last_connect_try >= 250) {
+            g_last_connect_try = now;
+            if (g_ok) hlog("hwd3d: the phone's GPU restarted, opening a new channel\n");
+            g_ok = 0;
+            g_stage = NULL;
+            g_readback = NULL;
+            g_stage_cap = g_stage_pos = 0;
+            g_qpage = NULL;
+            memset(g_qused, 0, sizeof g_qused);
+            g_stage_tried = 0;
+            connect_channel();
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
 }
@@ -231,9 +242,10 @@ static void ensure_staging(void)
         if (g_adapter) mapped = hww_map(g_adapter, g_slot, r.staging_offset, r.staging_size, &out.user) >= 0 && out.user;
         else mapped = DeviceIoControl(g_dev, IOCTL_HWGPU_MAP, &in, sizeof in, &out, sizeof out, &got, NULL) && out.user;
     }
-    if (mapped) {
+    if (mapped && r.staging_size > HWD3D_STAGING_DATA + HWD3D_QUERY_PAGE + HWD3D_READBACK_SIZE) {
         g_stage = (uint8_t *)(uintptr_t)out.user;
-        g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE;
+        g_stage_cap = r.staging_size - HWD3D_STAGING_DATA - HWD3D_QUERY_PAGE - HWD3D_READBACK_SIZE;
+        g_readback = g_stage + r.staging_size - HWD3D_QUERY_PAGE - HWD3D_READBACK_SIZE;
         g_qpage = (volatile struct hwd3d_query_slot *)(g_stage + r.staging_size - HWD3D_QUERY_PAGE);
     }
 }

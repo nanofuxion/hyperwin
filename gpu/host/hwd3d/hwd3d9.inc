@@ -9,30 +9,23 @@ struct D9State {
     std::vector<uint8_t> kinds{0};
     std::vector<uint32_t> levels{0};        // textures: their level count (subresource = face * levels + level)
     std::vector<uint32_t> owner{0};         // the device handle each object belongs to
+    IDirect3DSurface9* read_tmp = nullptr;  // cached systemmem staging surface for HWD3D9_READ
+    IDirect3DDevice9Ex* read_dev = nullptr;
+    UINT read_w = 0, read_h = 0;
+    D3DFORMAT read_fmt = D3DFMT_UNKNOWN;
 };
 
 enum { D9K_NONE, D9K_DEV, D9K_TEX, D9K_CUBE, D9K_VOL, D9K_SURF, D9K_VB, D9K_IB, D9K_VS, D9K_PS, D9K_DECL, D9K_QUERY };
 
-IDirect3D9Ex* (WINAPI* g_create9ex)(UINT) = nullptr;   // Direct3DCreate9Ex's shape, wrapped below
+const Dxvk& chan_dxvk(Chan& c);
+PFN_vkGetInstanceProcAddr vk_gipa(bool desktop);
 
-bool load_d3d9() {
-    static int state = -1;
-    if (state >= 0) return state;
-    state = 0;
-    void* h = dlopen("libdxvk_d3d9.so", RTLD_NOW | RTLD_LOCAL);
-    if (!h) {
-        LOG("Direct3D 9: libdxvk_d3d9.so: %s", dlerror());
-        return false;
-    }
-    auto create = reinterpret_cast<HRESULT(WINAPI*)(UINT, IDirect3D9Ex**)>(dlsym(h, "Direct3DCreate9Ex"));
-    if (!create) return false;
-    static HRESULT(WINAPI * s_create)(UINT, IDirect3D9Ex**) = create;
-    g_create9ex = [](UINT v) -> IDirect3D9Ex* {
-        IDirect3D9Ex* d = nullptr;
-        return SUCCEEDED(s_create(v, &d)) ? d : nullptr;
-    };
-    state = 1;
-    return true;
+IDirect3D9Ex* create_d3d9ex(Chan& c, UINT v) {
+    const Dxvk& dx = chan_dxvk(c);
+    if (!dx.create9ex) return nullptr;
+    dx.apply_program(c.exe, c.conf);
+    IDirect3D9Ex* d = nullptr;
+    return SUCCEEDED(dx.create9ex(v, &d)) ? d : nullptr;
 }
 
 uint32_t d9_put(D9State& s, IUnknown* o, uint8_t kind, uint32_t dev, uint32_t levels = 0) {
@@ -59,6 +52,11 @@ template <class T> T* d9_get(D9State* s, uint32_t h, uint8_t kind) {
 void d9_release(Chan& c) {
     D9State* s = c.d9;
     if (!s) return;
+    if (s->read_tmp) {
+        s->read_tmp->Release();
+        s->read_tmp = nullptr;
+        s->read_dev = nullptr;
+    }
     // Everything but the devices first, then the devices, then Direct3D.
     for (int pass = 0; pass < 2; pass++)
         for (size_t i = 1; i < s->objs.size(); i++)
@@ -125,9 +123,8 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
     D9State* s = c.d9;
     const uint32_t m = call.method;
     if (m == HWD3D9_CREATE_DEVICE) {
-        if (!load_d3d9()) return E_NOTIMPL;
-        if (!s->d3d) s->d3d = g_create9ex(D3D_SDK_VERSION);
-        if (!s->d3d) return E_FAIL;
+        if (!s->d3d) s->d3d = create_d3d9ex(c, D3D_SDK_VERSION);
+        if (!s->d3d) return E_NOTIMPL;
         D3DPRESENT_PARAMETERS pp = {};
         pp.BackBufferWidth = 16;
         pp.BackBufferHeight = 16;
@@ -148,9 +145,8 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         return 0;
     }
     if (m == HWD3D9_FORMATS) {
-        if (!load_d3d9()) return E_NOTIMPL;
-        if (!s->d3d) s->d3d = g_create9ex(D3D_SDK_VERSION);
-        if (!s->d3d) return E_FAIL;
+        if (!s->d3d) s->d3d = create_d3d9ex(c, D3D_SDK_VERSION);
+        if (!s->d3d) return E_NOTIMPL;
         uint64_t n = 0;
         const uint32_t* f = static_cast<const uint32_t*>(r.arr(4, &n));
         if (!r.ok || n > 512) return E_INVALIDARG;
@@ -160,6 +156,11 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
     if (m == HWD3D9_RELEASE) {
         uint32_t h = call.object;
         if (!h || h >= s->objs.size() || !s->objs[h]) return E_INVALIDARG;
+        if (s->kinds[h] == D9K_DEV && s->read_tmp && s->objs[h] == s->read_dev) {
+            s->read_tmp->Release();
+            s->read_tmp = nullptr;
+            s->read_dev = nullptr;
+        }
         s->objs[h]->Release();
         s->objs[h] = nullptr;
         s->kinds[h] = D9K_NONE;
@@ -173,7 +174,8 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
     case HWD3D9_CREATE_RES: {
         hwd3d9_res d;
         r.get(&d, sizeof d);
-        if (!r.ok || !d.width || d.width > 16384 || d.height > 16384 || d.depth > 2048 || d.levels > 16) return E_INVALIDARG;
+        bool is_buf = (d.kind == HWD3D9_VB || d.kind == HWD3D9_IB);
+        if (!r.ok || !d.width || (is_buf ? d.width > (256u << 20) : d.width > 16384) || d.height > 16384 || d.depth > 2048 || d.levels > 16) return E_INVALIDARG;
         HRESULT hr = E_INVALIDARG;
         IUnknown* o = nullptr;
         uint8_t kind = 0;
@@ -469,7 +471,9 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         return hr;
     }
     case HWD3D9_READ: {
-        uint32_t h = r.u32(), sub = r.u32();
+        uint32_t h = r.u32(), raw_sub = r.u32();
+        bool staged_ok = (raw_sub & HWD3D_MAP_STAGED_OK) != 0;
+        uint32_t sub = raw_sub & ~HWD3D_MAP_STAGED_OK;
         if (h >= s->objs.size()) return E_INVALIDARG;
         uint8_t k = s->kinds[h];
         if (k == D9K_VB || k == D9K_IB) {
@@ -490,8 +494,13 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
             if (FAILED(hr)) return hr;
             w.u32(size);
             w.u32(1);
-            w.u32(size);
-            w.put(p, size);
+            if (staged_ok && c.readback_ptr() && size <= HWD3D_READBACK_SIZE) {
+                memcpy(c.readback_ptr(), p, size);
+                w.u32(size | 0x80000000u);
+            } else {
+                w.u32(size);
+                w.put(p, size);
+            }
             k == D9K_VB ? static_cast<IDirect3DVertexBuffer9*>(s->objs[h])->Unlock() : static_cast<IDirect3DIndexBuffer9*>(s->objs[h])->Unlock();
             return 0;
         }
@@ -500,28 +509,43 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         D3DSURFACE_DESC sd;
         sf->GetDesc(&sd);
         D3DLOCKED_RECT lr;
-        IDirect3DSurface9* tmp = nullptr;
         HRESULT hr = sf->LockRect(&lr, nullptr, D3DLOCK_READONLY);
         IDirect3DSurface9* locked = sf;
         if (FAILED(hr)) {
-            // A render target: copied into system memory first.
-            hr = dev->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &tmp, nullptr);
-            if (SUCCEEDED(hr)) hr = dev->GetRenderTargetData(sf, tmp);
-            if (SUCCEEDED(hr)) hr = tmp->LockRect(&lr, nullptr, D3DLOCK_READONLY);
-            locked = tmp;
+            // A render target: copied into a cached system-memory staging surface first.
+            if (!s->read_tmp || s->read_dev != dev || s->read_w != sd.Width || s->read_h != sd.Height || s->read_fmt != sd.Format) {
+                if (s->read_tmp) { s->read_tmp->Release(); s->read_tmp = nullptr; }
+                hr = dev->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &s->read_tmp, nullptr);
+                if (SUCCEEDED(hr)) {
+                    s->read_dev = dev;
+                    s->read_w = sd.Width;
+                    s->read_h = sd.Height;
+                    s->read_fmt = sd.Format;
+                }
+            } else {
+                hr = S_OK;
+            }
+            if (SUCCEEDED(hr)) hr = dev->GetRenderTargetData(sf, s->read_tmp);
+            if (SUCCEEDED(hr)) hr = s->read_tmp->LockRect(&lr, nullptr, D3DLOCK_READONLY);
+            locked = s->read_tmp;
         }
         if (SUCCEEDED(hr)) {
             // Block-compressed formats are rows of 4x4 blocks.
             bool bc = sd.Format == D3DFMT_DXT1 || sd.Format == D3DFMT_DXT2 || sd.Format == D3DFMT_DXT3 || sd.Format == D3DFMT_DXT4 ||
                       sd.Format == D3DFMT_DXT5;
             uint32_t rows = bc ? (sd.Height + 3) / 4 : sd.Height;
+            uint32_t total = uint32_t(lr.Pitch) * rows;
             w.u32(uint32_t(lr.Pitch));
             w.u32(rows);
-            w.u32(uint32_t(lr.Pitch) * rows);
-            w.put(lr.pBits, size_t(lr.Pitch) * rows);
+            if (staged_ok && c.readback_ptr() && total <= HWD3D_READBACK_SIZE) {
+                memcpy(c.readback_ptr(), lr.pBits, size_t(total));
+                w.u32(total | 0x80000000u);
+            } else {
+                w.u32(total);
+                w.put(lr.pBits, size_t(total));
+            }
             locked->UnlockRect();
         }
-        if (tmp) tmp->Release();
         sf->Release();
         return hr;
     }
@@ -587,7 +611,25 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
     case HWD3D9_QUERY_ISSUE: {
         auto* q = d9_get<IDirect3DQuery9>(s, r.u32(), D9K_QUERY);
         uint32_t flags = r.u32();
-        return q ? q->Issue(flags) : E_INVALIDARG;
+        if (!q) return E_INVALIDARG;
+        HRESULT hr = q->Issue(flags);
+        if (SUCCEEDED(hr) && flags == D3DISSUE_END && r.end - r.p >= 8 && c.stage &&
+            c.stage_size > HWD3D_STAGING_DATA + HWD3D_QUERY_PAGE) {
+            uint32_t slot = r.u32(), seq = r.u32();
+            if (slot < HWD3D_QUERY_SLOTS && seq) {
+                q->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+                for (auto p = c.pending_d9.begin(); p != c.pending_d9.end(); ++p) {
+                    if (p->slot == slot) {
+                        p->q->Release();
+                        c.pending_d9.erase(p);
+                        break;
+                    }
+                }
+                q->AddRef();
+                c.pending_d9.push_back({q, slot, seq});
+            }
+        }
+        return hr;
     }
     case HWD3D9_QUERY_DATA: {
         auto* q = d9_get<IDirect3DQuery9>(s, r.u32(), D9K_QUERY);
@@ -597,6 +639,130 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         HRESULT hr = q->GetData(size ? buf : nullptr, size, D3DGETDATA_FLUSH);
         w.u32(size);
         w.put(buf, size);
+        return hr;
+    }
+    case HWD3D9_PRESENT: {
+        uint32_t sh = r.u32(), raw_sub = r.u32();
+        if (!sh) {
+            hwgpu_host_hide_game_buffer(c.slot);
+            return 0;
+        }
+        const bool overlay = (raw_sub & 0x80000000u) != 0;
+        uint32_t ssub = raw_sub & ~0x80000000u;
+        int32_t ov_x = 0, ov_y = 0;
+        uint32_t ov_w = 0, ov_h = 0, ov_crop[4] = {0, 0, 0, 0};
+        if (overlay) {
+            ov_x = int32_t(r.u32());
+            ov_y = int32_t(r.u32());
+            ov_w = r.u32();
+            ov_h = r.u32();
+            ov_crop[0] = r.u32();
+            ov_crop[1] = r.u32();
+            ov_crop[2] = r.u32();
+            ov_crop[3] = r.u32();
+        }
+        IDirect3DSurface9* sf = d9_surface(s, sh, ssub);
+        if (!sf) return E_INVALIDARG;
+        D3DSURFACE_DESC sd{};
+        sf->GetDesc(&sd);
+        const Dxvk& dx = chan_dxvk(c);
+        if (!sd.Width || !sd.Height || !dx.d9_get_vk_handles || !dx.d9_blit_to_vkimage) {
+            sf->Release();
+            return E_NOTIMPL;
+        }
+        if (c.scan_dev != dev || c.scan_w != sd.Width || c.scan_h != sd.Height || !c.scan_ring[0].vk_img) {
+            c.free_scan_ring();
+            VkInstance inst = VK_NULL_HANDLE;
+            VkPhysicalDevice phys = VK_NULL_HANDLE;
+            VkDevice vkd = VK_NULL_HANDLE;
+            dx.d9_get_vk_handles(dev, &inst, &phys, &vkd);
+            PFN_vkGetInstanceProcAddr gipa = vk_gipa(c.is_desktop);
+            auto gdpa = (gipa && inst) ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(inst, "vkGetDeviceProcAddr")) : nullptr;
+#define VKF(name) auto name = (gdpa && vkd) ? reinterpret_cast<PFN_##name>(gdpa(vkd, #name)) : nullptr
+            VKF(vkGetAndroidHardwareBufferPropertiesANDROID);
+            VKF(vkCreateImage);
+            VKF(vkAllocateMemory);
+            VKF(vkBindImageMemory);
+            VKF(vkDestroyImage);
+            VKF(vkFreeMemory);
+#undef VKF
+            if (!vkGetAndroidHardwareBufferPropertiesANDROID || !vkCreateImage || !vkAllocateMemory ||
+                !vkBindImageMemory || !vkDestroyImage || !vkFreeMemory) {
+                sf->Release();
+                return E_NOTIMPL;
+            }
+            static const bool custom_driver = getenv("HWGPU_VK_DRIVER") && *getenv("HWGPU_VK_DRIVER");
+            for (int i = 0; i < 3; i++) {
+                AHardwareBuffer_Desc ad{sd.Width, sd.Height, 1, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                                        AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                                            AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                                            (!c.is_desktop && custom_driver ? AHARDWAREBUFFER_USAGE_CPU_READ_RARELY : 0),
+                                        0, 0, 0};
+                if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) != 0) {
+                    ad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
+                    if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) != 0) {
+                        c.free_scan_ring();
+                        sf->Release();
+                        return E_OUTOFMEMORY;
+                    }
+                }
+                VkAndroidHardwareBufferFormatPropertiesANDROID fp{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
+                VkAndroidHardwareBufferPropertiesANDROID props{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, &fp};
+                if (vkGetAndroidHardwareBufferPropertiesANDROID(vkd, c.scan_ring[i].ahb, &props) != VK_SUCCESS ||
+                    fp.format == VK_FORMAT_UNDEFINED) {
+                    c.free_scan_ring();
+                    sf->Release();
+                    return E_FAIL;
+                }
+                VkExternalMemoryImageCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, nullptr,
+                                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+                VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext};
+                ci.imageType = VK_IMAGE_TYPE_2D;
+                ci.format = fp.format;
+                ci.extent = {sd.Width, sd.Height, 1};
+                ci.mipLevels = 1;
+                ci.arrayLayers = 1;
+                ci.samples = VK_SAMPLE_COUNT_1_BIT;
+                ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                if (vkCreateImage(vkd, &ci, nullptr, &c.scan_ring[i].vk_img) != VK_SUCCESS) {
+                    c.free_scan_ring();
+                    sf->Release();
+                    return E_FAIL;
+                }
+                c.scan_ring[i].vk_dev = vkd;
+                c.scan_ring[i].vk_fmt = uint32_t(fp.format);
+                c.scan_ring[i].destroy_image = vkDestroyImage;
+                c.scan_ring[i].free_memory = vkFreeMemory;
+                VkImportAndroidHardwareBufferInfoANDROID imp{VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+                                                             nullptr, c.scan_ring[i].ahb};
+                VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &imp,
+                                                  c.scan_ring[i].vk_img, VK_NULL_HANDLE};
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded, props.allocationSize, 0};
+                while (ai.memoryTypeIndex < 32 && !(props.memoryTypeBits & (1u << ai.memoryTypeIndex))) ai.memoryTypeIndex++;
+                if (vkAllocateMemory(vkd, &ai, nullptr, &c.scan_ring[i].vk_mem) != VK_SUCCESS ||
+                    vkBindImageMemory(vkd, c.scan_ring[i].vk_img, c.scan_ring[i].vk_mem, 0) != VK_SUCCESS) {
+                    c.free_scan_ring();
+                    sf->Release();
+                    return E_FAIL;
+                }
+            }
+            c.scan_dev = dev;
+            c.scan_w = sd.Width;
+            c.scan_h = sd.Height;
+            LOG("channel %u: fullscreen D3D9 scanout ring %ux%u ready", c.slot, sd.Width, sd.Height);
+        }
+        auto& buf = c.scan_ring[c.scan_idx++ % 3];
+        HRESULT hr = dx.d9_blit_to_vkimage(dev, sf, buf.vk_img, buf.vk_fmt, sd.Width, sd.Height);
+        sf->Release();
+        if (SUCCEEDED(hr)) {
+            if (overlay) hwgpu_host_show_window_buffer(c.slot, buf.ahb, sd.Width, sd.Height, ov_x, ov_y, ov_w, ov_h, ov_crop);
+            else hwgpu_host_show_game_buffer(c.slot, c.generation, buf.ahb, sd.Width, sd.Height, hwgpu_host_vsync());
+            c.presents++;
+        }
         return hr;
     }
     }

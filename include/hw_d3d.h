@@ -45,6 +45,7 @@
 /* Direct3D 9 (wddm/README.md phase 7): HWD3D_OP_D9 with the call's object = a Direct3D 9 handle of the
  * channel (0 for device-less calls) and method = one of these. Each maps onto DXVK's IDirect3DDevice9. */
 #define HWD3D_OP_D9             0x001Au
+#define HWD3D_OP_CURSOR         0x001Bu   /* width, height, hot_x, hot_y, width*height*4 RGBA bytes; no answer */
 enum hwd3d9_method {
     HWD3D9_CREATE_DEVICE = 1,  /* -> device handle, D3DCAPS9 */
     HWD3D9_FORMATS,            /* n, D3DFORMATs -> n HWD3D9_FMT_* masks */
@@ -86,6 +87,7 @@ enum hwd3d9_method {
     HWD3D9_QUERY,              /* type -> handle */
     HWD3D9_QUERY_ISSUE,        /* query, flags */
     HWD3D9_QUERY_DATA,         /* query, size -> S_FALSE or the data */
+    HWD3D9_PRESENT,            /* src, sub (or 0, 0 to leave fullscreen): GPU blit straight to the phone's screen */
 };
 /* What the phone can do with a format (HWD3D9_FORMATS). */
 #define HWD3D9_FMT_TEXTURE   0x001u
@@ -134,9 +136,14 @@ struct hwd3d_staging {
 
 /* The query page: the last HWD3D_QUERY_PAGE bytes of the staging area, outside its ring. Each query
  * the guest ends gets a slot; the phone writes the result there when the GPU has it and then sets
- * seq to the End it answers, so GetData is a memory read. */
-#define HWD3D_QUERY_PAGE  (64u << 10)
-#define HWD3D_QUERY_DATA  120u
+ * seq to the End it answers, so GetData is a memory read.
+ * Above the upload ring and below the query page sits HWD3D_READBACK_SIZE (9 MiB, enough for 1080p
+ * RGBA) for phone->guest readbacks (Map(READ), HWD3D9_READ, windowed Present), keeping 3.5-8.3 MiB
+ * frames out of the 512 KiB rx ring. */
+#define HWD3D_QUERY_PAGE     (64u << 10)
+#define HWD3D_READBACK_SIZE  (9u << 20)
+#define HWD3D_MAP_STAGED_OK  0x40000000u
+#define HWD3D_QUERY_DATA     120u
 struct hwd3d_query_slot {
     uint32_t seq;      /* phone, written last: the End this result is for */
     uint32_t size;
