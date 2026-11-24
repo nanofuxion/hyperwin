@@ -32,6 +32,7 @@ class HomeScreen(
         fun reinstall()
         fun importDriver()
         fun importDxvk()
+        fun updateGuestDrivers()
     }
 
     private val title = Ui.text(ctx, M.attr.textAppearanceDisplaySmall)
@@ -78,7 +79,7 @@ class HomeScreen(
         settings.removeAllViews()
         if (machine == null) return
         showSpecs(machine)
-        listOf(display(machine), graphics(), input(), network(machine), files(), performance(machine), startup(), advanced(running)).forEach {
+        listOf(display(machine), graphics(), input(), network(machine), files(), performance(machine), startup(), advanced(running, machine)).forEach {
             settings.addView(it, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP))
         }
         restartNote.visibility = if (running) View.VISIBLE else View.GONE
@@ -108,7 +109,7 @@ class HomeScreen(
                     if (AvfLaunch.machine != null && Machine.active(ctx)?.dir == machine.dir) AvfLaunch.sharedWindow?.let { w ->
                         val (sw, sh) = machine.frameSize()
                         val native = AvfPlan.nativeScreen()
-                        WindowBridge.nativeSetScreen(w.buffer, sw, sh, native.first, native.second, true)
+                        w.withBuffer { WindowBridge.nativeSetScreen(it, sw, sh, native.first, native.second, true) }
                     }
                     row.setSummary(sizeLabel(machine))
                     showSpecs(machine)
@@ -120,7 +121,13 @@ class HomeScreen(
         val vsync = Ui.switchRow(ctx, "Limit to screen refresh",
             "Fullscreen games draw one frame per refresh of the phone's screen. Smoother and cooler. Off: games choose, and may draw frames nobody sees.",
             HwGpu.vsync(ctx)) { on -> HwGpu.setVsync(ctx, on) }
-        return Ui.section(ctx, "Display", row, vsync)
+        val cool = Ui.switchRow(ctx, "Keep the phone cool",
+            "When the phone gets hot, the screen drops to 60 Hz until it cools down. Off: it only says so.",
+            prefs.getBoolean(GameSettings.KEEP_COOL, true)) { on ->
+            prefs.edit().putBoolean(GameSettings.KEEP_COOL, on).apply()
+            GameSettings.onChange?.invoke()
+        }
+        return Ui.section(ctx, "Display", row, vsync, cool)
     }
 
     private fun sizeLabel(machine: Machine) =
@@ -246,6 +253,19 @@ class HomeScreen(
     private fun fillDirect3d() {
         val box = direct3dBox ?: return
         box.removeAllViews()
+        // Desktop always stays on the built-in DXVK-Sarek (shown, not changeable).
+        box.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = ctx.dp(64)
+            setPadding(ctx.dp(20), ctx.dp(6), ctx.dp(20), ctx.dp(6))
+            setBackgroundColor(themeColor(M.attr.colorSurfaceContainer))
+            addView(Ui.column(ctx,
+                Ui.text(ctx, M.attr.textAppearanceBodyLarge, value = "Desktop: ${HwGpu.DXVK_SHIPPED_NAME}, built in"),
+                Ui.text(ctx, M.attr.textAppearanceBodyMedium, M.attr.colorOnSurfaceVariant,
+                    "Phone's own driver, no add-ons"),
+            ), LinearLayout.LayoutParams(0, Ui.WRAP, 1f))
+        }, LinearLayout.LayoutParams(Ui.MATCH, Ui.WRAP))
         val choice = HwGpu.dxvkChoice(ctx)
         for (d in HwGpu.dxvkList(ctx)) {
             box.addView(LinearLayout(ctx).apply {
@@ -255,18 +275,18 @@ class HomeScreen(
                 setPadding(ctx.dp(20), ctx.dp(6), ctx.dp(8), ctx.dp(6))
                 setBackgroundColor(themeColor(M.attr.colorSurfaceContainer))
                 addView(Ui.column(ctx,
-                    Ui.text(ctx, M.attr.textAppearanceBodyLarge, value = d.name),
+                    Ui.text(ctx, M.attr.textAppearanceBodyLarge, value = "Games: ${d.name}"),
                     Ui.text(ctx, M.attr.textAppearanceBodyMedium, M.attr.colorOnSurfaceVariant,
-                        "Direct3D. " + if (d.builtIn) "The version the app ships." else "Added from a file."),
+                        if (d.builtIn) "Default for games (built in)." else "Added from a file. Only affects games."),
                 ), LinearLayout.LayoutParams(0, Ui.WRAP, 1f).apply { marginEnd = ctx.dp(8) })
                 addView(Ui.switch(ctx, d.id == choice) { on ->
                     if (on && d.id != choice) {
                         HwGpu.useDxvk(ctx, d.id)
                         HwGpu.restart()
-                        if (HwGpu.running) setStatus("Direct3D now uses ${d.name}. Programs using it need to start again.")
+                        if (HwGpu.running) setStatus("Games now use ${d.name}. Desktop stays on ${HwGpu.DXVK_SHIPPED_NAME}.")
                     }
                     post { fillDirect3d() }
-                }.apply { contentDescription = "${d.name} on" })
+                }.apply { contentDescription = "Games ${d.name} on" })
                 if (d.builtIn) addView(View(ctx), LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
                 else addView(Ui.iconButton(ctx, R.drawable.ic_close, "Remove ${d.name}") {
                     MaterialAlertDialogBuilder(ctx)
@@ -346,16 +366,11 @@ class HomeScreen(
 
     private fun input() = Ui.section(ctx, "Touch and mouse",
         Ui.switchRow(ctx, "Trackpad mode",
-            "The screen works as a laptop touchpad: tap to click, tap and drag, two fingers to scroll, pinch to zoom. " +
+            "The screen works as a laptop touchpad that moves the mouse, in games too: tap to click, tap and drag, two fingers to scroll. " +
                 "Off: it is a touch screen.",
             prefs.getBoolean(MainActivity.TRACKPAD, false)) { on ->
             prefs.edit().putBoolean(MainActivity.TRACKPAD, on).apply()
             VsockInput.touchMode = if (on) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
-        },
-        Ui.row(ctx, "Game mouse", "Games that hide the pointer get raw mouse movement. Ctrl + Alt lets the mouse go."),
-        Ui.segmented(ctx, listOf("Automatic", "Always", "Never"),
-            MainActivity.GAME_MOUSE_MODES.indexOf(prefs.getString(MainActivity.GAME_MOUSE, "auto")).coerceAtLeast(0)) { i ->
-            prefs.edit().putString(MainActivity.GAME_MOUSE, MainActivity.GAME_MOUSE_MODES[i]).apply()
         },
         Ui.switchRow(ctx, "Rumble", "Games' rumble reaches the controllers, and the phone as set below. Off: no rumble at all.",
             prefs.getBoolean(GamepadInput.RUMBLE, true)) { on ->
@@ -376,7 +391,7 @@ class HomeScreen(
             prefs.edit().putString(GamepadInput.PLAYER1, if (i == 1) "ds4" else "xbox").apply()
             GamepadInput.player1Changed()
         },
-        Ui.row(ctx, "Mouse speed in games", "For high-resolution mice. 1x is the mouse's own counts."),
+        Ui.row(ctx, "Mouse speed", "The trackpad and a plugged-in mouse. 1x is a mouse's own counts."),
         Ui.slider(ctx, 0.25f, 4f, 0.25f, prefs.getFloat(MainActivity.GAME_SPEED, 1f), { "%.2fx".format(it) }) { v ->
             prefs.edit().putFloat(MainActivity.GAME_SPEED, v).apply()
             VsockInput.gameSpeed = v
@@ -428,25 +443,38 @@ class HomeScreen(
             prefs.edit().putBoolean(MainActivity.BOOT_ON_LAUNCH, it == 1).apply()
         }))
 
-    private fun advanced(running: Boolean): View {
+    private fun advanced(running: Boolean, machine: Machine): View {
         val rows = mutableListOf<View>(
             Ui.row(ctx, "Logs", "What the virtual machine printed while starting.", Ui.chevron(ctx)) { actions.showLogs() },
         )
-        if (running) rows += Ui.row(ctx, "Force stop", "Turns Windows off at once, like pulling the plug.", Ui.chevron(ctx)) {
-            MaterialAlertDialogBuilder(ctx)
-                .setTitle("Force stop Windows?")
-                .setMessage("Anything not saved in Windows is lost. Use Shut down when Windows still responds.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Force stop") { _, _ -> actions.forceStop() }
-                .show()
+        if (running) {
+            rows += Ui.row(ctx, "Force stop", "Turns Windows off at once, like pulling the plug.", Ui.chevron(ctx)) {
+                MaterialAlertDialogBuilder(ctx)
+                    .setTitle("Force stop Windows?")
+                    .setMessage("Anything not saved in Windows is lost. Use Shut down when Windows still responds.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Force stop") { _, _ -> actions.forceStop() }
+                    .show()
+            }
+        } else {
+            rows += Ui.row(
+                ctx,
+                "Update Windows drivers",
+                if (MachinePrep.guestNeedsPatch(ctx, machine)) "An update from this version of HyperWin is ready."
+                else "Reapply HyperWin drivers and tools to Windows before starting.",
+                Ui.chevron(ctx),
+            ) { actions.updateGuestDrivers() }
+            rows += Ui.row(ctx, "Reinstall Windows", "Builds a fresh Windows from an ISO. The current one is erased when the new one is ready.", Ui.chevron(ctx)) {
+                MaterialAlertDialogBuilder(ctx)
+                    .setTitle("Reinstall Windows?")
+                    .setMessage("You will choose an ISO and settings again. Your current Windows, with its files and programs, is erased once the new one is ready.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Continue") { _, _ -> actions.reinstall() }
+                    .show()
+            }
         }
-        else rows += Ui.row(ctx, "Reinstall Windows", "Builds a fresh Windows from an ISO. The current one is erased when the new one is ready.", Ui.chevron(ctx)) {
-            MaterialAlertDialogBuilder(ctx)
-                .setTitle("Reinstall Windows?")
-                .setMessage("You will choose an ISO and settings again. Your current Windows, with its files and programs, is erased once the new one is ready.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Continue") { _, _ -> actions.reinstall() }
-                .show()
+        if (Updater.enabled(ctx)) rows += Ui.row(ctx, "Check for updates", "HyperWin ${Updater.current(ctx)}", Ui.chevron(ctx)) {
+            (ctx as? android.app.Activity)?.let { Updater.check(it, manual = true) }
         }
         return Ui.section(ctx, "Advanced", *rows.toTypedArray())
     }

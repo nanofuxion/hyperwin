@@ -96,6 +96,7 @@ static void run_synced(PKSYNCHRONIZE_ROUTINE routine, PVOID context)
     KeReleaseSpinLock(&g_isr_lock, irql);
 }
 
+static KSPIN_LOCK g_mdl_lock;
 #include "hwdisplay.inc"
 
 static BOOLEAN g_w2;   /* Parameters\\Wddm2 */
@@ -146,7 +147,6 @@ static void report(const WCHAR *what, ULONG value)
     if (!NT_SUCCESS(ZwCreateKey(&key, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp))) return;
     RtlInitUnicodeString(&name, (PWSTR)what);
     ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof value);
-    ZwFlushKey(key);   /* a crash right after must not lose it */
     ZwClose(key);
 }
 
@@ -262,6 +262,7 @@ static void diag_write(void)
     report(L"T_SyncRuns", g_diag.sync_runs);
     report(L"T_SyncFallbacks", g_sync_fallbacks);
     report(L"T_Vsyncs", d.vsyncs);
+    report(L"T_CurHz", d.cur_hz);
     report(L"T_Presents", d.presents);
     report(L"T_SourceSets", d.source_sets);
     for (int i = 0; i < 4; i++) {
@@ -277,6 +278,7 @@ static void diag_write(void)
 static VOID NTAPI guard_thread(PVOID context)
 {
     (void)context;
+    if (d.on) hwd_calibrate_vsync();
     LONGLONG left = d.on ? 1200000000LL : 100000000LL;
     for (;;) {
         LARGE_INTEGER wait;
@@ -513,6 +515,10 @@ static NTSTATUS esc_unmap(struct hww_map *m)
     return STATUS_INVALID_PARAMETER;
 }
 
+static volatile ULONG g_bp_mask, g_bp_total, g_bp_null_h;
+static UCHAR *g_gdi_chunk;
+#define HWW_GDI_CHUNK_BYTES (64 * 1024)
+
 static NTSTATUS NTAPI HwEscape(const HANDLE hAdapter, const DXGKARG_ESCAPE *arg)
 {
     tr("Escape");
@@ -598,6 +604,168 @@ static NTSTATUS NTAPI HwEscape(const HANDLE hAdapter, const DXGKARG_ESCAPE *arg)
         st = STATUS_SUCCESS;
         break;
     }
+    case HWW_ESC_GDI_COPY: {
+        struct hww_gdi_copy *gc = &e->u.gdi;
+        gc->copied = 0;
+        gc->width = gc->height = gc->map_pages = gc->px0 = gc->px1 = 0;
+        gc->nmap = (uint32_t)hwd_nmap;
+        DXGKARGCB_GETHANDLEDATA gh;
+        RtlZeroMemory(&gh, sizeof gh);
+        gh.hObject = (D3DKMT_HANDLE)gc->halloc;
+        gh.Type = DXGK_HANDLE_ALLOCATION;
+        struct hwd_alloc *al = (struct hwd_alloc *)g.dxgk.DxgkCbGetHandleData(&gh);
+        if (!al || al->a.magic != HWW_ALLOC_MAGIC) {
+            st = STATUS_INVALID_HANDLE;
+            break;
+        }
+        gc->width = al->a.width;
+        gc->height = al->a.height;
+        SIZE_T want = (SIZE_T)al->a.width * (SIZE_T)al->a.height * 4;
+        if (want > gc->dst_size) want = gc->dst_size;
+        if (!g_gdi_chunk || !want || !gc->dst_user) {
+            st = STATUS_SUCCESS;
+            break;
+        }
+        PVOID dst = (PVOID)(ULONG_PTR)gc->dst_user;
+        __try {
+            ProbeForWrite(dst, want, 1);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            st = GetExceptionCode();
+            break;
+        }
+        SIZE_T done = 0;
+        PMDL first_mdl = NULL;
+        st = STATUS_SUCCESS;
+        /* Fast hash check: if caller supplies prev_hash (flags & 1), hash the MDL in 64 KB chunks
+         * without touching g_gdi_chunk or dst_user; skip the entire copy when unchanged. */
+        if (gc->flags & 1u) {
+            uint64_t prev_hash = gc->hash;
+            uint64_t h0 = 0x9e3779b97f4a7c15ull, h1 = 0xbf58476d1ce4e5b9ull;
+            uint64_t h2 = 0x94d049bb133111ebull, h3 = 0x517cc1b727220a95ull;
+            SIZE_T hpos = 0;
+            BOOLEAN ok = TRUE;
+            while (hpos < want) {
+                KIRQL irql;
+                KeAcquireSpinLock(&g_mdl_lock, &irql);
+                PMDL mdl = al->mdl;
+                ULONG mpage = al->mdl_page;
+                ULONG mpages = al->map_pages;
+                if (!mdl || !mpages || (first_mdl && mdl != first_mdl)) {
+                    KeReleaseSpinLock(&g_mdl_lock, irql);
+                    ok = FALSE;
+                    break;
+                }
+                first_mdl = mdl;
+                gc->map_pages = mpages;
+                SIZE_T mdl_bytes = MmGetMdlByteCount(mdl);
+                SIZE_T base_off = (SIZE_T)mpage * PAGE_SIZE;
+                SIZE_T avail = (SIZE_T)mpages * PAGE_SIZE;
+                if (base_off >= mdl_bytes) {
+                    KeReleaseSpinLock(&g_mdl_lock, irql);
+                    ok = FALSE;
+                    break;
+                }
+                if (avail > mdl_bytes - base_off) avail = mdl_bytes - base_off;
+                if (want > avail) want = avail;
+                PVOID va = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+                if (!va) {
+                    KeReleaseSpinLock(&g_mdl_lock, irql);
+                    ok = FALSE;
+                    break;
+                }
+                SIZE_T chunk = want - hpos;
+                if (chunk > HWW_GDI_CHUNK_BYTES) chunk = HWW_GDI_CHUNK_BYTES;
+                const uint64_t *p64 = (const uint64_t *)((const UCHAR *)va + base_off + hpos);
+                SIZE_T n64 = chunk >> 3;
+                SIZE_T i = 0;
+                for (; i + 4 <= n64; i += 4) {
+                    h0 = (h0 + p64[i]) ^ (h0 >> 17);
+                    h1 = (h1 + p64[i + 1]) ^ (h1 >> 19);
+                    h2 = (h2 + p64[i + 2]) ^ (h2 >> 23);
+                    h3 = (h3 + p64[i + 3]) ^ (h3 >> 29);
+                }
+                for (; i < n64; i++) h0 = (h0 + p64[i]) ^ (h0 >> 17);
+                KeReleaseSpinLock(&g_mdl_lock, irql);
+                hpos += chunk;
+            }
+            if (ok) {
+                uint64_t h = (h0 ^ (h1 * 0x9e3779b97f4a7c15ull)) ^ ((h2 * 0xbf58476d1ce4e5b9ull) ^ (h3 * 0x94d049bb133111ebull));
+                gc->hash = h;
+                if (h == prev_hash) {
+                    gc->copied = 0;
+                    break;
+                }
+            }
+            first_mdl = NULL;
+        }
+        uint64_t oh0 = 0x9e3779b97f4a7c15ull, oh1 = 0xbf58476d1ce4e5b9ull;
+        uint64_t oh2 = 0x94d049bb133111ebull, oh3 = 0x517cc1b727220a95ull;
+        while (done < want) {
+            KIRQL irql;
+            KeAcquireSpinLock(&g_mdl_lock, &irql);
+            PMDL mdl = al->mdl;
+            ULONG mpage = al->mdl_page;
+            ULONG mpages = al->map_pages;
+            if (!mdl || !mpages || (first_mdl && mdl != first_mdl)) {
+                if (!done) {
+                    gc->px0 = g_bp_mask;
+                    gc->px1 = (g_bp_total << 16) | (g_bp_null_h & 0xffff);
+                }
+                KeReleaseSpinLock(&g_mdl_lock, irql);
+                done = 0;
+                break;
+            }
+            first_mdl = mdl;
+            gc->map_pages = mpages;
+            SIZE_T mdl_bytes = MmGetMdlByteCount(mdl);
+            SIZE_T base_off = (SIZE_T)mpage * PAGE_SIZE;
+            SIZE_T avail = (SIZE_T)mpages * PAGE_SIZE;
+            if (base_off >= mdl_bytes) {
+                KeReleaseSpinLock(&g_mdl_lock, irql);
+                done = 0;
+                break;
+            }
+            if (avail > mdl_bytes - base_off) avail = mdl_bytes - base_off;
+            if (want > avail) want = avail;
+            PVOID va = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+            if (!va) {
+                KeReleaseSpinLock(&g_mdl_lock, irql);
+                st = STATUS_INSUFFICIENT_RESOURCES;
+                done = 0;
+                break;
+            }
+            SIZE_T chunk = want - done;
+            if (chunk > HWW_GDI_CHUNK_BYTES) chunk = HWW_GDI_CHUNK_BYTES;
+            const UCHAR *src = (const UCHAR *)va + base_off + done;
+            RtlCopyMemory(g_gdi_chunk, src, chunk);
+            if (done == 0) {
+                if (chunk >= 4) gc->px0 = *(const uint32_t *)g_gdi_chunk;
+                if (chunk >= 8) gc->px1 = *(const uint32_t *)(g_gdi_chunk + 4);
+            }
+            KeReleaseSpinLock(&g_mdl_lock, irql);
+            const uint64_t *p64 = (const uint64_t *)g_gdi_chunk;
+            SIZE_T n64 = chunk >> 3;
+            SIZE_T i = 0;
+            for (; i + 4 <= n64; i += 4) {
+                oh0 = (oh0 + p64[i]) ^ (oh0 >> 17);
+                oh1 = (oh1 + p64[i + 1]) ^ (oh1 >> 19);
+                oh2 = (oh2 + p64[i + 2]) ^ (oh2 >> 23);
+                oh3 = (oh3 + p64[i + 3]) ^ (oh3 >> 29);
+            }
+            for (; i < n64; i++) oh0 = (oh0 + p64[i]) ^ (oh0 >> 17);
+            __try {
+                RtlCopyMemory((UCHAR *)dst + done, g_gdi_chunk, chunk);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                st = GetExceptionCode();
+                done = 0;
+                break;
+            }
+            done += chunk;
+        }
+        gc->hash = (oh0 ^ (oh1 * 0x9e3779b97f4a7c15ull)) ^ ((oh2 * 0xbf58476d1ce4e5b9ull) ^ (oh3 * 0x94d049bb133111ebull));
+        gc->copied = (uint32_t)done;
+        break;
+    }
     }
     ExReleaseFastMutex(&g.lock);
     e->status = st;
@@ -665,6 +833,14 @@ static VOID NTAPI poll_timer(PEX_TIMER timer, PVOID context)
         if (!done.used) break;
         complete_fence(done.fence_id, done.node, done.engine);
     }
+}
+
+static KDPC g_done_dpc;
+
+static VOID NTAPI done_dpc_fn(PKDPC dpc, PVOID ctx, PVOID a1, PVOID a2)
+{
+    (void)dpc; (void)ctx; (void)a1; (void)a2;
+    poll_timer(g.timer, NULL);
 }
 
 static void start_polling(void)
@@ -741,6 +917,8 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     ExInitializeFastMutex(&g.lock);
     KeInitializeSpinLock(&g.pending_lock);
     KeInitializeSpinLock(&g_isr_lock);
+    KeInitializeSpinLock(&g_mdl_lock);
+    if (!g_gdi_chunk) g_gdi_chunk = ExAllocatePoolWithTag(NonPagedPoolNx, HWW_GDI_CHUNK_BYTES, 'gCwH');
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = (LONGLONG)(HW_WINDOW_PA + HWGPU_RING_OFF);
     g.ring = MmMapIoSpace(pa, HWGPU_RING_BYTES, MmCached);
@@ -749,6 +927,7 @@ static NTSTATUS NTAPI HwStartDevice(CONST PVOID ctx, PDXGK_START_INFO info, PDXG
     if (!g.ring) return STATUS_INSUFFICIENT_RESOURCES;
     g.epoch = hwgpu_ring_valid(window()) ? hwgpu_hdr(window())->epoch : 0;
     g.timer = ExAllocateTimer(poll_timer, NULL, EX_TIMER_HIGH_RESOLUTION);
+    KeInitializeDpc(&g_done_dpc, done_dpc_fn, NULL);
     guard_start();
     if (!g_notify_set) {
         NTSTATUS ns = PsSetCreateProcessNotifyRoutine(process_notify, FALSE);
@@ -948,7 +1127,21 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->SchedulingCaps.MultiEngineAware = 1;
     caps->SchedulingCaps.PreemptionAware = 1;
     caps->PresentationCaps.SupportKernelModeCommandBuffer = 1;
+    /* DEBUG (DWM investigation): Parameters PresCapsOr / PresCapsClear change the presentation caps without a rebuild.
+     * DriverSupportsCddDwmInterop (bit 8) and SupportSoftwareDeviceBitmaps (bit 16) are the ones that let Windows
+     * keep a window's redirection bitmap as a CPU-visible DX surface when there is no GDI hardware acceleration. */
+    caps->PresentationCaps.Value |= hwd_reg_dword(L"PresCapsOr", 0);
+    caps->PresentationCaps.Value &= ~hwd_reg_dword(L"PresCapsClear", 0);
+    report(L"D_PresCaps", caps->PresentationCaps.Value);
     caps->ApertureSegmentCommitLimit = (SIZE_T)HW_HEAP_SIZE;
+    if (d.on) {
+        /* The pointer has a layer of its own on the phone (hwdisplay.inc). */
+        caps->MaxPointerWidth = HWGPU_POINTER_MAX;
+        caps->MaxPointerHeight = HWGPU_POINTER_MAX;
+        caps->PointerCaps.Monochrome = 1;
+        caps->PointerCaps.Color = 1;
+        caps->PointerCaps.MaskedColor = 1;
+    }
     caps->WDDMVersion = DXGKDDI_WDDMv1_3;
     if (g_w2) {
         caps->WDDMVersion = DXGKDDI_WDDMv2;
@@ -975,10 +1168,13 @@ static NTSTATUS query_caps(DXGK_DRIVERCAPS *caps, ULONG size)
     caps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps->PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps->SupportNonVGA = FALSE;
-    if (d.on) {
-        /* Flips: the new address is taken at once and reported at the next vsync. Without these
-         * caps DWM made a primary, set it as the screen's and gave it up again, over and over. */
-        /* (no FlipCaps: flips then go through DxgkDdiPresent as DMA buffers, which need no interrupt level) */
+    if (d.on && hwd_reg_dword(L"FlipCaps", 1)) {
+        /* With ACPI\HWGP0001 connected to GSIV 63, DxgkCbSynchronizeExecution succeeds and
+         * HwdSetVidPnSourceAddress runs cleanly at DIRQL for VSync/Immediate/Independent flips. */
+        caps->FlipCaps.FlipOnVSyncMmIo = 1;
+        caps->FlipCaps.FlipImmediateMmIo = 1;
+        caps->FlipCaps.FlipIndependent = 1;
+        caps->MaxQueuedFlipOnVSync = 1;
     }
     return STATUS_SUCCESS;
 }
@@ -997,7 +1193,7 @@ static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
             RtlZeroMemory(d, sizeof *d);
             d->Flags.Aperture = 1;
             d->Flags.CacheCoherent = 1;
-            d->Flags.CpuVisible = 1;
+            d->Flags.CpuVisible = hwd_reg_dword(L"ApertureCpuVis", 1) ? 1 : 0;
             d->Size = (SIZE_T)HW_HEAP_SIZE;
             d->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
         }
@@ -1015,7 +1211,7 @@ static NTSTATUS query_segments(UINT type, const DXGKARG_QUERYADAPTERINFO *qai)
         RtlZeroMemory(d, sizeof *d);
         d->Flags.Aperture = 1;
         d->Flags.CacheCoherent = 1;
-        d->Flags.CpuVisible = 1;
+        d->Flags.CpuVisible = hwd_reg_dword(L"ApertureCpuVis", 1) ? 1 : 0;
         d->Size = (SIZE_T)HW_HEAP_SIZE;
         d->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
     }
@@ -1037,7 +1233,7 @@ static NTSTATUS query_segments4(const DXGKARG_QUERYADAPTERINFO *qai)
         RtlZeroMemory(d4, sizeof *d4);
         d4->Flags.Aperture = 1;
         d4->Flags.CacheCoherent = 1;
-        d4->Flags.CpuVisible = 1;
+        d4->Flags.CpuVisible = hwd_reg_dword(L"ApertureCpuVis", 1) ? 1 : 0;
         d4->Size = (SIZE_T)HW_HEAP_SIZE;
         d4->CommitLimit = (SIZE_T)HW_HEAP_SIZE;
     }
@@ -1201,7 +1397,30 @@ static NTSTATUS NTAPI HwCloseAllocation(const HANDLE hDevice, const DXGKARG_CLOS
     }
 NOTSUP(HwDescribeAllocation, "Describe")
 NOTSUP(HwGetStandardData, "StdData")
-NOTSUP(HwRenderDdi, "Render")
+static NTSTATUS NTAPI HwRenderDdi(const HANDLE hContext, DXGKARG_RENDER *r)
+{
+    (void)hContext;
+    tr("Render");
+    if (r->DmaSize >= 16) {
+        RtlZeroMemory(r->pDmaBuffer, 16);
+        r->pDmaBuffer = (UCHAR *)r->pDmaBuffer + 16;
+    }
+    if (r->pDmaBufferPrivateData && r->DmaBufferPrivateDataSize >= sizeof(struct hww_marker)) {
+        RtlZeroMemory(r->pDmaBufferPrivateData, sizeof(struct hww_marker));
+        r->pDmaBufferPrivateData = (UCHAR *)r->pDmaBufferPrivateData + sizeof(struct hww_marker);
+    }
+    if (r->pPatchLocationListIn && r->PatchLocationListInSize && r->pPatchLocationListOut && r->PatchLocationListOutSize) {
+        UINT n = r->PatchLocationListInSize;
+        if (n > r->PatchLocationListOutSize) n = r->PatchLocationListOutSize;
+        for (UINT i = 0; i < n; i++) {
+            *r->pPatchLocationListOut = r->pPatchLocationListIn[i];
+            r->pPatchLocationListOut->PatchOffset = 0;
+            r->pPatchLocationListOut->SplitOffset = 0;
+            r->pPatchLocationListOut++;
+        }
+    }
+    return STATUS_SUCCESS;
+}
 NOTSUP(HwPresentDdi, "Present")
 NOTSUP(HwRenderKmDdi, "RenderKm")
 
@@ -1218,7 +1437,39 @@ static NTSTATUS NTAPI HwBuildPagingBuffer(const HANDLE hAdapter, DXGKARG_BUILDPA
 {
     tr("BuildPaging");
     (void)hAdapter;
-    (void)pb;
+    InterlockedIncrement((volatile LONG *)&g_bp_total);
+    g_bp_mask |= (1u << ((ULONG)pb->Operation & 31));
+    /* Window bitmaps (SupportSoftwareDeviceBitmaps): their pages are ordinary system memory the phone cannot see, so
+     * the driver remembers the MDL each one is mapped with and copies it on request (HWW_ESC_GDI_COPY). */
+    InterlockedIncrement(&hwd_nops[(ULONG)pb->Operation & 15]);
+    if (pb->Operation == DXGK_OPERATION_MAP_APERTURE_SEGMENT) {
+        if (!pb->MapApertureSegment.hAllocation) {
+            InterlockedIncrement((volatile LONG *)&g_bp_null_h);
+        } else {
+            struct hwd_alloc *al = (struct hwd_alloc *)pb->MapApertureSegment.hAllocation;
+            if (al->a.kind != HWW_ALLOC_UMD) {
+                KIRQL irql;
+                KeAcquireSpinLock(&g_mdl_lock, &irql);
+                al->mdl = pb->MapApertureSegment.pMdl;
+                al->mdl_page = pb->MapApertureSegment.MdlOffset;
+                al->map_page = (ULONG)pb->MapApertureSegment.OffsetInPages;
+                al->map_pages = (ULONG)pb->MapApertureSegment.NumberOfPages;
+                KeReleaseSpinLock(&g_mdl_lock, irql);
+                InterlockedIncrement(&hwd_nmap);
+                hwd_maplast = (al->map_pages << 8) | (al->mdl_page & 0xff) | (pb->MapApertureSegment.SegmentId << 28);
+            }
+        }
+    } else if (pb->Operation == DXGK_OPERATION_UNMAP_APERTURE_SEGMENT && pb->UnmapApertureSegment.hAllocation) {
+        struct hwd_alloc *al = (struct hwd_alloc *)pb->UnmapApertureSegment.hAllocation;
+        if (al->a.kind != HWW_ALLOC_UMD) {
+            KIRQL irql;
+            KeAcquireSpinLock(&g_mdl_lock, &irql);
+            al->mdl = NULL;
+            al->map_pages = 0;
+            KeReleaseSpinLock(&g_mdl_lock, irql);
+            InterlockedIncrement(&hwd_nunmap);
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1260,8 +1511,12 @@ static NTSTATUS NTAPI HwSubmitCommand(const HANDLE hAdapter, const DXGKARG_SUBMI
     }
     KeReleaseSpinLock(&g.pending_lock, irql);
     if (queued) {
-        if (marker) g.counters.marker_submits++;
-        start_polling();
+        if (marker) {
+            g.counters.marker_submits++;
+            start_polling();
+        } else {
+            KeInsertQueueDpc(&g_done_dpc, NULL, NULL);
+        }
         return STATUS_SUCCESS;
     }
     complete_fence(sc->SubmissionFenceId, sc->NodeOrdinal, sc->EngineOrdinal);

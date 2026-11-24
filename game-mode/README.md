@@ -6,12 +6,21 @@ choice. The result is steadier frame times, not higher peaks.
 
 ## Where it stands
 
-- The manifest has no `appCategory`, and there's no game mode config.
-- Nothing tells Android how long frames take, so CPU speeds follow load slowly.
-- Thermal state isn't checked. When the phone gets hot, it throttles without
-  warning and frame times jump.
-- The app has no foreground service. The audio plan needs one for the
-  microphone anyway.
+Built 2026-11-22, not yet tried on the phone (nothing measured yet):
+
+- `android:appCategory="game"` and `res/xml/game_mode_config.xml` are in the manifest.
+- `GameSettings.kt` reads the Game Dashboard mode. Battery mode, or a hot phone with "Keep the
+  phone cool" on (Display settings, on by default), asks for a 60 Hz display mode at the same
+  size. Otherwise the fastest one. Checked on start, on resume and when the heat changes.
+- Loading state: on when Windows starts, off at the first desktop frame (`onLive`).
+- Heat: `addThermalStatusListener` plus `getThermalHeadroom(10)` on each change, while the
+  Windows screen is up. Hot is SEVERE or headroom over 0.85. Cool again at LIGHT and under 0.7.
+  A toast says "Phone is hot, limiting to 60 fps".
+- ADPF: one hint session on the app's frame thread (`hyperwin-frame-ring`), target one
+  refresh, each `nativePresent` pass reported, power efficient while capped (API 35).
+- Not done: hint sessions in `:gpu`/`:games` (gfxstream render and scanout threads, NDK
+  `APerformanceHint`), and the polling of headroom every few seconds.
+- The foreground service exists already (`WindowsService`).
 
 The biggest CPU users, Windows' vCPU threads, belong to crosvm, not to the app.
 Android's hint APIs only accept the app's own threads, so they can't boost the

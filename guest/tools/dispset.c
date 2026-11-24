@@ -12,21 +12,35 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) return 2;
     int w = argc > 3 ? atoi(argv[2]) : 0, h = argc > 3 ? atoi(argv[3]) : 0;
+    int hz = argc > 4 ? atoi(argv[4]) : 0;
     char found[32];
     if (!strcmp(argv[1], "auto")) {
         found[0] = 0;
         for (int t = 0; t < 45 && !found[0]; t++) {
             DISPLAY_DEVICEA a = {sizeof a};
-            for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &a, 0); i++)
-                if (strstr(a.DeviceString, "HyperWin screen")) { strncpy(found, a.DeviceName, sizeof found - 1); found[sizeof found - 1] = 0; }
+            char fallback[32] = {0};
+            for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &a, 0); i++) {
+                if (strstr(a.DeviceString, "HyperWin GPU")) {
+                    strncpy(found, a.DeviceName, sizeof found - 1);
+                    found[sizeof found - 1] = 0;
+                    break;
+                }
+                if (!fallback[0] && strstr(a.DeviceString, "HyperWin screen")) {
+                    strncpy(fallback, a.DeviceName, sizeof fallback - 1);
+                    fallback[sizeof fallback - 1] = 0;
+                }
+            }
+            if (!found[0] && fallback[0]) strcpy(found, fallback);
             if (!found[0]) Sleep(2000);
         }
         if (!found[0]) return 3;
         argv[1] = found;
-        DEVMODEA m = {0};
-        m.dmSize = sizeof m;
-        if (!EnumDisplaySettingsA(found, 0, &m)) return 4;
-        w = (int)m.dmPelsWidth; h = (int)m.dmPelsHeight;
+        if (w <= 0 || h <= 0) {
+            DEVMODEA m = {0};
+            m.dmSize = sizeof m;
+            if (!EnumDisplaySettingsA(found, 0, &m)) return 4;
+            w = (int)m.dmPelsWidth; h = (int)m.dmPelsHeight;
+        }
     }
     if (w <= 0 || h <= 0) return 2;
     DISPLAY_DEVICEA dd = {sizeof dd};
@@ -38,8 +52,12 @@ int main(int argc, char **argv)
         if (!strcmp(dd.DeviceName, argv[1])) {
             dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION | DM_BITSPERPEL;
             dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmBitsPerPel = 32;
+            if (hz > 0) {
+                dm.dmFields |= DM_DISPLAYFREQUENCY;
+                dm.dmDisplayFrequency = (DWORD)hz;
+            }
             r = ChangeDisplaySettingsExA(dd.DeviceName, &dm, NULL, CDS_UPDATEREGISTRY | CDS_NORESET | CDS_SET_PRIMARY, NULL);
-            printf("%s primary %dx%d: %ld\n", dd.DeviceName, w, h, r);
+            printf("%s primary %dx%d@%dHz: %ld\n", dd.DeviceName, w, h, hz, r);
         } else {
             dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
             r = ChangeDisplaySettingsExA(dd.DeviceName, &dm, NULL, CDS_UPDATEREGISTRY | CDS_NORESET, NULL);

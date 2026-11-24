@@ -136,6 +136,30 @@ Not checked yet, needing a physical mouse or two hands: captured movement from
 a real mouse, a shooter turning 360°, two-finger gestures, capture in split
 screen, and how fast a high-rate mouse goes.
 
+## Goal now: no separate "game mouse" (2026-11-23)
+
+The aim is a mouse that needs no mode. Every pointer on the phone works in games and on the
+desktop without a button to press. What changed in the app, not yet committed:
+
+- **The trackpad is a relative mouse.** `VsockInput.trackpad` sends movement as mouse counts
+  (message 4), with the fraction carried to the next event. Taps, tap and drag, and two finger
+  scroll go the same way. Phone pixels are scaled to Windows pixels, so one drag across the view
+  crosses Windows' screen. Games that hide the cursor still turn with it. The Precision Touchpad
+  path (`HidInput.pad`) is no longer used for this mode.
+- **Automatic capture is gone.** It held the mouse whenever a game hid the cursor, and kept
+  holding it after the game closed. The agent's cursor report is no longer needed for this.
+
+Still to do before the toolbar's "Game mouse" button and the Automatic/Always/Never setting can
+go:
+
+1. A real mouse on the phone: does `SOURCE_MOUSE` without capture reach games as relative
+   counts? If not, capture only the real mouse, not touch, and release it when the app loses focus.
+2. Remove the button, the setting, the `GAME_MOUSE` keys and the Ctrl + Alt chord, or keep the
+   chord as a plain way to free a stuck mouse.
+3. Test a shooter turning 360° with the trackpad, and the desktop with a touchpad and a mouse.
+4. Decide what happens to Windows' own touchpad gestures. The trackpad no longer gives three and
+   four finger swipes. Either send them as keys, or keep an option for the old Precision Touchpad.
+
 ## Phases
 
 1. Message 4 in the app and driver, with a manual toggle. Test: a raw-input

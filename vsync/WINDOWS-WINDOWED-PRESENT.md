@@ -1,0 +1,28 @@
+# Windows windowed VSync on HyperWin
+
+Research note for later investigation, 2026-11-23. Applies to AIO's windowed D3D11 blt presentation path on the WDDM 1.3 guest. The previous guest trace recorded a roughly 30 ms wait for a shared window surface with sync interval 1. Interval 0 removed the wait. Changing 60 to 120 Hz did not change the old cap. The timeout is a measurement on this Windows build. The public driver contract does not specify a 30 ms timer. [HyperWin trace and settings](../d3d/README.md#speed-plan-the-full-aio-gui-the-cap-and-what-is-left)
+
+## What Windows expects to receive
+
+For a windowed blt with composition enabled, DXGI opens a shared resource that the application-side driver can draw into and DWM can sample as a texture. It asks the driver to transfer the back buffer into that destination through BltDXGI with the Present flag. The flag carries an atomicity requirement for the transfer. The shared destination is distinct from the game's back buffer. Flip-model applications have a different ownership model. [Microsoft's driver presentation path](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/dxgi-presentation-path) · [DXGI presentation models](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-flip-model)
+
+**Implication for HyperWin.** A visible game on the Android child layer proves that its back buffer reached Android. Windows still needs a composable window surface. HyperWin's experimental notify_dwm passes allocation handles to pfnPresentCb. A successful callback alone cannot establish that the destination contains the right pixels. A useful check is to correlate the destination of the present blt with the surface DWM samples, and to verify its pixels with the HUD and an ordinary GDI window overlapping the game. [HyperWin UMD](../gpu/guest/hwd3d/umd.cpp)
+
+## The aperture exception matters
+
+Microsoft describes aperture residency as mapping the allocation's backing pages. Its documentation says the segment-level CpuVisible flag generally has no meaning on an aperture. It explicitly calls out a primary allocation without an alternate virtual address as an exception, and discusses section-backed shared primaries separately. Consequently, Aperture=1, CpuVisible=1 and CpuTranslatedAddress=0 alone do **not** establish why HyperWin's lock returned E_INVALIDARG. A desktop-related bitmap can be a GDI surface without being a shared primary. [DXGK_SEGMENTFLAGS, CpuVisible and remarks](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_segmentflags)
+
+For a future gate-on test, identify the failing allocation by handle and standard allocation type; record its allocation-level flags, primary status, requested segment, actual lock flags (including UseAlternateVA), and HRESULT. Compare identical allocations before and after changing only the segment flag. Verify the returned content and row pitch with known GDI pixels even when the lock succeeds. A change in frame rate alone cannot validate this memory path.
+
+## Two other events that look like frame acknowledgements
+
+- **IDD frame processing.** IddCxSwapChainFinishedProcessingFrame tells Windows that the driver has queued the work for an acquired desktop frame. Microsoft requires it before acquiring the next one. HyperWin already calls it in its frame loop. Trace acquire, actual submission and completion result in sequence. This callback describes a composed monitor frame, whereas the DXGI wait observed in AIO concerns an individual application window. It also occurs before proof of physical display. [Microsoft callback contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/iddcx/nf-iddcx-iddcxswapchainfinishedprocessingframe) · [HyperWin IDD loop](../gpu/guest/idd/hwidd.cpp)
+- **Monitor mode updates.** IddCxMonitorUpdateModes publishes a revised monitor mode list. A fluctuating interval between two phone frames is poor evidence that the supported list changed. For a diagnostic run, hold the advertised mode stable and count mode updates, swapchain replacements and per-window timeouts separately. If replacements stop and the timeout persists, that distinguishes display churn from window pacing. [Microsoft mode-update contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/iddcx/nf-iddcx-iddcxmonitorupdatemodes)
+
+## A trace that would distinguish the causes
+
+1. Use the same foreground AIO scene and binary. Pair short interval-0 and interval-1 captures at fixed 60 Hz; repeat at 120 Hz. Record actual selected mode and thermal state.
+2. On the guest, line up AIO Present entry/return, the destination allocation and blt, DWM composition and IDD frame processing. GPUView reads graphics ETW traces and can correlate a DWM present packet with the flip queue where the driver exposes those events. Keep driver timestamps for missing events on this virtual stack. [GPUView](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/using-gpuview) · [Flip queue correlation](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpuview-flip-queue)
+3. On Android, correlate frame IDs with compositor presentation times. For sustained animation, look for distinct visible updates approximately every 16.7 ms or 8.3 ms according to mode. Count repeats and missed intervals. Verify overlapping windows, movement, Alt-Tab and exit. Removal of the old timeout and correct visible pacing are separate observations.
+
+The documented contracts support those checks. They do not establish a specific fix for the private DWM wait or for the guest lock failure. This note contains no new device measurements.

@@ -232,3 +232,89 @@ as button 1 and the stick at -0.62.
   `xinput1_4.dll` sends to the current driver.
 - Whether `Windows.Gaming.Input` and GameInput pick up an XUSB-only device, or
   need the HID twin too. That decides how many games phase 3 fixes.
+
+## Addendum (2026-11-22): touch controls as player 1, and PlayStation labels
+
+Status: noted, not started. The user asked for this to be written down, not built yet.
+
+### 1. On-screen controls don't act as the controller
+
+Reported by the user: the on-screen gamepad does not seem to reach Windows as the Xbox or
+DualShock 4 player 1.
+
+The wiring exists on paper. `InputControlsView` calls `GamepadInput.setTouchButton`,
+`setTouchTrigger` and `setTouchStick`. `GamepadInput.send` merges that touch state into slot 0
+and sends message 3 through `VsockInput.pad`. Something on the way drops it. Suspects to
+check, in order:
+
+1. **The pad only plugs in on the first press.** `setTouchActive(true)` runs only from the
+   `profile` and `editMode` setters, and only while the view is `VISIBLE`. Showing the
+   overlay from the Controls menu changes visibility without calling it. Then the first
+   `setTouchButton` turns `touchActive` on and sends "connected" with the press. Windows
+   needs a moment to plug in the USB child for `xusb22.sys` or `hwhid.sys`, so that press
+   is lost. Games that look for controllers only at start never see one.
+   Fix: call `setTouchActive` from `onVisibilityChanged` and when the overlay is shown,
+   so the pad connects when the controls appear.
+2. **Sticks may not wake it.** Check that `setTouchStick` also turns `touchActive` on,
+   as `setTouchButton` does.
+3. **Disconnect on hide.** When the overlay hides, slot 0 drops unless a real controller
+   is attached. Check that games survive the unplug, and that showing the controls
+   plugs it back in.
+4. **DualShock 4 mode.** Confirm the DualShock 4 child turns XInput bits into its
+   report 0x01 the same way for touch input as for a real pad.
+
+Test: no real controller attached. Show a gamepad profile, wait 2 s, then check `joy.cpl`
+and an XInput tester inside Windows. Repeat in DualShock 4 mode with a HID tester.
+
+### 2. PlayStation labels when player 1 is a DualShock 4
+
+When Settings → Player 1 controller is DualShock 4, the on-screen buttons should show
+PlayStation labels instead of Xbox ones. Switching back restores the Xbox labels. It swaps
+live, like the controller itself. The labels today are mixed (A, B, L1, START, BACK, HOME), so
+Xbox mode gets proper Xbox names too.
+
+| Binding | Xbox | DualShock 4 |
+| --- | --- | --- |
+| `GAMEPAD_BUTTON_A` | A | ✕ (cross) |
+| `GAMEPAD_BUTTON_B` | B | ○ (circle) |
+| `GAMEPAD_BUTTON_X` | X | □ (square) |
+| `GAMEPAD_BUTTON_Y` | Y | △ (triangle) |
+| `GAMEPAD_BUTTON_L1` / `R1` | LB / RB | L1 / R1 |
+| L2 / R2 triggers | LT / RT | L2 / R2 |
+| `GAMEPAD_BUTTON_L3` / `R3` | LS / RS | L3 / R3 |
+| `GAMEPAD_BUTTON_SELECT` | View | Share |
+| `GAMEPAD_BUTTON_START` | Menu | Options |
+| `GAMEPAD_BUTTON_GUIDE` | Xbox | PS |
+
+How:
+- `ControlElement.displayText()` picks the label from the active controller type, not a fixed
+  `shortLabel`. The binding names in `TouchBinding` stay the same, so saved profiles and
+  imported `.icp` files keep working.
+- A label the user typed (`text`) is never changed.
+- Draw the four face shapes as paths, not font characters, so they look right on every phone.
+  Optional: the usual face colors, green, red, pink and blue.
+- `GamepadInput.player1Changed()` already runs when the setting changes. It also tells the
+  overlay to redraw.
+- The same labels in the binding picker and the profile editor.
+- Use plain shapes and words only. No PlayStation or Xbox logos.
+
+## Follow-up: on-screen controller implementation (2026-11-23)
+
+Controller-aware overlay labels are now implemented. Default face buttons render Xbox
+A/B/X/Y or geometric PlayStation cross/circle/square/triangle from the Player 1 setting;
+shoulders, triggers and menu buttons follow the same setting. Custom text is preserved.
+The attached overlay listens for setting changes and redraws without changing saved bindings.
+
+The existing visibility setter already connects touch player 1 when the controls show.
+Attachment now also synchronizes that connection; detachment and window hiding release
+held inputs and disconnect the touch controller (a physical controller remains connected).
+Buttons, triggers and sticks continue through GamepadInput -> VsockInput -> hwvsinput's
+USB Xbox/xusb22 or DualShock/hwhid child, rather than keyboard emulation.
+
+Kotlin compilation passes. Live verification on Pixel 6 Pro (`1C231FDEE004NA`) diagnosed and resolved two guest-driver root causes:
+1. **`ROOT\HWVSINPUT\0000` stuck in `CM_PROB_FAILED_INSTALL` (`ConfigFlags=64`, Problem 28):** `hwvsinput.sys` created the pad bus PDO via `IoReportDetectedDevice` without a `ClassGUID`/`Class`, so Windows PnP refused to start it on subsequent boots (`u.bus == NULL`, silently dropping all physical and touch controller updates). Fixed in `gpu-install.cmd` (repairs `ROOT\HWVSINPUT\0000` by clearing `ConfigFlags=0`, setting `Class=System`/`ClassGUID`, removing `DeviceReported`, and restarting the device) and `guest/drivers/drivers.json` (pre-registers `ROOT\HWVSPAD\0000` for new VMs). Verified `ROOT\HWVSINPUT\0000` survives reboot with `Status=OK, CM_PROB_NONE`.
+2. **Live Xbox ↔ DualShock 4 switching blocked when an app held a handle:** `usbpad.c` only cleared `u.child[slot]` in `IRP_MN_REMOVE_DEVICE`, so switching kinds while a game/tester held an open handle left the old PDO in `u.child[slot]` (`CM_PROB_PHANTOM`) and permanently blocked the replacement PDO. Fixed in `usbpad.c` by moving the old child to a `u.dying` list immediately so the new PDO plugs in atomically on the same `BusRelations` invalidation.
+
+Verified end to end with actual overlay touches on Pixel 6 Pro:
+- **Connection before first press:** showing the Virtual Gamepad overlay brings up `USB\VID_045E&PID_028E` (`xusb22.sys`), `XInputGetState(0)` returns `OK`, and *A Precisely Fun Gamepad Tester* lights up green before any button is pressed.
+- **Inputs & labels:** verified buttons, triggers, and sticks via actual overlay touches in both Xbox mode (`XInputGetState(0)` / `A B X Y LB RB LT RT LS RS View Menu`) and DualShock 4 mode (`HWPAD\VID_054C&PID_09CC` / `joyGetPosEx` / geometric `✕ ○ □ △` + `L1 R1 L2 R2 L3 R3 Share Options`).

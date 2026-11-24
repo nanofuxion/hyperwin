@@ -70,10 +70,18 @@ android {
 }
 
 // The GPU renderer libraries (libhwgpu, libgfxstream_backend, libc++_shared) are built, not checked
-// in. Build them before the app when they are missing; see gpu/README.md for what the script needs.
+// in. Build them before the app when missing or older than their C++ sources; see gpu/README.md.
 val gpuHostLibs by tasks.registering(Exec::class) {
     val lib = rootProject.file("gpu/work/android/arm64-v8a/libhwgpu.so")
-    onlyIf { !lib.exists() }
+    val sources = listOf(
+        "gpu/host/hwgpu_host.cpp",
+        "gpu/host/hwgpu_host.h",
+        "gpu/host/hwgpu_jni.cpp",
+        "gpu/host/hwd3d/hwd3d.cpp",
+        "gpu/include/hwgpu_ring.h",
+        "include/hw_d3d.h",
+    ).map { rootProject.file(it) }
+    onlyIf { !lib.exists() || sources.any { it.exists() && it.lastModified() > lib.lastModified() } }
     workingDir = rootProject.projectDir
     commandLine("bash", "gpu/host/build-android.sh")
 }
@@ -83,6 +91,8 @@ dependencies {
     // Shizuku grants the two virtual machine permissions once (VmAccess.kt).
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    // AVF's custom-image and service APIs are hidden @SystemApi classes reached by reflection.
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
     // Material Design 3 widgets and dynamic colour for the setup and settings screens.
     implementation("com.google.android.material:material:1.12.0")
 }

@@ -64,6 +64,13 @@ object AvfLaunch {
         VsockInput.key(event)
     }
 
+    /** Presses the keys in order, then lets go in reverse: a shortcut such as Ctrl + Shift + Esc. */
+    fun shortcut(vararg keys: Int) {
+        val t = android.os.SystemClock.uptimeMillis()
+        for (k in keys) key(KeyEvent(t, t, KeyEvent.ACTION_DOWN, k, 0))
+        for (k in keys.reversed()) key(KeyEvent(t, t, KeyEvent.ACTION_UP, k, 0))
+    }
+
     /**
      * Sends text as guest key presses (US layout). A character with no key stops the whole text,
      * or is left out when [skipUnknown] is set, as the on-screen keyboard pass-through wants.
@@ -204,33 +211,46 @@ object AvfLaunch {
             MachinePrep.hardenBoot(ctx, machine)
             val (width, height) = if (MachinePrep.refreshLoader(ctx, machine)) machine.frameSize()
                 else AvfPlan.FRAME_WIDTH to AvfPlan.FRAME_HEIGHT
+            val custom = GuestBoot.setupImage(firmware, listOf(machine.disk))
+            val prev = sharedWindow
+            sharedWindow = null
+            prev?.close()
             val window = AvfPlan.createWindow(ByteArray(0), width, height)
-            sharedWindow?.close()
             sharedWindow = window
-            HwGpu.start(ctx, window, width, height)
-            FileShare.start(ctx, window.buffer)
-            GuestAudio.start(ctx, window.buffer)
-            UsbBridge.start(ctx, window.usbBuffer)
-            WindowsService.start(ctx)
-            startDebugTap(window, File(dir, "frame.bgra"))
-            startCppcCounter(window)
-            val report = boot(
-                ctx,
-                GuestBoot.setupImage(firmware, listOf(machine.disk)),
-                keep = true,
-                memoryMb = machine.memoryMb + AvfPlan.SHARED_MIB,
-                cpus = machine.cpuCount,
-                expect = "HYPERWIN GOP",
-                sharedWindow = window,
-                onVmStarted = onVmStarted,
-                onVmStopped = onVmStopped,
-                onConsole = onConsole,
-            )
-            if (!report.startsWith("VM running;")) {
-                sharedWindow = null
+            return try {
+                HwGpu.start(ctx, window, width, height)
+                FileShare.start(ctx, window.buffer)
+                GuestAudio.start(ctx, window.buffer)
+                UsbBridge.start(ctx, window.usbBuffer)
+                WindowsService.start(ctx)
+                startDebugTap(window, File(dir, "frame.bgra"))
+                startCppcCounter(window)
+                val report = boot(
+                    ctx,
+                    custom,
+                    keep = true,
+                    memoryMb = machine.memoryMb + AvfPlan.SHARED_MIB,
+                    cpus = machine.cpuCount,
+                    expect = "HYPERWIN GOP",
+                    sharedWindow = window,
+                    onVmStarted = onVmStarted,
+                    onVmStopped = onVmStopped,
+                    onConsole = onConsole,
+                )
+                if (!report.startsWith("VM running;")) {
+                    if (sharedWindow === window) sharedWindow = null
+                    HwGpu.stop()
+                    WindowsService.stop()
+                    window.close()
+                }
+                report
+            } catch (t: Throwable) {
+                if (sharedWindow === window) sharedWindow = null
+                HwGpu.stop()
+                WindowsService.stop()
                 window.close()
+                throw t
             }
-            return report
         }
         val esp = File(dir, "setup-esp.img")
         val iso = File(dir, "tiny11.iso")
@@ -250,32 +270,45 @@ object AvfLaunch {
         }
         GuestBoot.requireAligned(esp)
         GuestBoot.requireAligned(media)
+        val custom = GuestBoot.setupImage(firmware, listOf(esp, media))
+        val prev = sharedWindow
+        sharedWindow = null
+        prev?.close()
         val window = AvfPlan.createWindow(ByteArray(0))
-        sharedWindow?.close()
         sharedWindow = window
-        HwGpu.start(ctx, window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
-        FileShare.start(ctx, window.buffer)
-        GuestAudio.start(ctx, window.buffer)
-        UsbBridge.start(ctx, window.usbBuffer)
-        WindowsService.start(ctx)
-        startDebugTap(window, File(dir, "frame.bgra"))
-        startCppcCounter(window)
-        val report = boot(
-            ctx,
-            GuestBoot.setupImage(firmware, listOf(esp, media)),
-            keep = true,
-            memoryMb = AvfPlan.WINDOWS_VM_MEMORY_MIB,
-            expect = "HYPERWIN GOP",
-            sharedWindow = window,
-            onVmStarted = onVmStarted,
-            onVmStopped = onVmStopped,
-            onConsole = onConsole,
-        )
-        if (!report.startsWith("VM running;")) {
-            sharedWindow = null
+        return try {
+            HwGpu.start(ctx, window, AvfPlan.FRAME_WIDTH, AvfPlan.FRAME_HEIGHT)
+            FileShare.start(ctx, window.buffer)
+            GuestAudio.start(ctx, window.buffer)
+            UsbBridge.start(ctx, window.usbBuffer)
+            WindowsService.start(ctx)
+            startDebugTap(window, File(dir, "frame.bgra"))
+            startCppcCounter(window)
+            val report = boot(
+                ctx,
+                custom,
+                keep = true,
+                memoryMb = AvfPlan.WINDOWS_VM_MEMORY_MIB,
+                expect = "HYPERWIN GOP",
+                sharedWindow = window,
+                onVmStarted = onVmStarted,
+                onVmStopped = onVmStopped,
+                onConsole = onConsole,
+            )
+            if (!report.startsWith("VM running;")) {
+                if (sharedWindow === window) sharedWindow = null
+                HwGpu.stop()
+                WindowsService.stop()
+                window.close()
+            }
+            report
+        } catch (t: Throwable) {
+            if (sharedWindow === window) sharedWindow = null
+            HwGpu.stop()
+            WindowsService.stop()
             window.close()
+            throw t
         }
-        return report
     }
 
     private fun copyAsset(ctx: Context, name: String, dest: File) {
@@ -335,10 +368,14 @@ object AvfLaunch {
      */
     private fun startCppcCounter(window: AvfPlan.SharedWindow) {
         Thread({
-            val b = window.buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
-            while (sharedWindow === window) {
-                val now = System.nanoTime() / 1000
-                runCatching { b.putLong(0xB00008, now); b.putLong(0xB00010, now) }   // HW_CPPC_REGS +0, +8
+            while (window.isOpen && sharedWindow === window) {
+                val ok = window.withBuffer { raw ->
+                    val b = raw.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+                    val now = System.nanoTime() / 1000
+                    runCatching { b.putLong(0xB00008, now); b.putLong(0xB00010, now) }   // HW_CPPC_REGS +0, +8
+                    true
+                }
+                if (ok == null) break
                 Thread.sleep(5)                     // Windows samples them every few tens of ms
             }
         }, "hw-cppc").apply { isDaemon = true }.start()
@@ -348,47 +385,53 @@ object AvfLaunch {
     private fun startDebugTap(window: AvfPlan.SharedWindow, frameDump: File? = null) {
         Thread({
             var ticks = 0
-            val b = window.buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
             var lastCount = -1L
             var lastMarks = ""
             var lastWindow = ""
             var lastDiag = ""
-            while (sharedWindow === window) {
-                runCatching {
-                    val magic = ByteArray(8).also { for (i in 0 until 8) it[i] = b.get(i) }.decodeToString()
-                    val flags = b.getInt(52)
-                    val seq = b.getInt(44)
-                    val pixel = b.getInt(AvfPlan.frameOffset)
-                    val windowState = "$magic flags=${flags.toUInt().toString(16)} seq=$seq pixel=${pixel.toUInt().toString(16)}"
-                    if (windowState != lastWindow) {
-                        lastWindow = windowState
-                        Log.i("HyperWinDbg", windowState)
+            while (window.isOpen && sharedWindow === window) {
+                val frame = window.withBuffer { raw ->
+                    val b = raw.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+                    runCatching {
+                        val magic = ByteArray(8).also { for (i in 0 until 8) it[i] = b.get(i) }.decodeToString()
+                        val flags = b.getInt(52)
+                        val seq = b.getInt(44)
+                        val pixel = b.getInt(AvfPlan.frameOffset)
+                        val windowState = "$magic flags=${flags.toUInt().toString(16)} seq=$seq pixel=${pixel.toUInt().toString(16)}"
+                        if (windowState != lastWindow) {
+                            lastWindow = windowState
+                            Log.i("HyperWinDbg", windowState)
+                        }
+                        val base = 0x7f00000
+                        val marks = StringBuilder()
+                        for (i in 0 until 20) marks.append(java.lang.Long.toHexString(b.getLong(base + 0x100 + 8 * i))).append(' ')
+                        if (marks.toString() != lastMarks) {
+                            lastMarks = marks.toString()
+                            Log.i("HyperWinDbg", "marks " + lastMarks)
+                            val images = (32 until 160).map { b.getLong(base + 0x100 + 8 * it) }.filter { it != 0L }
+                            if (images.isNotEmpty()) Log.i("HyperWinDbg", "images " + images.joinToString(" ") { java.lang.Long.toHexString(it) })
+                        }
+                        val diag = "diag " + (0 until 128).joinToString(" ") { Integer.toHexString(b.getInt(0xA00000 + 4 * it)) }
+                        if (diag != lastDiag) { lastDiag = diag; Log.i("HyperWinDbg", diag) }
+                        if (b.getLong(base) == 0x1111222233334444L && lastCount != 1L) {
+                            lastCount = 1L
+                            fun h(o: Int) = java.lang.Long.toHexString(b.getLong(base + o))
+                            Log.i("HyperWinDbg", "GUEST EXCEPTION vector=" + h(8) + " esr=" + h(16) + " elr=" + h(24) +
+                                " far=" + h(32) + " lr=" + h(40) + " sp=" + h(48) + " spsr=" + h(56))
+                        }
                     }
-                    val base = 0x7f00000
-                    val marks = StringBuilder()
-                    for (i in 0 until 20) marks.append(java.lang.Long.toHexString(b.getLong(base + 0x100 + 8 * i))).append(' ')
-                    if (marks.toString() != lastMarks) {
-                        lastMarks = marks.toString()
-                        Log.i("HyperWinDbg", "marks " + lastMarks)
-                        val images = (32 until 160).map { b.getLong(base + 0x100 + 8 * it) }.filter { it != 0L }
-                        if (images.isNotEmpty()) Log.i("HyperWinDbg", "images " + images.joinToString(" ") { java.lang.Long.toHexString(it) })
-                    }
-                    val diag = "diag " + (0 until 128).joinToString(" ") { Integer.toHexString(b.getInt(0xA00000 + 4 * it)) }
-                    if (diag != lastDiag) { lastDiag = diag; Log.i("HyperWinDbg", diag) }
-                    if (b.getLong(base) == 0x1111222233334444L && lastCount != 1L) {
-                        lastCount = 1L
-                        fun h(o: Int) = java.lang.Long.toHexString(b.getLong(base + o))
-                        Log.i("HyperWinDbg", "GUEST EXCEPTION vector=" + h(8) + " esr=" + h(16) + " elr=" + h(24) +
-                            " far=" + h(32) + " lr=" + h(40) + " sp=" + h(48) + " spsr=" + h(56))
-                    }
+                    if (frameDump != null && ++ticks % 8 == 0) {
+                        runCatching {
+                            ByteArray(AvfPlan.frameBytes).also { out ->
+                                val view = raw.duplicate()
+                                view.position(AvfPlan.frameOffset)
+                                view.get(out)
+                            }
+                        }.getOrNull()
+                    } else null
                 }
-                /* Debug builds: save the guest frame (BGRA) every few seconds so it can
-                 * be pulled with adb when the app's own controls cover part of it. */
-                if (frameDump != null && ++ticks % 8 == 0) runCatching {
-                    val frame = ByteArray(AvfPlan.frameBytes)
-                    val view = window.buffer.duplicate()
-                    view.position(AvfPlan.frameOffset)
-                    view.get(frame)
+                if (!window.isOpen) break
+                if (frame != null && frameDump != null) runCatching {
                     val tmp = File(frameDump.parentFile, frameDump.name + ".tmp")
                     tmp.writeBytes(frame)
                     tmp.renameTo(frameDump)

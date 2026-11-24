@@ -68,6 +68,58 @@ struct hwgpu_ring_hdr {
     uint64_t copy_to_guest, copy_from_guest;
 };
 
+/* Windows' mouse pointer, from the display driver (wddm/hwdisplay.inc, DxgkDdiSetPointerShape and
+ * DxgkDdiSetPointerPosition), between the GPU rings and the debug marks. Windows stops drawing the
+ * pointer into frames once the driver takes it, so the phone shows it on one layer of its own, over
+ * the desktop and every program. The driver writes the fields, then bumps seq (shape_seq for a new
+ * picture). */
+#define HWGPU_POINTER_OFF   0x7ef0000u
+#define HWGPU_POINTER_MAGIC 0x52544e50u /* "PNTR" */
+#define HWGPU_POINTER_MAX   64u
+struct hwgpu_pointer {
+    uint32_t magic;        /* HWGPU_POINTER_MAGIC once the driver owns the pointer */
+    uint32_t seq;          /* bumped after any field below changes */
+    uint32_t visible;
+    int32_t  x, y;         /* the picture's top left corner, screen pixels */
+    uint32_t screen_w;     /* Windows' screen mode, the space x and y are in */
+    uint32_t screen_h;
+    uint32_t shape_seq;    /* bumped after a new picture */
+    uint32_t width, height;
+    int32_t  hot_x, hot_y;
+    uint32_t reserved[4];
+    uint32_t rgba[HWGPU_POINTER_MAX * HWGPU_POINTER_MAX]; /* premultiplied RGBA8, rows of `width` */
+};
+_Static_assert(HWGPU_RING_OFF + HWGPU_RING_BYTES <= HWGPU_POINTER_OFF, "pointer after the GPU rings");
+_Static_assert(HWGPU_POINTER_OFF + sizeof(struct hwgpu_pointer) <= 0x7f00000u, "pointer before the debug marks");
+
+/* The phone's screen refreshes, for Windows (vsync/README.md phase 1). The desktop renderer writes
+ * it from AChoreographer. Times are in the phone's counter ticks (CNTVCT, `freq` a second); Windows'
+ * counter runs from the same clock with an offset, found once through the mailbox below. */
+#define HWGPU_VSYNC_OFF   0x7efc000u
+#define HWGPU_VSYNC_MAGIC 0x434e5356u /* "VSNC" */
+struct hwgpu_vsync {
+    uint32_t magic;
+    uint32_t seq;            /* odd while the phone writes, even when stable */
+    uint64_t count;          /* refreshes seen */
+    uint64_t last;           /* the last refresh */
+    uint64_t period;         /* ticks a refresh, from the display mode */
+    uint64_t next_present;   /* when the next frame is expected on screen */
+    uint64_t next_deadline;  /* the latest a buffer can reach the compositor for it */
+    uint32_t hz_milli;       /* refresh rate x 1000 */
+    uint32_t freq;           /* counter ticks a second */
+    /* Clock mailbox. Windows sets `calibrate` (the phone then polls without sleeping for a second),
+     * writes its counter to `guest_t` and bumps `ask`. The phone writes its counter to `host_t` and
+     * sets `answer` = `ask`. Offset = host_t - (guest_t + Windows' counter on reading the answer) / 2. */
+    uint32_t calibrate;
+    uint32_t ask;
+    uint32_t answer;
+    uint32_t reserved;
+    uint64_t guest_t;
+    uint64_t host_t;
+};
+_Static_assert(HWGPU_POINTER_OFF + sizeof(struct hwgpu_pointer) <= HWGPU_VSYNC_OFF, "vsync after the pointer");
+_Static_assert(HWGPU_VSYNC_OFF + sizeof(struct hwgpu_vsync) <= 0x7f00000u, "vsync before the debug marks");
+
 /* First page of each channel. */
 struct hwgpu_ctl {
     uint32_t guest_state;
@@ -356,6 +408,12 @@ static inline int hwgpu_window_fills_screen(HWND wnd)
  * it; a window that covers a whole edge strip of what is left (the taskbar, the screen's edge) only trims
  * the visible part, anything else refuses. client_out: the client rect in screen pixels (it may run past
  * the screen). vis_out: the part to show, in client pixels. */
+/* The window that last made hwgpu_window_overlay_ok refuse (for the log). */
+static HWND g_hwgpu_overlay_block;
+/* Debug (HWD3D_OWN_OVERLAYS=1): the program's own windows above its 3D window (an FPS counter, a HUD) do not stop the layer;
+ * the frame then covers them. */
+static int g_hwgpu_own_overlays;
+
 static inline int hwgpu_window_overlay_ok(HWND wnd, RECT *client_out, RECT *vis_out)
 {
     if (!wnd || !IsWindow(wnd) || !IsWindowVisible(wnd) || IsIconic(wnd)) return 0;
@@ -390,6 +448,12 @@ static inline int hwgpu_window_overlay_ok(HWND wnd, RECT *client_out, RECT *vis_
             continue;
         RECT o, both;
         if (!GetWindowRect(w, &o) || !IntersectRect(&both, &o, &vis)) continue;
+        if (g_hwgpu_own_overlays) {
+            DWORD wpid = 0;
+            GetWindowThreadProcessId(w, &wpid);
+            if (wpid == GetCurrentProcessId()) continue;
+        }
+        g_hwgpu_overlay_block = w;
         LONG ex = GetWindowLongA(w, GWL_EXSTYLE);
         if ((ex & WS_EX_TRANSPARENT) && (ex & WS_EX_LAYERED)) {
             BYTE alpha = 255;

@@ -14,6 +14,7 @@ object MachinePrep {
     private external fun nativeReplaceBootFile(disk: String, path: String, data: ByteArray): Boolean
     private external fun nativeHardenBoot(disk: String, scratch: String): Int
     private external fun nativeNtfsDelete(disk: String, paths: Array<String>): Int
+    private external fun nativePatchGuest(disk: String, assets: String, progress: Progress): String
 
     /**
      * Repair hook: when /data/local/tmp/hyperwin/ntfsdel.txt exists, each line is a path inside the
@@ -69,12 +70,35 @@ object MachinePrep {
         }
         if (report == "ok") {
             GuestBoot.requireAligned(machine.disk)
+            machine.guestStamp = gpuStamp(activity)
             machine.prepared = true
             machine.save()
             Machine.setActive(activity, machine)
             return "${machine.name} is ready. Boot Windows to start it."
         }
         return report
+    }
+
+    fun guestNeedsPatch(ctx: android.content.Context, machine: Machine): Boolean =
+        machine.prepared && machine.guestStamp != gpuStamp(ctx)
+
+    /** Copies updated HyperWin drivers and tools into system.img offline before Windows boots. */
+    fun patchGuest(ctx: android.content.Context, machine: Machine, progress: Progress): String {
+        val dir = File(ctx.cacheDir, "patch-assets").apply { deleteRecursively(); mkdirs() }
+        try {
+            progress.step(0, "Preparing update files…")
+            copyAssetTree(ctx, "machine/guest", File(dir, "guest"))
+            copyAssetTree(ctx, "machine/drivers", File(dir, "drivers"))
+            val report = nativePatchGuest(machine.disk.absolutePath, dir.absolutePath, progress)
+            android.util.Log.i("HyperWin", "patchGuest(${machine.name}): $report")
+            if (report == "ok") {
+                machine.guestStamp = gpuStamp(ctx)
+                machine.save()
+            }
+            return report
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     /** GPU files under machine/guest/gpu (tools/machine_assets.sh), installed by gpu-install.cmd. */
@@ -89,17 +113,18 @@ object MachinePrep {
     fun gpuStamp(ctx: android.content.Context): String =
         ctx.assets.open("machine/guest/gpu/stamp.txt").use { it.readBytes().decodeToString().trim() }
 
+    private fun copyAssetTree(ctx: android.content.Context, path: String, dest: File) {
+        val children = ctx.assets.list(path).orEmpty()
+        if (children.isEmpty()) {
+            dest.parentFile?.mkdirs()
+            ctx.assets.open(path).use { input -> dest.outputStream().use { input.copyTo(it) } }
+        } else children.forEach { copyAssetTree(ctx, "$path/$it", File(dest, it)) }
+    }
+
     private fun stageAssets(activity: Activity): File {
         val dir = File(activity.cacheDir, "prep-assets").apply { deleteRecursively(); mkdirs() }
-        fun copy(path: String, dest: File) {
-            val children = activity.assets.list(path).orEmpty()
-            if (children.isEmpty()) {
-                dest.parentFile?.mkdirs()
-                activity.assets.open(path).use { input -> dest.outputStream().use { input.copyTo(it) } }
-            } else children.forEach { copy("$path/$it", File(dest, it)) }
-        }
         // A new machine gets the GPU at first boot (firstboot.cmd); its stamp.txt says it is current.
-        copy("machine", dir)
+        copyAssetTree(activity, "machine", dir)
         return dir
     }
 }

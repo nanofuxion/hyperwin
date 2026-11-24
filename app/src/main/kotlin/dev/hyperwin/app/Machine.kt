@@ -25,6 +25,8 @@ data class Machine(
     var lanMode: Boolean = false,
     /** Checksum of our boot files as last written to this disk's boot partition. */
     var loaderStamp: Long = 0,
+    /** Fingerprint of our guest drivers/tools as last written to this Windows disk. */
+    var guestStamp: String = "",
     var prepared: Boolean = false,
 ) {
     val json get() = File(dir, "machine.json")
@@ -57,6 +59,7 @@ data class Machine(
             .put("testSigning", testSigning)
             .put("lanMode", lanMode)
             .put("loaderStamp", loaderStamp)
+            .put("guestStamp", guestStamp)
             .put("prepared", prepared)
         val tmp = File(dir, "machine.json.tmp")
         tmp.writeText(data.toString(2))
@@ -92,6 +95,7 @@ data class Machine(
                 testSigning = d.optBoolean("testSigning", true),
                 lanMode = d.optBoolean("lanMode", false),
                 loaderStamp = d.optLong("loaderStamp", 0),
+                guestStamp = d.optString("guestStamp", ""),
                 prepared = d.optBoolean("prepared", false),
             )
         }.getOrNull()

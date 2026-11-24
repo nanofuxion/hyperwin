@@ -7,7 +7,7 @@
  * Who does what:
  *   phone app  hwf_init() once per boot, publishes the volumes, then serves the slots
  *              (app/src/main/cpp/files.c).
- *   guest      hwfiles.exe gets this region mapped by hwgpu.sys (IOCTL_HWGPU_FILES), claims a free
+ *   guest      hwfiles.exe gets this region mapped by hwfiles.sys (IOCTL_HWFILES_MAP), claims a free
  *              slot per request, fills it, and waits for the answer.
  *
  * A slot goes FREE -> CLAIMED (guest fills it) -> REQUEST -> BUSY (phone works) -> DONE -> FREE.
@@ -21,8 +21,9 @@
 
 #include <stdint.h>
 
-/* Above the GPU rings (they end at 0x7809000) and below the debug marks at HW_FRAME_END. */
-#define HWF_OFF        0x7810000u
+/* Above the largest frame pair (4096x2304 BGRA twice ends at 0x5800000) and below the GPU rings
+ * (0x6000000). */
+#define HWF_OFF        0x5800000u
 #define HWF_MAGIC      0x53454c4946575948ull /* "HYWFILES" little endian */
 #define HWF_VERSION    2u  /* 2: 24 slots of 256 KiB */
 #define HWF_SLOTS      24u
@@ -33,7 +34,7 @@
 #define HWF_VOLUMES    8u
 #define HWF_PATH       1900u  /* bytes of UTF-8, with the terminating zero */
 
-_Static_assert(HWF_OFF + HWF_BYTES <= 0x7f00000u, "file slots end below the debug marks");
+_Static_assert(HWF_OFF + HWF_BYTES <= 0x6000000u, "file slots end below the GPU rings");
 
 /* slot state */
 #define HWF_FREE     0u
@@ -129,6 +130,17 @@ struct hwf_slot {
 
 _Static_assert(sizeof(struct hwf_hdr) <= 0x1000u, "header fits its page");
 _Static_assert(sizeof(struct hwf_slot) <= HWF_META, "slot fields fit their page");
+
+/* Kernel mapper device (guest/files/hwfiles_drv.c -> hwfiles.sys). Only SYSTEM may map it. */
+#define HWFILES_DEVICE_NAME L"\\Device\\HwFiles"
+#define HWFILES_LINK_NAME   L"\\DosDevices\\HwFiles"
+#define HWFILES_USER_PATH   L"\\\\.\\HwFiles"
+/* CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_ANY_ACCESS) */
+#define IOCTL_HWFILES_MAP   0x00222410u
+
+struct hwfiles_map_out {
+    uint64_t user;      /* address in the caller */
+};
 
 static inline struct hwf_hdr *hwf_hdr(void *region) { return (struct hwf_hdr *)region; }
 static inline struct hwf_slot *hwf_slot(void *region, uint32_t i)

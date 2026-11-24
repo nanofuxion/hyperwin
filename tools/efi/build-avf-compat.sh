@@ -20,7 +20,7 @@ iasl -p "$out/osc_ssdt" guest/efi/osc_ssdt.asl >/dev/null
 python3 tools/efi/embed_aml.py "$out/osc_ssdt.h" HyperwinOscSsdt="$out/osc_ssdt.aml"
 iasl -p "$out/gpu_ssdt" guest/efi/gpu_ssdt.asl >/dev/null
 python3 tools/efi/embed_aml.py "$out/gpu_ssdt.h" HyperwinGpuSsdt="$out/gpu_ssdt.aml"
-$CC -c guest/efi/cpu_acpi.c -o "$out/cpu_acpi.obj"
+$CC -DHWGPU_ACPI_DEVICE -c guest/efi/cpu_acpi.c -o "$out/cpu_acpi.obj"
 $LINK -subsystem:efi_application -entry:SetupBootEntry -out:"$out/BOOTAA64.EFI" "$out/setup_boot.obj" "$out/pci_acpi.obj" "$out/cpu_acpi.obj"
 $CC -c guest/efi/gop_driver.c -o "$out/gop.obj"
 $CC -c guest/efi/qemu_ring.c -o "$out/qemu_ring.obj"

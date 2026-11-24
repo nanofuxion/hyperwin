@@ -1,0 +1,1320 @@
+diff --git a/include/drm-uapi/mali_kbase_jm_ioctl.h b/include/drm-uapi/mali_kbase_jm_ioctl.h
+index 8b46ceb..2da7400 100644
+--- a/include/drm-uapi/mali_kbase_jm_ioctl.h
++++ b/include/drm-uapi/mali_kbase_jm_ioctl.h
+@@ -135,6 +135,26 @@ union kbase_ioctl_get_cpu_gpu_timeinfo {
+ #define BASE_JD_REQ_V                (1u << 4)
+ #define BASE_JD_REQ_ONLY_COMPUTE     (1u << 10)
+ 
++/* Sync-file soft jobs (uAPI 11.x): jc points to struct base_fence.
++ * TRIGGER creates a sync_file fd in basep.fd signaled when pre_dep completes;
++ * WAIT waits for the sync_file in basep.fd before completing. */
++#define BASE_JD_REQ_SOFT_JOB           (1u << 9)
++#define BASE_JD_REQ_SOFT_FENCE_TRIGGER (BASE_JD_REQ_SOFT_JOB | 0x2)
++#define BASE_JD_REQ_SOFT_FENCE_WAIT    (BASE_JD_REQ_SOFT_JOB | 0x3)
++
++struct base_fence {
++   struct {
++      __s32 fd;
++      __s32 stream_fd;
++   } basep;
++};
++
++struct kbase_ioctl_fence_validate {
++   __s32 fd;
++};
++#define KBASE_IOCTL_FENCE_VALIDATE \
++   _IOW(KBASE_IOCTL_TYPE, 25, struct kbase_ioctl_fence_validate)
++
+ #define BASE_JD_DEP_TYPE_DATA  1
+ #define BASE_JD_DEP_TYPE_ORDER 2
+ 
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 8295a5a..a881bc9 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -30,12 +30,14 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <linux/dma-buf.h>
++#include <linux/sync_file.h>
+ #include <sys/mman.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+ #include "c11/threads.h"
+ #include "util/cache_ops.h"
++#include "util/list.h"
+ #include "util/log.h"
+ #include "util/u_debug.h"
+ #include "util/macros.h"
+@@ -67,6 +69,8 @@ struct kbase_kmod_dev {
+    uint32_t next_handle;
+    /* Live dma-buf imports (window surfaces shared with other contexts). */
+    uint32_t dmabuf_imports;
++   mtx_t dmabuf_lock;
++   struct list_head dmabuf_list;
+ 
+    struct util_sync_provider no_sync;
+ 
+@@ -110,6 +114,8 @@ struct kbase_kmod_bo {
+     * mmap() of it made on first use, since kbase's own CPU view of a dma-buf
+     * import faults. -1 otherwise. */
+    int dmabuf_fd;
++   struct list_head dmabuf_node;
++   bool written_by_dev;
+ };
+ 
+ static inline struct kbase_kmod_dev *
+@@ -329,6 +335,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+    kdev->stats = debug_get_bool_option("PANVK_KBASE_STATS", false);
+    kdev->next_handle = 1;
+    kdev->next_atom = 1;
++   mtx_init(&kdev->dmabuf_lock, mtx_plain);
++   list_inithead(&kdev->dmabuf_list);
+    mtx_init(&kdev->atom_lock, mtx_plain);
+    cnd_init(&kdev->atom_cond);
+ 
+@@ -339,6 +347,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+       mesa_loge("kbase: no GPU id in the GPU properties");
+       kdev->base.flags &= ~PAN_KMOD_DEV_FLAG_OWNS_FD;
+       pan_kmod_dev_cleanup(&kdev->base);
++      mtx_destroy(&kdev->dmabuf_lock);
+       mtx_destroy(&kdev->atom_lock);
+       cnd_destroy(&kdev->atom_cond);
+       pan_kmod_free(allocator, kdev);
+@@ -367,6 +376,7 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
+       thrd_join(kdev->event_thread, NULL);
+    }
+    munmap(kdev->tracking_page, KBASE_PAGE_SIZE);
++   mtx_destroy(&kdev->dmabuf_lock);
+    mtx_destroy(&kdev->atom_lock);
+    cnd_destroy(&kdev->atom_cond);
+    pan_kmod_dev_cleanup(dev);
+@@ -474,8 +484,12 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
+       if (kbo->dmabuf_fd >= 0 && kbo->cpu_ptr)
+          munmap(kbo->cpu_ptr, bo->size);
+       if (kbo->dmabuf_fd >= 0) {
++         struct kbase_kmod_dev *kdev = to_kbase_dev(bo->dev);
++         mtx_lock(&kdev->dmabuf_lock);
++         list_del(&kbo->dmabuf_node);
++         mtx_unlock(&kdev->dmabuf_lock);
+          close(kbo->dmabuf_fd);
+-         p_atomic_dec(&to_kbase_dev(bo->dev)->dmabuf_imports);
++         p_atomic_dec(&kdev->dmabuf_imports);
+       }
+       struct kbase_ioctl_sticky_resource_map sm = {
+          .count = 1,
+@@ -526,7 +540,7 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+    union kbase_ioctl_mem_import req = {
+       .in = {
+          .flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+-                  BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP,
++                  BASE_MEM_UNCACHED_GPU | BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP,
+          .phandle = (uintptr_t)&own_fd,
+          .type = BASE_MEM_IMPORT_TYPE_UMM,
+       },
+@@ -591,6 +605,10 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+    bo->host_import = true;
+    bo->dmabuf_fd = own_fd;
+    bo->same_va = false;
++   bo->written_by_dev = false;
++   mtx_lock(&kdev->dmabuf_lock);
++   list_addtail(&bo->dmabuf_node, &kdev->dmabuf_list);
++   mtx_unlock(&kdev->dmabuf_lock);
+    p_atomic_inc(&kdev->dmabuf_imports);
+ 
+    uint32_t handle = p_atomic_inc_return(&kdev->next_handle);
+@@ -934,23 +952,9 @@ kbase_kmod_bo_extres(struct pan_kmod_bo *bo, uint64_t *gpu_va)
+    return true;
+ }
+ 
+-uint32_t
+-kbase_kmod_atom_submit(struct pan_kmod_dev *dev, uint64_t jc,
+-                       uint32_t core_req, uint32_t dep0, uint32_t dep0_type,
+-                       uint32_t dep1, uint32_t dep1_type)
++static uint32_t
++kbase_atom_alloc(struct kbase_kmod_dev *kdev)
+ {
+-   return kbase_kmod_atom_submit_ext(dev, jc, core_req, dep0, dep0_type, dep1,
+-                                     dep1_type, NULL, 0);
+-}
+-
+-uint32_t
+-kbase_kmod_atom_submit_ext(struct pan_kmod_dev *dev, uint64_t jc,
+-                           uint32_t core_req, uint32_t dep0,
+-                           uint32_t dep0_type, uint32_t dep1,
+-                           uint32_t dep1_type, const uint64_t *extres,
+-                           uint16_t nr_extres)
+-{
+-   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
+    uint32_t id = 0;
+ 
+    mtx_lock(&kdev->atom_lock);
+@@ -974,6 +978,35 @@ kbase_kmod_atom_submit_ext(struct pan_kmod_dev *dev, uint64_t jc,
+    if (kdev->stats)
+       kdev->atom_submit_ns[id] = os_time_get_nano();
+    mtx_unlock(&kdev->atom_lock);
++   return id;
++}
++
++static void
++kbase_atom_abort(struct kbase_kmod_dev *kdev, uint32_t id)
++{
++   mtx_lock(&kdev->atom_lock);
++   kdev->atom_state[id] = KBASE_ATOM_FREE;
++   mtx_unlock(&kdev->atom_lock);
++}
++
++uint32_t
++kbase_kmod_atom_submit(struct pan_kmod_dev *dev, uint64_t jc,
++                       uint32_t core_req, uint32_t dep0, uint32_t dep0_type,
++                       uint32_t dep1, uint32_t dep1_type)
++{
++   return kbase_kmod_atom_submit_ext(dev, jc, core_req, dep0, dep0_type, dep1,
++                                     dep1_type, NULL, 0);
++}
++
++uint32_t
++kbase_kmod_atom_submit_ext(struct pan_kmod_dev *dev, uint64_t jc,
++                           uint32_t core_req, uint32_t dep0,
++                           uint32_t dep0_type, uint32_t dep1,
++                           uint32_t dep1_type, const uint64_t *extres,
++                           uint16_t nr_extres)
++{
++   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
++   uint32_t id = kbase_atom_alloc(kdev);
+ 
+    struct base_jd_atom atom = {
+       .jc = jc,
+@@ -996,15 +1029,85 @@ kbase_kmod_atom_submit_ext(struct pan_kmod_dev *dev, uint64_t jc,
+ 
+    if (ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub)) {
+       mesa_loge("kbase: JOB_SUBMIT failed: %s", strerror(errno));
+-      mtx_lock(&kdev->atom_lock);
+-      kdev->atom_state[id] = KBASE_ATOM_FREE;
+-      mtx_unlock(&kdev->atom_lock);
++      kbase_atom_abort(kdev, id);
++      return 0;
++   }
++
++   return id;
++}
++
++uint32_t
++kbase_kmod_atom_submit_fence_wait(struct pan_kmod_dev *dev, int sync_fd,
++                                  uint32_t dep0, uint32_t dep0_type)
++{
++   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
++   uint32_t id = kbase_atom_alloc(kdev);
++   struct base_fence fence = {.basep = {.fd = sync_fd, .stream_fd = -1}};
++
++   struct base_jd_atom atom = {
++      .jc = (uintptr_t)&fence,
++      .core_req = BASE_JD_REQ_SOFT_FENCE_WAIT,
++      .atom_number = id,
++   };
++   atom.pre_dep[0].atom_id = dep0;
++   atom.pre_dep[0].dependency_type = dep0 ? dep0_type : 0;
++
++   struct kbase_ioctl_job_submit sub = {
++      .addr = (uintptr_t)&atom,
++      .nr_atoms = 1,
++      .stride = sizeof(atom),
++   };
++
++   if (ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub)) {
++      mesa_loge("kbase: SOFT_FENCE_WAIT failed: %s", strerror(errno));
++      kbase_atom_abort(kdev, id);
+       return 0;
+    }
+ 
+    return id;
+ }
+ 
++uint32_t
++kbase_kmod_atom_submit_fence_trigger(struct pan_kmod_dev *dev, uint32_t dep0,
++                                     uint32_t dep0_type, uint32_t dep1,
++                                     uint32_t dep1_type, int *out_sync_fd)
++{
++   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
++   uint32_t id = kbase_atom_alloc(kdev);
++   struct base_fence fence = {.basep = {.fd = -1, .stream_fd = -1}};
++
++   struct base_jd_atom atom = {
++      .jc = (uintptr_t)&fence,
++      .core_req = BASE_JD_REQ_SOFT_FENCE_TRIGGER,
++      .atom_number = id,
++   };
++   atom.pre_dep[0].atom_id = dep0;
++   atom.pre_dep[0].dependency_type = dep0 ? dep0_type : 0;
++   atom.pre_dep[1].atom_id = dep1;
++   atom.pre_dep[1].dependency_type = dep1 ? dep1_type : 0;
++
++   struct kbase_ioctl_job_submit sub = {
++      .addr = (uintptr_t)&atom,
++      .nr_atoms = 1,
++      .stride = sizeof(atom),
++   };
++
++   if (ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub)) {
++      mesa_loge("kbase: SOFT_FENCE_TRIGGER failed: %s", strerror(errno));
++      kbase_atom_abort(kdev, id);
++      if (out_sync_fd)
++         *out_sync_fd = -1;
++      return 0;
++   }
++
++   if (out_sync_fd)
++      *out_sync_fd = fence.basep.fd;
++   else if (fence.basep.fd >= 0)
++      close(fence.basep.fd);
++
++   return id;
++}
++
+ static int
+ kbase_atom_wait(struct pan_kmod_dev *dev, uint32_t atom, int64_t timeout_ns,
+                 uint32_t *event_code, bool free_id)
+@@ -1072,6 +1175,105 @@ kbase_kmod_has_dmabuf_imports(const struct pan_kmod_dev *dev)
+    return p_atomic_read(&to_kbase_dev(dev)->dmabuf_imports) != 0;
+ }
+ 
++static bool
++bo_in_list(const struct pan_kmod_bo *bo, struct pan_kmod_bo *const *list,
++           unsigned count)
++{
++   for (unsigned i = 0; i < count; i++) {
++      if (list[i] == bo)
++         return true;
++   }
++   return false;
++}
++
++int
++kbase_kmod_dmabuf_export_wait_fence(struct pan_kmod_dev *dev,
++                                    struct pan_kmod_bo *const *written_bos,
++                                    unsigned nr_written, bool write_all)
++{
++   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
++   int merged = -1;
++
++   mtx_lock(&kdev->dmabuf_lock);
++   list_for_each_entry(struct kbase_kmod_bo, kbo, &kdev->dmabuf_list,
++                       dmabuf_node) {
++      if (kbo->dmabuf_fd < 0)
++         continue;
++
++      bool writing = write_all || bo_in_list(&kbo->base, written_bos, nr_written);
++      if (!writing && kbo->written_by_dev)
++         continue;
++
++      struct dma_buf_export_sync_file ex = {
++         .flags = writing ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ,
++         .fd = -1,
++      };
++      if (ioctl(kbo->dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &ex) ||
++          ex.fd < 0)
++         continue;
++
++      struct pollfd p = {.fd = ex.fd, .events = POLLIN};
++      if (poll(&p, 1, 0) > 0) {
++         close(ex.fd);
++         continue;
++      }
++
++      if (merged < 0) {
++         merged = ex.fd;
++      } else {
++         struct sync_merge_data sm = {
++            .fd2 = ex.fd,
++            .fence = -1,
++         };
++         memcpy(sm.name, "panvk", 6);
++         if (ioctl(merged, SYNC_IOC_MERGE, &sm) == 0 && sm.fence >= 0) {
++            close(merged);
++            close(ex.fd);
++            merged = sm.fence;
++         } else {
++            int ret;
++            do {
++               ret = poll(&p, 1, 1000);
++            } while (ret < 0 && (errno == EINTR || errno == EAGAIN));
++            close(ex.fd);
++         }
++      }
++   }
++   mtx_unlock(&kdev->dmabuf_lock);
++   return merged;
++}
++
++void
++kbase_kmod_dmabuf_import_signal_fence(struct pan_kmod_dev *dev, int sync_fd,
++                                      struct pan_kmod_bo *const *written_bos,
++                                      unsigned nr_written, bool write_all)
++{
++   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
++
++   if (sync_fd < 0)
++      return;
++
++   mtx_lock(&kdev->dmabuf_lock);
++   list_for_each_entry(struct kbase_kmod_bo, kbo, &kdev->dmabuf_list,
++                       dmabuf_node) {
++      if (kbo->dmabuf_fd < 0)
++         continue;
++
++      bool writing = write_all || bo_in_list(&kbo->base, written_bos, nr_written);
++      if (writing)
++         kbo->written_by_dev = true;
++      else if (kbo->written_by_dev)
++         continue;
++
++      struct dma_buf_import_sync_file imp = {
++         .flags = writing ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ,
++         .fd = sync_fd,
++      };
++      ioctl(kbo->dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &imp);
++   }
++   mtx_unlock(&kdev->dmabuf_lock);
++}
++
+ int
+ kbase_kmod_atom_wait(struct pan_kmod_dev *dev, uint32_t atom,
+                      int64_t timeout_ns, uint32_t *event_code)
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 87578c0..c54ac7c 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -68,6 +68,34 @@ void kbase_kmod_bo_wait_implicit(struct pan_kmod_bo *bo);
+ /* True while the device holds a dma-buf import (a buffer another context reads). */
+ bool kbase_kmod_has_dmabuf_imports(const struct pan_kmod_dev *dev);
+ 
++/* Export and merge any unsignaled dma-buf fences this submission must wait on:
++ * WRITE fences (all readers+writers) for written_bos (or all live imports if
++ * write_all), and READ fences (writers only) for other live imports not last
++ * written by this device. Returns a sync_file fd to close, or -1 if ready. */
++int kbase_kmod_dmabuf_export_wait_fence(struct pan_kmod_dev *dev,
++                                        struct pan_kmod_bo *const *written_bos,
++                                        unsigned nr_written, bool write_all);
++
++/* Attach sync_fd to live dma-buf imports: DMA_BUF_SYNC_WRITE on written_bos
++ * (or all if write_all), DMA_BUF_SYNC_READ on other imports not written by
++ * this device. Caller still owns and closes sync_fd. */
++void kbase_kmod_dmabuf_import_signal_fence(
++   struct pan_kmod_dev *dev, int sync_fd,
++   struct pan_kmod_bo *const *written_bos, unsigned nr_written, bool write_all);
++
++/* Submit a SOFT_FENCE_WAIT atom waiting for sync_fd (after optional dep0).
++ * Caller still closes sync_fd after this returns. Returns atom id or 0. */
++uint32_t kbase_kmod_atom_submit_fence_wait(struct pan_kmod_dev *dev,
++                                           int sync_fd, uint32_t dep0,
++                                           uint32_t dep0_type);
++
++/* Submit a SOFT_FENCE_TRIGGER atom signaled when dep0/dep1 complete.
++ * Returns atom id or 0; on success *out_sync_fd receives the new sync_file fd. */
++uint32_t kbase_kmod_atom_submit_fence_trigger(struct pan_kmod_dev *dev,
++                                              uint32_t dep0, uint32_t dep0_type,
++                                              uint32_t dep1, uint32_t dep1_type,
++                                              int *out_sync_fd);
++
+ /* Frees the id of an atom nobody is going to wait for. */
+ void kbase_kmod_atom_release(struct pan_kmod_dev *dev, uint32_t atom);
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index eef218c..040e0a7 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -31,6 +31,32 @@
+ 
+ #include "genxml/gen_macros.h"
+ 
++/* Pipeline stages that execute on JS0 (fragment) vs JS1 (vertex/tiler/compute).
++ * Used to decide when a pipeline barrier requires the next batch's JS1 atom to
++ * wait for the previous batch's JS0 fragment atom. */
++#define PANVK_JM_FRAG_STAGES                                                   \
++   (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |                             \
++    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |                                  \
++    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |                              \
++    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |                          \
++    VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |           \
++    VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT |             \
++    VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT)
++
++#define PANVK_JM_VTC_STAGES                                                    \
++   (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |                                    \
++    VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |                                      \
++    VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |                           \
++    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |                                    \
++    VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |                      \
++    VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |                   \
++    VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |                                  \
++    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |    \
++    VK_PIPELINE_STAGE_2_CLEAR_BIT |                                            \
++    VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT)
++
++struct panvk_gpu_queue;
++
+ struct panvk_batch {
+    struct list_head node;
+    struct util_dynarray jobs;
+@@ -60,6 +86,10 @@ struct panvk_batch {
+    struct pan_tls_info tlsinfo;
+    unsigned wls_total_size;
+    bool issued;
++   bool wait_frag;
++   bool has_user_compute;
++   struct panvk_gpu_queue *last_queue;
++   uint64_t last_seq;
+ };
+ 
+ enum panvk_cmd_event_op_type {
+@@ -82,12 +112,17 @@ struct panvk_cmd_buffer {
+    struct list_head batches;
+    struct list_head push_sets;
+    struct panvk_batch *cur_batch;
++   bool end_wait_frag;
+ 
+    struct {
+       struct panvk_cmd_graphics_state gfx;
+       struct panvk_cmd_compute_state compute;
+       struct panvk_push_constant_state push_constants;
+       bool uses_poly_heap;
++      bool pending_frag_to_vtc_barrier;
++      bool in_meta_copy;
++      struct pan_kmod_bo *copy_src_bo;
++      struct pan_kmod_bo *copy_dst_bo;
+    } state;
+ };
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_queue.h b/src/panfrost/vulkan/jm/panvk_queue.h
+index 25693d0..d9e7089 100644
+--- a/src/panfrost/vulkan/jm/panvk_queue.h
++++ b/src/panfrost/vulkan/jm/panvk_queue.h
+@@ -29,14 +29,20 @@ struct panvk_gpu_queue {
+    struct vk_queue vk;
+    uint32_t sync;
+ 
+-   /* kbase: submissions run on the GPU while the CPU goes on. Atoms are
+-    * chained in submission order; kb_entries (from kb_head) lists what is not
+-    * done yet. Only one thread waits for atoms at a time (kb_draining). */
++   /* kbase: submissions run on the GPU while the CPU goes on. VTC (JS1) and
++    * fragment (JS0) chains are tracked separately so the next batch's vertex
++    * work can overlap the previous batch's fragment work unless a barrier
++    * orders JS0 -> JS1; kb_entries (from kb_head) lists what is not done yet.
++    * Only one thread waits for atoms at a time (kb_draining). */
+    struct {
+       mtx_t lock;
+       cnd_t cond;
+       bool draining;
+-      uint32_t last_atom;
++      uint32_t last_vtc;
++      uint32_t last_frag;
++      uint32_t tiler_heap_atom[PANVK_NUM_TILER_HEAPS];
++      unsigned tiler_heap_next;
++      bool need_frag_dep;
+       uint64_t next_seq;
+       uint64_t done_seq;
+       unsigned head;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index 09cbf4a..58f1ef8 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -34,6 +34,7 @@
+ #include "poly/geometry.h"
+ #include "vk_descriptor_update_template.h"
+ #include "vk_format.h"
++#include "vk_synchronization.h"
+ 
+ static VkResult
+ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
+@@ -79,7 +80,8 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
+    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
+       if (util_dynarray_num_elements(&batch->event_ops,
+                                      struct panvk_cmd_event_op) == 0) {
+-         /* Content-less batch, let's drop it */
++         /* Content-less batch, let's drop it (keep any pending barrier). */
++         cmdbuf->state.pending_frag_to_vtc_barrier |= batch->wait_frag;
+          vk_free(&cmdbuf->vk.pool->alloc, batch);
+       } else {
+          /* Batch has no jobs but is needed for synchronization, let's add a
+@@ -326,6 +328,10 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
+    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
++   cmdbuf->cur_batch->wait_frag = cmdbuf->state.pending_frag_to_vtc_barrier;
++   cmdbuf->state.pending_frag_to_vtc_barrier = false;
++   cmdbuf->cur_batch->blit.src = cmdbuf->state.copy_src_bo;
++   cmdbuf->cur_batch->blit.dst = cmdbuf->state.copy_dst_bo;
+    assert(cmdbuf->cur_batch);
+    return cmdbuf->cur_batch;
+ }
+@@ -362,17 +368,70 @@ panvk_per_arch(cmd_init_poly_heap)(struct panvk_cmd_buffer *cmdbuf,
+                      0, 0, &job, false);
+    util_dynarray_append(&batch->jobs, job.cpu);
+ 
++   batch->wait_frag = true;
+    cmdbuf->state.uses_poly_heap = true;
+ 
+    return VK_SUCCESS;
+ }
+ 
++static bool
++jm_stage_dep_waits_frag_to_vtc(VkPipelineStageFlags2 src,
++                               VkPipelineStageFlags2 dst, uint32_t src_qfi,
++                               uint32_t dst_qfi)
++{
++   if (src_qfi != dst_qfi) {
++      if (src_qfi == VK_QUEUE_FAMILY_EXTERNAL)
++         src = VK_PIPELINE_STAGE_2_NONE;
++      if (dst_qfi == VK_QUEUE_FAMILY_EXTERNAL)
++         dst = VK_PIPELINE_STAGE_2_NONE;
++   }
++
++   src = vk_expand_src_stage_flags2(src);
++   dst = vk_expand_dst_stage_flags2(dst);
++   return (src & PANVK_JM_FRAG_STAGES) && (dst & PANVK_JM_VTC_STAGES);
++}
++
++static bool
++jm_dep_info_waits_frag_to_vtc(const VkDependencyInfo *info)
++{
++   if (!info)
++      return false;
++
++   for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
++      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
++      if (jm_stage_dep_waits_frag_to_vtc(b->srcStageMask, b->dstStageMask,
++                                         VK_QUEUE_FAMILY_IGNORED,
++                                         VK_QUEUE_FAMILY_IGNORED))
++         return true;
++   }
++
++   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
++      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
++      if (jm_stage_dep_waits_frag_to_vtc(b->srcStageMask, b->dstStageMask,
++                                         b->srcQueueFamilyIndex,
++                                         b->dstQueueFamilyIndex))
++         return true;
++   }
++
++   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
++      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
++      if (jm_stage_dep_waits_frag_to_vtc(b->srcStageMask, b->dstStageMask,
++                                         b->srcQueueFamilyIndex,
++                                         b->dstQueueFamilyIndex))
++         return true;
++   }
++
++   return false;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
+    panvk_per_arch(cmd_close_batch)(cmdbuf);
++   cmdbuf->end_wait_frag = cmdbuf->state.pending_frag_to_vtc_barrier;
++   cmdbuf->state.pending_frag_to_vtc_barrier = false;
+ 
+    panvk_pool_flush_maps(&cmdbuf->desc_pool);
+ 
+@@ -384,6 +443,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++   bool wait_frag = jm_dep_info_waits_frag_to_vtc(pDependencyInfo);
+ 
+    /* Caches are flushed/invalidated at batch boundaries for now, nothing to do
+     * for memory barriers assuming we implement barriers with the creation of a
+@@ -393,7 +453,10 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+     */
+    if (cmdbuf->cur_batch) {
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
++      cmdbuf->state.pending_frag_to_vtc_barrier |= wait_frag;
+       panvk_per_arch(cmd_open_batch)(cmdbuf);
++   } else {
++      cmdbuf->state.pending_frag_to_vtc_barrier |= wait_frag;
+    }
+ }
+ 
+@@ -419,6 +482,7 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+    panvk_pool_reset(&cmdbuf->varying_pool);
+    panvk_cmd_buffer_obj_list_reset(cmdbuf, push_sets);
+ 
++   cmdbuf->end_wait_frag = false;
+    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
+ }
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+index aa07f6f..d7b64a8 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+@@ -118,6 +118,8 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+ 
+    panvk_per_arch(cmd_close_batch)(cmdbuf);
+    struct panvk_batch *batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
++   if (!cmdbuf->state.in_meta_copy)
++      batch->has_user_compute = true;
+ 
+    const struct panvk_shader_desc_info *cs_desc_info =
+       &cmdbuf->state.compute.shader->desc_info;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+index d655f2d..4f0be3f 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+@@ -95,7 +95,8 @@ panvk_emit_clear_queries(struct panvk_cmd_buffer *cmd,
+    };
+ 
+    bool had_batch;
+-   open_batch(cmd, &had_batch);
++   struct panvk_batch *batch = open_batch(cmd, &had_batch);
++   batch->wait_frag = true;
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+    panlib_clear_query_result_struct(&precomp_ctx, panlib_1d(query_count),
+                                     PANLIB_BARRIER_NONE, push);
+@@ -218,6 +219,7 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+    }
+ 
+    uint64_t available_addr = panvk_query_available_dev_addr(pool, query);
++   batch->wait_frag = true;
+    panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                         available_addr, 1);
+ 
+@@ -245,7 +247,8 @@ panvk_meta_copy_query_pool_results(struct panvk_cmd_buffer *cmd,
+    };
+ 
+    bool had_batch;
+-   open_batch(cmd, &had_batch);
++   struct panvk_batch *batch = open_batch(cmd, &had_batch);
++   batch->wait_frag = true;
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+    panlib_copy_query_result_struct(&precomp_ctx, panlib_1d(query_count),
+                                    PANLIB_BARRIER_NONE, push);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 2e5346a..06c9dd9 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -26,6 +26,7 @@
+ 
+ #include "vk_drm_syncobj.h"
+ #include "vk_framebuffer.h"
++#include "vk_synchronization.h"
+ 
+ #include "kmod/kbase_kmod.h"
+ #include "panvk_kbase_sync.h"
+@@ -36,6 +37,8 @@
+ #include "drm-uapi/mali_kbase_jm_ioctl.h"
+ #include "util/u_atomic.h"
+ 
++#include <poll.h>
++
+ #include "drm-uapi/panfrost_drm.h"
+ 
+ static void
+@@ -342,9 +345,17 @@ kbase_drain(struct panvk_gpu_queue *queue, uint64_t seq, uint64_t abs_timeout_ns
+                mesa_loge("kbase: atom %u failed, event 0x%x", e.atom, code);
+                vk_device_set_lost(&dev->vk, "kbase atom failed (0x%x)", code);
+             }
+-            /* Drop it from the chain before the id can be handed out again. */
+-            if (queue->kb.last_atom == e.atom)
+-               queue->kb.last_atom = 0;
++            /* Drop it from the chains before the id can be handed out again. */
++            if (queue->kb.last_vtc == e.atom)
++               queue->kb.last_vtc = 0;
++            if (queue->kb.last_frag == e.atom) {
++               queue->kb.last_frag = 0;
++               queue->kb.need_frag_dep = false;
++            }
++            for (unsigned i = 0; i < PANVK_NUM_TILER_HEAPS; i++) {
++               if (queue->kb.tiler_heap_atom[i] == e.atom)
++                  queue->kb.tiler_heap_atom[i] = 0;
++            }
+             kbase_kmod_atom_free(kdev, e.atom);
+          }
+          queue->kb.pending_atoms--;
+@@ -411,18 +422,23 @@ kbase_submit_batch(struct panvk_gpu_queue *queue, struct panvk_cmd_buffer *cmdbu
+    struct pan_kmod_dev *kdev = dev->kmod.dev;
+    VkResult result;
+ 
+-   /* Events are set and waited on by the CPU, a re-issued batch is patched in
+-    * place, and a trace needs the result now: those batches run alone, with
+-    * nothing in flight before or after them. */
++   /* Events are set and waited on by the CPU, and a trace needs the result now:
++    * those batches run alone, with nothing in flight before or after them.
++    * Re-issued batches only wait for their own previous execution before
++    * patching descriptors in place. */
+    const bool sync_batch =
+       util_dynarray_num_elements(&batch->event_ops,
+                                  struct panvk_cmd_event_op) > 0 ||
+-      batch->issued || PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
++      PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
+ 
+    if (sync_batch) {
+       result = kbase_drain_all(queue);
+       if (result != VK_SUCCESS)
+          return result;
++   } else if (batch->issued && batch->last_queue) {
++      kbase_drain(batch->last_queue, batch->last_seq, UINT64_MAX);
++      if (vk_device_is_lost(&dev->vk))
++         return VK_ERROR_DEVICE_LOST;
+    }
+ 
+    /* Keep the number of ids in flight well below kbase's 255. */
+@@ -438,33 +454,41 @@ kbase_submit_batch(struct panvk_gpu_queue *queue, struct panvk_cmd_buffer *cmdbu
+          kbase_drain(queue, oldest, UINT64_MAX);
+    }
+ 
++   /* Rotate across the tiler heap ring so JS1 of this batch can tile into a
++    * fresh heap while JS0 of earlier batches is still reading theirs. */
++   const bool uses_tiler_heap = batch->tiler.heap_desc.cpu != NULL;
++   unsigned heap_slot = 0;
++   if (uses_tiler_heap)
++      heap_slot = queue->kb.tiler_heap_next++ % PANVK_NUM_TILER_HEAPS;
++
+    /* Reset the batch if it's already been issued */
+    if (batch->issued) {
+       util_dynarray_foreach(&batch->jobs, void *, job)
+          panvk_reset_issued_job(*job);
+ 
+-      /* Reset the tiler before re-issuing the batch */
++      /* Reset the tiler contexts before re-issuing the batch */
+       if (batch->tiler.ctx_descs.cpu) {
+-         memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
+-                sizeof(batch->tiler.heap_templ));
+-
+          struct mali_tiler_context_packed *ctxs = batch->tiler.ctx_descs.cpu;
+ 
+          for (uint32_t i = 0; i < batch->fb.layer_count; i++)
+             memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
+       }
++   }
+ 
+-      panvk_pool_flush_maps(&cmdbuf->desc_pool);
++   if (uses_tiler_heap) {
++      struct panvk_priv_bo *heap = dev->tiler_heaps[heap_slot];
++      pan_cast_and_pack(batch->tiler.heap_desc.cpu, TILER_HEAP, cfg) {
++         cfg.size = pan_kmod_bo_size(heap->bo);
++         cfg.base = heap->addr.dev;
++         cfg.bottom = heap->addr.dev;
++         cfg.top = cfg.base + cfg.size;
++      }
+    }
+ 
+-   pan_kmod_flush_bo_map_syncs(kdev);
++   if (batch->issued || uses_tiler_heap)
++      panvk_pool_flush_maps(&cmdbuf->desc_pool);
+ 
+-   /* Render targets that are imported buffers may still be in use by the
+-    * display or another device: wait for their fences before drawing. */
+-   for (unsigned i = 0; i < batch->fb.bo_count; i++) {
+-      if (batch->fb.bos[i]->flags & PAN_KMOD_BO_FLAG_IMPORTED)
+-         kbase_kmod_bo_wait_implicit(batch->fb.bos[i]);
+-   }
++   pan_kmod_flush_bo_map_syncs(kdev);
+ 
+    /* Events: wait for the ones this batch waits on. */
+    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
+@@ -475,18 +499,54 @@ kbase_submit_batch(struct panvk_gpu_queue *queue, struct panvk_cmd_buffer *cmdbu
+          usleep(100);
+    }
+ 
+-   /* Submit under the lock: the drain clears last_atom when it frees it. Each
+-    * batch starts after everything before it on this queue. */
++   /* Imported copy/blit sources and destinations go to the VTC/compute job as
++    * external resources so kbase handles cache maintenance around them too. */
++   uint64_t vtc_extres[2];
++   uint16_t nr_vtc_extres = 0;
++   if (batch->blit.src) {
++      uint64_t va;
++      if (kbase_kmod_bo_extres(batch->blit.src, &va))
++         vtc_extres[nr_vtc_extres++] = va;
++   }
++   if (batch->blit.dst) {
++      uint64_t va;
++      if (kbase_kmod_bo_extres(batch->blit.dst, &va)) {
++         if (nr_vtc_extres == 1 && vtc_extres[0] == va)
++            vtc_extres[0] = va | BASE_EXT_RES_ACCESS_EXCLUSIVE;
++         else
++            vtc_extres[nr_vtc_extres++] = va | BASE_EXT_RES_ACCESS_EXCLUSIVE;
++      }
++   }
++
++   /* Submit under the lock: the drain clears last_vtc / last_frag /
++    * tiler_heap_atom when it frees them. VTC (JS1) runs in order with previous
++    * VTC and only waits on previous fragment (JS0) when a barrier requires
++    * JS0 -> JS1 ordering (or when reusing a tiler heap still in use). */
+    mtx_lock(&queue->kb.lock);
+-   uint32_t prev = queue->kb.last_atom;
++   uint32_t prev_vtc = queue->kb.last_vtc;
++   uint32_t prev_frag = queue->kb.last_frag;
++   bool wait_frag = batch->wait_frag || queue->kb.need_frag_dep;
+    uint32_t vtc_atom = 0, frag_atom = 0;
+    bool failed = false;
+ 
+    if (batch->vtc_jc.first_job) {
+-      vtc_atom = kbase_kmod_atom_submit(
++      uint32_t dep0 = prev_vtc;
++      uint32_t dep1 =
++         wait_frag ? prev_frag
++                   : (uses_tiler_heap ? queue->kb.tiler_heap_atom[heap_slot] : 0);
++      if (dep1 == dep0)
++         dep1 = 0;
++      if (!dep0 && dep1) {
++         dep0 = dep1;
++         dep1 = 0;
++      }
++
++      vtc_atom = kbase_kmod_atom_submit_ext(
+          kdev, batch->vtc_jc.first_job,
+-         BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V, prev,
+-         BASE_JD_DEP_TYPE_ORDER, 0, 0);
++         BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V, dep0,
++         dep0 ? BASE_JD_DEP_TYPE_ORDER : 0, dep1,
++         dep1 ? BASE_JD_DEP_TYPE_ORDER : 0,
++         nr_vtc_extres ? vtc_extres : NULL, nr_vtc_extres);
+       failed |= !vtc_atom;
+    }
+ 
+@@ -501,23 +561,45 @@ kbase_submit_batch(struct panvk_gpu_queue *queue, struct panvk_cmd_buffer *cmdbu
+    }
+ 
+    if (!failed && batch->frag_jc.first_job) {
++      uint32_t dep0 = vtc_atom ? vtc_atom : prev_frag;
++      uint32_t dep0_type =
++         vtc_atom ? BASE_JD_DEP_TYPE_DATA : BASE_JD_DEP_TYPE_ORDER;
++      uint32_t dep1 = vtc_atom ? prev_frag : prev_vtc;
++      uint32_t dep1_type = BASE_JD_DEP_TYPE_ORDER;
++      if (dep1 == dep0)
++         dep1 = 0;
++      if (!dep0 && dep1) {
++         dep0 = dep1;
++         dep0_type = dep1_type;
++         dep1 = 0;
++      }
++
+       frag_atom = kbase_kmod_atom_submit_ext(
+-         kdev, batch->frag_jc.first_job, BASE_JD_REQ_FS,
+-         vtc_atom ? vtc_atom : prev,
+-         vtc_atom ? BASE_JD_DEP_TYPE_DATA : BASE_JD_DEP_TYPE_ORDER, 0, 0,
++         kdev, batch->frag_jc.first_job, BASE_JD_REQ_FS, dep0,
++         dep0 ? dep0_type : 0, dep1, dep1 ? dep1_type : 0,
+          nr_extres ? extres : NULL, nr_extres);
+       failed |= !frag_atom;
+    }
+ 
+    uint64_t seq = ++queue->kb.next_seq;
+-   if (vtc_atom)
++   if (vtc_atom) {
+       kbase_push(queue, seq, vtc_atom, NULL);
+-   if (frag_atom)
++      queue->kb.last_vtc = vtc_atom;
++      if (wait_frag)
++         queue->kb.need_frag_dep = false;
++   } else if (batch->wait_frag) {
++      queue->kb.need_frag_dep = true;
++   }
++   if (frag_atom) {
+       kbase_push(queue, seq, frag_atom, NULL);
+-   if (frag_atom || vtc_atom)
+-      queue->kb.last_atom = frag_atom ? frag_atom : vtc_atom;
++      queue->kb.last_frag = frag_atom;
++   }
++   if (uses_tiler_heap && (frag_atom || vtc_atom))
++      queue->kb.tiler_heap_atom[heap_slot] = frag_atom ? frag_atom : vtc_atom;
+    mtx_unlock(&queue->kb.lock);
+ 
++   batch->last_queue = queue;
++   batch->last_seq = seq;
+    batch->issued = true;
+ 
+    if (failed) {
+@@ -526,18 +608,8 @@ kbase_submit_batch(struct panvk_gpu_queue *queue, struct panvk_cmd_buffer *cmdbu
+       return vk_device_set_lost(&dev->vk, "kbase submit failed");
+    }
+ 
+-   /* A device that shares buffers with other devices or processes (AHBs,
+-    * dma-bufs: window surfaces) finishes its batches before submit returns:
+-    * kbase gives other contexts no ordering against our atoms, the readers
+-    * rely on the work being done, and a buffer can be written by draws and by
+-    * compute alike. Devices that share nothing stay asynchronous. */
+-   const bool writes_shared = kbase_kmod_has_dmabuf_imports(kdev);
+-
+-   if (!sync_batch) {
+-      if (writes_shared)
+-         kbase_drain(queue, seq, UINT64_MAX);
++   if (!sync_batch)
+       return vk_device_is_lost(&dev->vk) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+-   }
+ 
+    kbase_drain(queue, seq, UINT64_MAX);
+    result = vk_device_is_lost(&dev->vk) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+@@ -568,18 +640,89 @@ kbase_submit_batch(struct panvk_gpu_queue *queue, struct panvk_cmd_buffer *cmdbu
+    return result;
+ }
+ 
++static void
++kbase_collect_written_dmabufs(struct vk_queue_submit *submit,
++                              struct pan_kmod_bo **written_bos,
++                              unsigned max_written, unsigned *nr_written,
++                              bool *write_all)
++{
++   unsigned n = 0;
++   bool all = false;
++
++   for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
++      struct panvk_cmd_buffer *cmdbuf =
++         container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
++
++      list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
++         if (batch->has_user_compute)
++            all = true;
++
++         for (unsigned i = 0; i < batch->fb.bo_count; i++) {
++            uint64_t va;
++            if (!kbase_kmod_bo_extres(batch->fb.bos[i], &va))
++               continue;
++            bool dup = false;
++            for (unsigned k = 0; k < n; k++) {
++               if (written_bos[k] == batch->fb.bos[i]) {
++                  dup = true;
++                  break;
++               }
++            }
++            if (!dup) {
++               if (n < max_written)
++                  written_bos[n++] = batch->fb.bos[i];
++               else
++                  all = true;
++            }
++         }
++
++         if (batch->blit.dst) {
++            uint64_t va;
++            if (kbase_kmod_bo_extres(batch->blit.dst, &va)) {
++               bool dup = false;
++               for (unsigned k = 0; k < n; k++) {
++                  if (written_bos[k] == batch->blit.dst) {
++                     dup = true;
++                     break;
++                  }
++               }
++               if (!dup) {
++                  if (n < max_written)
++                     written_bos[n++] = batch->blit.dst;
++                  else
++                     all = true;
++               }
++            }
++         }
++      }
++   }
++
++   *nr_written = n;
++   *write_all = all;
++}
++
+ static VkResult
+ kbase_queue_submit(struct panvk_gpu_queue *queue,
+                    struct vk_queue_submit *submit)
+ {
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++   struct pan_kmod_dev *kdev = dev->kmod.dev;
+    VkResult result;
+ 
+    for (uint32_t i = 0; i < submit->wait_count; i++) {
+       /* Signaled by an earlier submission on this queue: the GPU runs them
+-       * in order, nothing to wait for on the CPU. */
+-      if (panvk_kbase_sync_pending_on(submit->waits[i].sync, queue))
++       * in order, nothing to wait for on the CPU. If the wait covers a JS1
++       * stage, order the next VTC atom after the earlier fragment work. */
++      if (panvk_kbase_sync_pending_on(submit->waits[i].sync, queue)) {
++         VkPipelineStageFlags2 dst =
++            vk_expand_dst_stage_flags2(submit->waits[i].stage_mask);
++         if (!submit->waits[i].stage_mask || (dst & PANVK_JM_VTC_STAGES)) {
++            mtx_lock(&queue->kb.lock);
++            queue->kb.need_frag_dep = true;
++            mtx_unlock(&queue->kb.lock);
++         }
+          continue;
++      }
+ 
+       result = vk_sync_wait(&dev->vk, submit->waits[i].sync,
+                             submit->waits[i].wait_value, VK_SYNC_WAIT_COMPLETE,
+@@ -590,6 +733,44 @@ kbase_queue_submit(struct panvk_gpu_queue *queue,
+       }
+    }
+ 
++   const bool has_imports =
++      submit->command_buffer_count > 0 && kbase_kmod_has_dmabuf_imports(kdev);
++   struct pan_kmod_bo *written_bos[32];
++   unsigned nr_written = 0;
++   bool write_all = false;
++
++   if (has_imports) {
++      kbase_collect_written_dmabufs(submit, written_bos, ARRAY_SIZE(written_bos),
++                                    &nr_written, &write_all);
++
++      /* Wait on the GPU (via a SOFT_FENCE_WAIT soft job) for any unsignaled
++       * dma-buf fences left by other contexts or the display. */
++      int wait_fd = kbase_kmod_dmabuf_export_wait_fence(kdev, written_bos,
++                                                        nr_written, write_all);
++      if (wait_fd >= 0) {
++         mtx_lock(&queue->kb.lock);
++         uint32_t prev_vtc = queue->kb.last_vtc;
++         uint32_t wait_atom = kbase_kmod_atom_submit_fence_wait(
++            kdev, wait_fd, prev_vtc, prev_vtc ? BASE_JD_DEP_TYPE_ORDER : 0);
++         if (wait_atom) {
++            uint64_t wseq = ++queue->kb.next_seq;
++            kbase_push(queue, wseq, wait_atom, NULL);
++            queue->kb.last_vtc = wait_atom;
++         }
++         mtx_unlock(&queue->kb.lock);
++
++         if (!wait_atom) {
++            struct pollfd p = {.fd = wait_fd, .events = POLLIN};
++            int ret;
++            do {
++               ret = poll(&p, 1, 1000);
++            } while (ret < 0 && (errno == EINTR || errno == EAGAIN));
++         }
++         close(wait_fd);
++      }
++   }
++
++   bool submitted = false;
+    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
+       struct panvk_cmd_buffer *cmdbuf =
+          container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+@@ -598,16 +779,62 @@ kbase_queue_submit(struct panvk_gpu_queue *queue,
+          result = kbase_submit_batch(queue, cmdbuf, batch);
+          if (result != VK_SUCCESS)
+             return result;
++         submitted = true;
++      }
++
++      if (cmdbuf->end_wait_frag) {
++         mtx_lock(&queue->kb.lock);
++         queue->kb.need_frag_dep = true;
++         mtx_unlock(&queue->kb.lock);
++      }
++   }
++
++   /* Attach a kernel sync-file fence (SOFT_FENCE_TRIGGER) to our live dma-buf
++    * imports so other contexts and the display synchronize on the GPU without
++    * blocking this submit on the CPU. */
++   if (submitted && has_imports) {
++      mtx_lock(&queue->kb.lock);
++      uint32_t d0 = queue->kb.last_frag;
++      uint32_t d1 = queue->kb.last_vtc;
++      if (d1 == d0)
++         d1 = 0;
++      if (!d0 && d1) {
++         d0 = d1;
++         d1 = 0;
++      }
++      int trig_fd = -1;
++      uint32_t trig_atom = 0;
++      if (d0) {
++         trig_atom = kbase_kmod_atom_submit_fence_trigger(
++            kdev, d0, BASE_JD_DEP_TYPE_ORDER, d1,
++            d1 ? BASE_JD_DEP_TYPE_ORDER : 0, &trig_fd);
++         if (trig_atom) {
++            uint64_t tseq = ++queue->kb.next_seq;
++            kbase_push(queue, tseq, trig_atom, NULL);
++         }
++      }
++      mtx_unlock(&queue->kb.lock);
++
++      if (trig_atom && trig_fd >= 0) {
++         kbase_kmod_dmabuf_import_signal_fence(kdev, trig_fd, written_bos,
++                                               nr_written, write_all);
++         close(trig_fd);
++      } else {
++         if (trig_fd >= 0)
++            close(trig_fd);
++         result = kbase_drain_all(queue);
++         if (result != VK_SUCCESS)
++            return result;
+       }
+    }
+ 
+    if (submit->signal_count) {
+       mtx_lock(&queue->kb.lock);
+-      uint64_t seq = ++queue->kb.next_seq;
++      uint64_t signal_seq = ++queue->kb.next_seq;
+       for (uint32_t i = 0; i < submit->signal_count; i++) {
+          struct vk_sync *sync = submit->signals[i].sync;
+-         panvk_kbase_sync_set_pending(sync, kbase_drain_cb, queue, seq);
+-         kbase_push(queue, seq, 0, sync);
++         panvk_kbase_sync_set_pending(sync, kbase_drain_cb, queue, signal_seq);
++         kbase_push(queue, signal_seq, 0, sync);
+       }
+       mtx_unlock(&queue->kb.lock);
+    }
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 2ee2e8b..9a54993 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -29,6 +29,7 @@
+ 
+ /* 128 MiB */
+ #define PANVK_POLY_HEAP_SIZE (1 << 27)
++#define PANVK_NUM_TILER_HEAPS 4
+ 
+ struct panvk_precomp_cache;
+ struct panvk_device_draw_context;
+@@ -68,6 +69,7 @@ struct panvk_device {
+    } kmod;
+ 
+    struct panvk_priv_bo *tiler_heap;
++   struct panvk_priv_bo *tiler_heaps[PANVK_NUM_TILER_HEAPS];
+    struct panvk_priv_bo *sample_positions;
+ 
+    struct {
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index 6711a5b..8512e8d 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -6,6 +6,7 @@
+ 
+ #include "panvk_buffer.h"
+ #include "panvk_cmd_meta.h"
++#include "panvk_device_memory.h"
+ #include "panvk_entrypoints.h"
+ #include "panvk_meta.h"
+ #include "panvk_tracepoints.h"
+@@ -868,6 +869,15 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
+       struct panvk_cmd_meta_compute_save_ctx save = {0};
+ 
+       meta_compute_start(cmdbuf, &save);
++#if PAN_ARCH <= 9
++      cmdbuf->state.in_meta_copy = true;
++      cmdbuf->state.copy_src_bo = NULL;
++      cmdbuf->state.copy_dst_bo =
++         img->planes[0].mem &&
++         (img->planes[0].mem->bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)
++            ? img->planes[0].mem->bo
++            : NULL;
++#endif
+ #if PAN_ARCH >= 10
+       if (copy_buffer_to_image_touches_crc(img, pCopyMemoryInfo)) {
+          struct cs_builder *b =
+@@ -880,6 +890,10 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
+       vk_meta_copy_memory_to_image(&cmdbuf->vk, &dev->meta,
+                                    pCopyMemoryInfo, &img_props,
+                                    VK_PIPELINE_BIND_POINT_COMPUTE);
++#if PAN_ARCH <= 9
++      cmdbuf->state.in_meta_copy = false;
++      cmdbuf->state.copy_dst_bo = NULL;
++#endif
+       meta_compute_end(cmdbuf, &save);
+    }
+ }
+@@ -905,8 +919,21 @@ panvk_per_arch(CmdCopyImageToMemoryKHR)(
+    struct panvk_cmd_meta_compute_save_ctx save = {0};
+ 
+    meta_compute_start(cmdbuf, &save);
++#if PAN_ARCH <= 9
++   cmdbuf->state.in_meta_copy = true;
++   cmdbuf->state.copy_src_bo =
++      img->planes[0].mem &&
++      (img->planes[0].mem->bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)
++         ? img->planes[0].mem->bo
++         : NULL;
++   cmdbuf->state.copy_dst_bo = NULL;
++#endif
+    vk_meta_copy_image_to_memory(&cmdbuf->vk, &dev->meta, pCopyMemoryInfo,
+                                 &img_props);
++#if PAN_ARCH <= 9
++   cmdbuf->state.in_meta_copy = false;
++   cmdbuf->state.copy_src_bo = NULL;
++#endif
+    meta_compute_end(cmdbuf, &save);
+ }
+ 
+@@ -1091,6 +1118,19 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
+       struct panvk_cmd_meta_compute_save_ctx save = {0};
+ 
+       meta_compute_start(cmdbuf, &save);
++#if PAN_ARCH <= 9
++      cmdbuf->state.in_meta_copy = true;
++      cmdbuf->state.copy_src_bo =
++         src_img->planes[0].mem &&
++         (src_img->planes[0].mem->bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)
++            ? src_img->planes[0].mem->bo
++            : NULL;
++      cmdbuf->state.copy_dst_bo =
++         dst_img->planes[0].mem &&
++         (dst_img->planes[0].mem->bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)
++            ? dst_img->planes[0].mem->bo
++            : NULL;
++#endif
+ #if PAN_ARCH >= 10
+       if (copy_image_touches_crc(dst_img, pCopyImageInfo)) {
+          struct cs_builder *b =
+@@ -1103,6 +1143,11 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
+       vk_meta_copy_image(&cmdbuf->vk, &dev->meta, pCopyImageInfo,
+                          &src_img_props, &dst_img_props,
+                          VK_PIPELINE_BIND_POINT_COMPUTE);
++#if PAN_ARCH <= 9
++      cmdbuf->state.in_meta_copy = false;
++      cmdbuf->state.copy_src_bo = NULL;
++      cmdbuf->state.copy_dst_bo = NULL;
++#endif
+       meta_compute_end(cmdbuf, &save);
+    }
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 56c130a..685f88b 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -591,12 +591,21 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+ #endif
+ 
+ #if PAN_ARCH <= 9
+-   result = panvk_priv_bo_create(
+-      device, 128 * 1024 * 1024,
+-      PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "Tiler Heap", &device->tiler_heap);
+-   if (result != VK_SUCCESS)
+-      goto err_free_priv_bos;
++   /* On kbase, give the queue a ring of grow-on-fault tiler heaps so a batch's
++    * vertex/tiler stage can run on JS1 while earlier batches' fragment jobs are
++    * still reading their polygon lists on JS0. */
++   unsigned num_tiler_heaps =
++      physical_device->kbase ? PANVK_NUM_TILER_HEAPS : 1;
++   for (unsigned i = 0; i < num_tiler_heaps; i++) {
++      result = panvk_priv_bo_create(
++         device, 128 * 1024 * 1024,
++         PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
++         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "Tiler Heap",
++         &device->tiler_heaps[i]);
++      if (result != VK_SUCCESS)
++         goto err_free_priv_bos;
++   }
++   device->tiler_heap = device->tiler_heaps[0];
+ #endif
+ 
+    result = panvk_priv_bo_create(
+@@ -714,7 +723,8 @@ err_free_priv_bos:
+ #if PAN_ARCH >= 10
+    simple_mtx_destroy(&device->poly_heap.init_lock);
+ #endif
+-   panvk_priv_bo_unref(device->tiler_heap);
++   for (unsigned i = 0; i < PANVK_NUM_TILER_HEAPS; i++)
++      panvk_priv_bo_unref(device->tiler_heaps[i]);
+    panvk_device_cleanup_mempools(device);
+    vk_free(&device->vk.alloc, device->dump_region_size);
+    pan_kmod_vm_destroy(device->kmod.vm);
+@@ -762,7 +772,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
+ #if PAN_ARCH >= 10
+    simple_mtx_destroy(&device->poly_heap.init_lock);
+ #endif
+-   panvk_priv_bo_unref(device->tiler_heap);
++   for (unsigned i = 0; i < PANVK_NUM_TILER_HEAPS; i++)
++      panvk_priv_bo_unref(device->tiler_heaps[i]);
+    panvk_priv_bo_unref(device->sample_positions);
+    panvk_device_cleanup_mempools(device);
+    vk_free(&device->vk.alloc, device->dump_region_size);

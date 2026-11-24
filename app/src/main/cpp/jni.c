@@ -555,3 +555,557 @@ Java_dev_hyperwin_app_MachinePrep_nativeNtfsDelete(JNIEnv *env, jobject self, js
     (*env)->ReleaseStringUTFChars(env, disk, d);
     return done;
 }
+
+#include <android/log.h>
+#include <dirent.h>
+#include <strings.h>
+#include <ntfs-3g/logging.h>
+#include "sha256.h"
+
+static int hw_ntfs_log(const char *function, const char *file, int line, u32 level,
+                       void *data, const char *format, va_list args)
+{
+    (void)function; (void)file; (void)line; (void)level; (void)data;
+    __android_log_vprint(ANDROID_LOG_WARN, "HyperWinNtfs", format, args);
+    return 0;
+}
+
+typedef struct {
+    char *host;
+    char *ntfs;
+} PatchItem;
+
+typedef struct {
+    PatchItem *items;
+    int count;
+    int cap;
+} PatchList;
+
+static int patch_list_add(PatchList *l, const char *host, const char *ntfs)
+{
+    if (l->count >= l->cap) {
+        int ncap = l->cap ? l->cap * 2 : 64;
+        PatchItem *ni = realloc(l->items, (size_t)ncap * sizeof *ni);
+        if (!ni) return -1;
+        l->items = ni;
+        l->cap = ncap;
+    }
+    l->items[l->count].host = strdup(host);
+    l->items[l->count].ntfs = strdup(ntfs);
+    if (!l->items[l->count].host || !l->items[l->count].ntfs) return -1;
+    l->count++;
+    return 0;
+}
+
+static void patch_list_free(PatchList *l)
+{
+    for (int i = 0; i < l->count; i++) {
+        free(l->items[i].host);
+        free(l->items[i].ntfs);
+    }
+    free(l->items);
+    l->items = NULL;
+    l->count = l->cap = 0;
+}
+
+static int patch_collect_tree(const char *host_dir, const char *ntfs_dir, PatchList *list)
+{
+    DIR *d = opendir(host_dir);
+    if (!d) return -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char hp[1200], np[1200];
+        snprintf(hp, sizeof hp, "%s/%s", host_dir, de->d_name);
+        snprintf(np, sizeof np, "%s/%s", ntfs_dir, de->d_name);
+        struct stat st;
+        if (stat(hp, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (patch_collect_tree(hp, np, list) != 0) { closedir(d); return -1; }
+        } else if (S_ISREG(st.st_mode)) {
+            if (patch_list_add(list, hp, np) != 0) { closedir(d); return -1; }
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int hw_ntfs_exists(ntfs_volume *vol, const char *path)
+{
+    ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, path);
+    if (!ni) return 0;
+    ntfs_inode_close(ni);
+    return 1;
+}
+
+static int hw_ntfs_mkdir_p(ntfs_volume *vol, const char *path)
+{
+    char cur[1024];
+    snprintf(cur, sizeof cur, "%s", path);
+    for (char *p = cur + 1; ; p++) {
+        if (*p != '/' && *p != '\0') continue;
+        char saved = *p;
+        *p = '\0';
+        if (!hw_ntfs_exists(vol, cur)) {
+            char parent[1024];
+            char *slash = strrchr(cur, '/');
+            const char *name = slash ? slash + 1 : cur;
+            if (slash && slash != cur) snprintf(parent, sizeof parent, "%.*s", (int)(slash - cur), cur);
+            else snprintf(parent, sizeof parent, "/");
+            ntfs_inode *pni = ntfs_pathname_to_inode(vol, NULL, parent);
+            if (!pni) return -1;
+            ntfschar *uname = NULL;
+            int ulen = ntfs_mbstoucs(name, &uname);
+            if (ulen <= 0 || !uname) { ntfs_inode_close(pni); free(uname); return -1; }
+            ntfs_inode *cni = ntfs_create(pni, 0, uname, (u8)ulen, S_IFDIR);
+            free(uname);
+            ntfs_inode_close(pni);
+            if (!cni) return -1;
+            ntfs_inode_close(cni);
+        }
+        *p = saved;
+        if (!saved) break;
+    }
+    return 0;
+}
+
+static ntfs_inode *hw_ntfs_open_or_create(ntfs_volume *vol, const char *ntfs_path)
+{
+    ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, ntfs_path);
+    if (ni) return ni;
+    char parent[1024];
+    snprintf(parent, sizeof parent, "%s", ntfs_path);
+    char *slash = strrchr(parent, '/');
+    if (!slash) return NULL;
+    const char *name = slash + 1;
+    if (slash == parent) parent[1] = '\0';
+    else {
+        *slash = '\0';
+        if (hw_ntfs_mkdir_p(vol, parent) != 0) return NULL;
+    }
+    ntfs_inode *pni = ntfs_pathname_to_inode(vol, NULL, parent);
+    if (!pni) return NULL;
+    ntfschar *uname = NULL;
+    int ulen = ntfs_mbstoucs(name, &uname);
+    if (ulen <= 0 || !uname) { ntfs_inode_close(pni); free(uname); return NULL; }
+    ni = ntfs_create(pni, 0, uname, (u8)ulen, S_IFREG);
+    free(uname);
+    ntfs_inode_close(pni);
+    return ni;
+}
+
+static int hw_ntfs_write_bytes(ntfs_volume *vol, const char *ntfs_path, const void *data, size_t len)
+{
+    ntfs_inode *ni = hw_ntfs_open_or_create(vol, ntfs_path);
+    if (!ni) return -1;
+    ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+    if (!na) { ntfs_inode_close(ni); return -1; }
+    int rc = 0;
+    if (ntfs_attr_truncate(na, 0) != 0) rc = -1;
+    else if (len > 0 && ntfs_attr_pwrite(na, 0, (s64)len, data) != (s64)len) rc = -1;
+    ntfs_attr_close(na);
+    ntfs_inode_mark_dirty(ni);
+    ntfs_inode_close(ni);
+    return rc;
+}
+
+static int hw_ntfs_copy_file(ntfs_volume *vol, const char *ntfs_path, const char *host_path, int *updated)
+{
+    static unsigned char hbuf[65536], nbuf[65536];
+    int fd = open(host_path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    s64 size = (s64)st.st_size;
+
+    ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, ntfs_path);
+    if (ni) {
+        ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+        if (na && na->data_size == size) {
+            int same = 1;
+            s64 pos = 0;
+            while (pos < size) {
+                s64 chunk = size - pos < (s64)sizeof hbuf ? size - pos : (s64)sizeof hbuf;
+                if (pread(fd, hbuf, (size_t)chunk, (off_t)pos) != (ssize_t)chunk ||
+                    ntfs_attr_pread(na, pos, chunk, nbuf) != chunk ||
+                    memcmp(hbuf, nbuf, (size_t)chunk) != 0) {
+                    same = 0;
+                    break;
+                }
+                pos += chunk;
+            }
+            if (same) {
+                ntfs_attr_close(na);
+                ntfs_inode_close(ni);
+                close(fd);
+                *updated = 0;
+                return 0;
+            }
+        }
+        if (na) ntfs_attr_close(na);
+    } else {
+        ni = hw_ntfs_open_or_create(vol, ntfs_path);
+        if (!ni) { close(fd); return -1; }
+    }
+
+    ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+    if (!na) { ntfs_inode_close(ni); close(fd); return -1; }
+    int rc = 0;
+    if (ntfs_attr_truncate(na, 0) != 0) {
+        rc = -1;
+    } else {
+        s64 pos = 0;
+        while (pos < size) {
+            s64 chunk = size - pos < (s64)sizeof hbuf ? size - pos : (s64)sizeof hbuf;
+            if (pread(fd, hbuf, (size_t)chunk, (off_t)pos) != (ssize_t)chunk ||
+                ntfs_attr_pwrite(na, pos, chunk, hbuf) != chunk) {
+                rc = -1;
+                break;
+            }
+            pos += chunk;
+        }
+    }
+    ntfs_attr_close(na);
+    ntfs_inode_mark_dirty(ni);
+    ntfs_inode_close(ni);
+    close(fd);
+    if (rc == 0) *updated = 1;
+    return rc;
+}
+
+static int hw_ntfs_file_equals(ntfs_volume *vol, const char *ntfs_path, const char *host_path)
+{
+    static unsigned char hbuf[65536], nbuf[65536];
+    int fd = open(host_path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return 0; }
+    s64 size = (s64)st.st_size;
+    ntfs_inode *ni = ntfs_pathname_to_inode(vol, NULL, ntfs_path);
+    if (!ni) { close(fd); return 0; }
+    ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+    int same = 0;
+    if (na && na->data_size == size) {
+        same = 1;
+        s64 pos = 0;
+        while (pos < size) {
+            s64 chunk = size - pos < (s64)sizeof hbuf ? size - pos : (s64)sizeof hbuf;
+            if (pread(fd, hbuf, (size_t)chunk, (off_t)pos) != (ssize_t)chunk ||
+                ntfs_attr_pread(na, pos, chunk, nbuf) != chunk ||
+                memcmp(hbuf, nbuf, (size_t)chunk) != 0) {
+                same = 0;
+                break;
+            }
+            pos += chunk;
+        }
+    }
+    if (na) ntfs_attr_close(na);
+    ntfs_inode_close(ni);
+    close(fd);
+    return same;
+}
+
+static int hw_ls_ci_fill(void *de, const ntfschar *name, const int len, const int type, const s64 pos, const MFT_REF mref, const unsigned dt)
+{
+    (void)type; (void)pos; (void)mref; (void)dt;
+    struct hw_ls *l = de;
+    char *mb = NULL;
+    if (ntfs_ucstombs(name, len, &mb, 0) < 0 || !mb) return 0;
+    if (!strncasecmp(mb, l->prefix, strlen(l->prefix)) && l->n < 16 && strlen(mb) < 160) strcpy(l->names[l->n++], mb);
+    free(mb);
+    return 0;
+}
+
+static int cmp_str_ci(const void *a, const void *b)
+{
+    return strcasecmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int hw_ends_with_ci(const char *s, const char *suf)
+{
+    size_t sl = strlen(s), fl = strlen(suf);
+    return sl >= fl && strcasecmp(s + sl - fl, suf) == 0;
+}
+
+static int hw_pkg_sha256(const char *pkg_dir, char hex_out[65])
+{
+    DIR *d = opendir(pkg_dir);
+    if (!d) return -1;
+    char *names[64];
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && n < 64) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (!strcasecmp(de->d_name, "installed.sha") || !strcasecmp(de->d_name, "install.log") || hw_ends_with_ci(de->d_name, ".cat")) continue;
+        char hp[1200];
+        snprintf(hp, sizeof hp, "%s/%s", pkg_dir, de->d_name);
+        struct stat st;
+        if (stat(hp, &st) == 0 && S_ISREG(st.st_mode)) names[n++] = strdup(de->d_name);
+    }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof names[0], cmp_str_ci);
+
+    size_t cap = 4096, len = 0;
+    char *joined = malloc(cap);
+    if (!joined) { for (int i = 0; i < n; i++) free(names[i]); return -1; }
+    int ok = 1;
+    for (int i = 0; i < n && ok; i++) {
+        char hp[1200];
+        snprintf(hp, sizeof hp, "%s/%s", pkg_dir, names[i]);
+        int fd = open(hp, O_RDONLY);
+        struct stat st;
+        if (fd < 0 || fstat(fd, &st) != 0) { if (fd >= 0) close(fd); ok = 0; break; }
+        uint8_t *buf = malloc((size_t)(st.st_size > 0 ? st.st_size : 1));
+        if (!buf || (st.st_size > 0 && read(fd, buf, (size_t)st.st_size) != (ssize_t)st.st_size)) {
+            free(buf); close(fd); ok = 0; break;
+        }
+        close(fd);
+        uint8_t digest[32];
+        hw_sha256(buf, (size_t)st.st_size, digest);
+        free(buf);
+        size_t need = len + strlen(names[i]) + 1 + 64 + 2;
+        if (need > cap) {
+            cap = need * 2;
+            char *nj = realloc(joined, cap);
+            if (!nj) { ok = 0; break; }
+            joined = nj;
+        }
+        if (i > 0) joined[len++] = ';';
+        len += (size_t)snprintf(joined + len, cap - len, "%s:", names[i]);
+        for (int b = 0; b < 32; b++) len += (size_t)snprintf(joined + len, cap - len, "%02X", digest[b]);
+    }
+    for (int i = 0; i < n; i++) free(names[i]);
+    if (!ok) { free(joined); return -1; }
+
+    uint8_t final_digest[32];
+    hw_sha256((const uint8_t *)joined, len, final_digest);
+    free(joined);
+    for (int b = 0; b < 32; b++) snprintf(hex_out + b * 2, 3, "%02X", final_digest[b]);
+    hex_out[64] = '\0';
+    return 0;
+}
+
+/* Patches an already-installed PnP driver package directly inside DriverStore\FileRepository.
+ * Returns 1 if patched offline (no PnP reinstall needed), 0 if gpu-install.cmd is needed, -1 on error. */
+static int hw_patch_driverstore_pkg(ntfs_volume *vol, const char *assets_dir, const char *pkg, int *written)
+{
+    char pkg_dir[1100], inf_host[1200], prefix[160];
+    snprintf(pkg_dir, sizeof pkg_dir, "%s/guest/gpu/%s", assets_dir, pkg);
+    snprintf(inf_host, sizeof inf_host, "%s/%s.inf", pkg_dir, pkg);
+    if (access(inf_host, R_OK) != 0) return 1;
+
+    ntfs_inode *repo = ntfs_pathname_to_inode(vol, NULL, "/Windows/System32/DriverStore/FileRepository");
+    if (!repo) return 0;
+    snprintf(prefix, sizeof prefix, "%s.inf_", pkg);
+    struct hw_ls ls = { prefix, { { 0 } }, 0 };
+    s64 pos = 0;
+    ntfs_readdir(repo, &pos, &ls, hw_ls_ci_fill);
+    ntfs_inode_close(repo);
+    if (ls.n == 0) return 0;
+
+    for (int r = 0; r < ls.n; r++) {
+        char inf_ntfs[1200];
+        snprintf(inf_ntfs, sizeof inf_ntfs, "/Windows/System32/DriverStore/FileRepository/%s/%s.inf", ls.names[r], pkg);
+        if (!hw_ntfs_file_equals(vol, inf_ntfs, inf_host)) return 0;
+    }
+
+    DIR *d = opendir(pkg_dir);
+    if (!d) return 0;
+    char *files[64];
+    int nf = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && nf < 64) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (hw_ends_with_ci(de->d_name, ".inf") || hw_ends_with_ci(de->d_name, ".cat") ||
+            !strcasecmp(de->d_name, "installed.sha") || !strcasecmp(de->d_name, "install.log")) continue;
+        char hp[1200];
+        snprintf(hp, sizeof hp, "%s/%s", pkg_dir, de->d_name);
+        struct stat st;
+        if (stat(hp, &st) == 0 && S_ISREG(st.st_mode)) files[nf++] = strdup(de->d_name);
+    }
+    closedir(d);
+
+    for (int r = 0; r < ls.n; r++) {
+        for (int i = 0; i < nf; i++) {
+            char np[1200];
+            snprintf(np, sizeof np, "/Windows/System32/DriverStore/FileRepository/%s/%s", ls.names[r], files[i]);
+            if (!hw_ntfs_exists(vol, np)) {
+                for (int k = 0; k < nf; k++) free(files[k]);
+                return 0;
+            }
+        }
+    }
+
+    for (int i = 0; i < nf; i++) {
+        char hp[1200];
+        snprintf(hp, sizeof hp, "%s/%s", pkg_dir, files[i]);
+        for (int r = 0; r < ls.n; r++) {
+            char np[1200];
+            int did = 0;
+            snprintf(np, sizeof np, "/Windows/System32/DriverStore/FileRepository/%s/%s", ls.names[r], files[i]);
+            if (hw_ntfs_copy_file(vol, np, hp, &did) != 0) {
+                for (int k = 0; k < nf; k++) free(files[k]);
+                return -1;
+            }
+            if (did) (*written)++;
+        }
+        if (hw_ends_with_ci(files[i], ".sys")) {
+            char dp[1200];
+            snprintf(dp, sizeof dp, "/Windows/System32/drivers/%s", files[i]);
+            if (hw_ntfs_exists(vol, dp)) {
+                int did = 0;
+                if (hw_ntfs_copy_file(vol, dp, hp, &did) != 0) {
+                    for (int k = 0; k < nf; k++) free(files[k]);
+                    return -1;
+                }
+                if (did) (*written)++;
+            }
+        } else if (hw_ends_with_ci(files[i], ".dll")) {
+            char up[1200];
+            snprintf(up, sizeof up, "/Windows/System32/drivers/UMDF/%s", files[i]);
+            if (hw_ntfs_exists(vol, up)) {
+                int did = 0;
+                if (hw_ntfs_copy_file(vol, up, hp, &did) != 0) {
+                    for (int k = 0; k < nf; k++) free(files[k]);
+                    return -1;
+                }
+                if (did) (*written)++;
+            }
+        }
+    }
+    for (int k = 0; k < nf; k++) free(files[k]);
+
+    char hex[65], sha_ntfs[1200];
+    if (hw_pkg_sha256(pkg_dir, hex) == 0) {
+        snprintf(sha_ntfs, sizeof sha_ntfs, "/HyperWin/gpu/%s/installed.sha", pkg);
+        hw_ntfs_write_bytes(vol, sha_ntfs, hex, 64);
+    }
+    return 1;
+}
+
+JNIEXPORT jstring JNICALL
+Java_dev_hyperwin_app_MachinePrep_nativePatchGuest(JNIEnv *env, jobject self, jstring disk,
+                                                   jstring assets, jobject progress)
+{
+    (void)self;
+    const char *d = (*env)->GetStringUTFChars(env, disk, NULL);
+    const char *a = (*env)->GetStringUTFChars(env, assets, NULL);
+    char err[512] = "ok";
+    PrepJni pj = {env, progress, NULL};
+    PatchList list = {0};
+    ntfs_volume *vol = NULL;
+    if (progress) {
+        pj.step = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, progress), "step", "(ILjava/lang/String;)V");
+    }
+
+    int fd = d ? open(d, O_RDONLY) : -1;
+    uint64_t best = 0, best_first = 0;
+    if (fd >= 0) {
+        unsigned char hdr[512], ent[128];
+        if (pread(fd, hdr, sizeof hdr, 512) == (ssize_t)sizeof hdr) {
+            uint64_t tab = *(uint64_t *)(hdr + 72);
+            uint32_t n = *(uint32_t *)(hdr + 80), sz = *(uint32_t *)(hdr + 84);
+            for (uint32_t i = 0; i < n && sz == sizeof ent; i++) {
+                if (pread(fd, ent, sizeof ent, (off_t)(tab * 512 + (uint64_t)i * sz)) != (ssize_t)sizeof ent) break;
+                uint64_t first = *(uint64_t *)(ent + 32), last = *(uint64_t *)(ent + 40);
+                if (last >= first && last - first + 1 > best) { best = last - first + 1; best_first = first; }
+            }
+        }
+        close(fd);
+    }
+    if (!best || !a) {
+        snprintf(err, sizeof err, "Could not find the Windows partition on disk.");
+        goto out;
+    }
+
+    char win[1300];
+    snprintf(win, sizeof win, "hwwin:%llu:%llu:%s", (unsigned long long)(best_first * 512),
+             (unsigned long long)(best * 512), d);
+    ntfs_log_set_handler(hw_ntfs_log);
+    ntfs_log_set_levels(NTFS_LOG_LEVEL_ERROR | NTFS_LOG_LEVEL_PERROR | NTFS_LOG_LEVEL_WARNING);
+    errno = 0;
+    struct ntfs_device *ndev = ntfs_device_alloc(win, 0, &ntfs_device_default_io_ops, NULL);
+    vol = ndev ? ntfs_device_mount(ndev, NTFS_MNT_RECOVER | NTFS_MNT_IGNORE_HIBERFILE) : NULL;
+    if (!vol) {
+        snprintf(err, sizeof err,
+                 "Could not open the Windows partition (error %d). Start Windows and shut it down normally, then try again.",
+                 errno);
+        goto out;
+    }
+
+    char guest_dir[1100], drv_dir[1100], hp[1200];
+    snprintf(guest_dir, sizeof guest_dir, "%s/guest", a);
+    snprintf(drv_dir, sizeof drv_dir, "%s/drivers", a);
+    if (patch_collect_tree(guest_dir, "/HyperWin", &list) != 0) {
+        snprintf(err, sizeof err, "Could not read app guest files.");
+        goto out;
+    }
+    if (patch_collect_tree(drv_dir, "/Windows/System32/drivers", &list) != 0) {
+        snprintf(err, sizeof err, "Could not read app driver files.");
+        goto out;
+    }
+    snprintf(hp, sizeof hp, "%s/guest/gpu/hwgpu.sys", a);
+    if (access(hp, R_OK) == 0) patch_list_add(&list, hp, "/Windows/System32/drivers/hwgpu.sys");
+    snprintf(hp, sizeof hp, "%s/guest/gpu/hwfiles.sys", a);
+    if (access(hp, R_OK) == 0) patch_list_add(&list, hp, "/Windows/System32/drivers/hwfiles.sys");
+    snprintf(hp, sizeof hp, "%s/guest/gpu/hwfiles.exe", a);
+    if (access(hp, R_OK) == 0 && hw_ntfs_exists(vol, "/HyperWin/files")) {
+        patch_list_add(&list, hp, "/HyperWin/files/hwfiles.exe");
+    }
+    snprintf(hp, sizeof hp, "%s/guest/gpu/vulkan-1.dll", a);
+    if (access(hp, R_OK) == 0 && hw_ntfs_exists(vol, "/HyperWin/gpu/vulkan-1.ours")) {
+        patch_list_add(&list, hp, "/Windows/System32/vulkan-1.dll");
+    }
+    snprintf(hp, sizeof hp, "%s/guest/gpu/vulkan-1_x86.dll", a);
+    if (access(hp, R_OK) == 0 && hw_ntfs_exists(vol, "/HyperWin/gpu/vulkan-1-x86.ours")) {
+        patch_list_add(&list, hp, "/Windows/SysWOW64/vulkan-1.dll");
+    }
+
+    char cmd_host[1200];
+    snprintf(cmd_host, sizeof cmd_host, "%s/guest/gpu-install.cmd", a);
+    int need_pnp = !hw_ntfs_file_equals(vol, "/HyperWin/gpu-install.cmd", cmd_host);
+
+    int written = 0;
+    for (int i = 0; i < list.count; i++) {
+        if (pj.step) {
+            int pct = (i * 90) / (list.count > 0 ? list.count : 1);
+            prep_progress(&pj, pct, "Updating Windows files…");
+        }
+        int did = 0;
+        if (hw_ntfs_copy_file(vol, list.items[i].ntfs, list.items[i].host, &did) != 0) {
+            snprintf(err, sizeof err, "Could not write %s into Windows.", list.items[i].ntfs);
+            goto out;
+        }
+        if (did) written++;
+    }
+
+    static const char *const pnp_pkgs[] = { "hwgpuw", "hwidd", "hwaudio", "hwhid" };
+    for (int k = 0; k < 4; k++) {
+        if (pj.step) prep_progress(&pj, 90 + k * 2, "Updating DriverStore…");
+        int r = hw_patch_driverstore_pkg(vol, a, pnp_pkgs[k], &written);
+        if (r < 0) {
+            snprintf(err, sizeof err, "Could not update DriverStore package %s.", pnp_pkgs[k]);
+            goto out;
+        }
+        if (r == 0) need_pnp = 1;
+    }
+
+    if (need_pnp) {
+        if (hw_ntfs_write_bytes(vol, "/HyperWin/gpu/pending.install", "1\r\n", 3) != 0) {
+            snprintf(err, sizeof err, "Could not write update marker into Windows.");
+            goto out;
+        }
+    }
+    if (pj.step) prep_progress(&pj, 100, "Done");
+    __android_log_print(ANDROID_LOG_INFO, "HyperWin", "offline guest patch: updated %d files (need_pnp=%d)", written, need_pnp);
+
+out:
+    if (strcmp(err, "ok") != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "HyperWin", "offline guest patch failed: %s (errno=%d)", err, errno);
+    }
+    if (vol) ntfs_umount(vol, 0);
+    patch_list_free(&list);
+    if (d) (*env)->ReleaseStringUTFChars(env, disk, d);
+    if (a) (*env)->ReleaseStringUTFChars(env, assets, a);
+    return (*env)->NewStringUTF(env, err);
+}

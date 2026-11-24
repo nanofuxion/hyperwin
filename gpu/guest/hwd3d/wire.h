@@ -45,6 +45,96 @@ static void hlog(const char *fmt, ...)
     if (getenv("HWD3D_LOG")) fputs(s, stderr);
 }
 
+/* ---- the frame profile (speed plan, phase 0) ----
+ * HWD3D_PROFILE=1 (environment, or HKLM\SOFTWARE\HyperWin\Gpu): every 2 s, and at each present, the program says
+ * where a frame went on this side: calls sent without waiting (and the ring time they took, which includes waiting
+ * for room), calls that waited for the phone's answer, by method, and the time the lock waited for other threads.
+ * It writes to C:\Users\Public\hwd3d_prof.log, or HWD3D_PROFILE_LOG. */
+static int g_prof = -1;
+static LARGE_INTEGER g_pq_freq;
+#define PROF_KEYS 8192
+static struct { uint64_t n, ns; } g_prof_wait[PROF_KEYS];
+static uint64_t g_prof_async_n, g_prof_async_ns, g_prof_async_bytes, g_prof_wait_n, g_prof_wait_ns, g_prof_lock_ns;
+static uint64_t g_prof_frames, g_prof_t0, g_prof_last;
+
+static int prof_on(void)
+{
+    if (g_prof >= 0) return g_prof;
+    char v[8] = "";
+    g_prof = GetEnvironmentVariableA("HWD3D_PROFILE", v, sizeof v) && v[0] == '1';
+    if (!g_prof) {
+        HKEY k;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\HyperWin\\Gpu", 0, KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS) {
+            DWORD type = 0, len = sizeof v;
+            if (RegQueryValueExA(k, "HWD3D_PROFILE", NULL, &type, (BYTE *)v, &len) == ERROR_SUCCESS)
+                g_prof = (type == REG_DWORD && *(DWORD *)v) || (type == REG_SZ && v[0] == '1');
+            RegCloseKey(k);
+        }
+    }
+    QueryPerformanceFrequency(&g_pq_freq);
+    return g_prof;
+}
+
+static uint64_t prof_now(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)((double)t.QuadPart * 1e9 / (double)g_pq_freq.QuadPart);
+}
+
+static void prof_out(const char *fmt, ...)
+{
+    char s[600];
+    va_list a;
+    va_start(a, fmt);
+    int n = vsnprintf(s, sizeof s - 2, fmt, a);
+    va_end(a);
+    if (n <= 0) return;
+    s[n++] = '\n';
+    char path[MAX_PATH];
+    if (!GetEnvironmentVariableA("HWD3D_PROFILE_LOG", path, sizeof path)) lstrcpyA(path, "C:\\Users\\Public\\hwd3d_prof.log");
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(f, s, (DWORD)n, &w, NULL);
+        CloseHandle(f);
+    }
+}
+
+/* One frame ended (a present). Under no lock: it only reads and clears the counters, so another thread's call in
+ * the same instant may be counted in the next window, which is fine for a profile. */
+static void prof_frame(void)
+{
+    if (!prof_on()) return;
+    uint64_t now = prof_now();
+    if (!g_prof_t0) g_prof_t0 = g_prof_last = now;
+    g_prof_frames++;
+    if (now - g_prof_last < 2000000000ull) return;
+    double secs = (double)(now - g_prof_t0) / 1e9, f = (double)g_prof_frames;
+    char exe[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    const char *base = exe;
+    for (const char *q = exe; *q; q++) if (*q == '\\') base = q + 1;
+    prof_out("%s pid %lu: %.1f fps (%llu frames, %.1f s); per frame: %.1f calls sent without waiting (%.0f bytes, %.3f ms in the ring), "
+             "%.1f calls waited for an answer (%.3f ms), %.3f ms waiting for the lock; the rest of the %.3f ms is the program and the driver",
+             base, (unsigned long)GetCurrentProcessId(), f / secs, (unsigned long long)g_prof_frames, secs, g_prof_async_n / f,
+             g_prof_async_bytes / f, g_prof_async_ns / f / 1e6, g_prof_wait_n / f, g_prof_wait_ns / f / 1e6, g_prof_lock_ns / f / 1e6,
+             secs * 1000.0 / f - (g_prof_async_ns + g_prof_wait_ns + g_prof_lock_ns) / f / 1e6);
+    for (int round = 0; round < 12; round++) {
+        int best = -1;
+        for (int i = 0; i < PROF_KEYS; i++)
+            if (g_prof_wait[i].ns && (best < 0 || g_prof_wait[i].ns > g_prof_wait[best].ns)) best = i;
+        if (best < 0) break;
+        prof_out("    waited: op %d method %d: %.2f calls and %.3f ms per frame (%.1f us each)", best >> 9, best & 511,
+                 g_prof_wait[best].n / f, g_prof_wait[best].ns / f / 1e6, g_prof_wait[best].ns / (double)g_prof_wait[best].n / 1e3);
+        g_prof_wait[best].ns = 0;
+    }
+    memset(g_prof_wait, 0, sizeof g_prof_wait);
+    g_prof_async_n = g_prof_async_ns = g_prof_async_bytes = g_prof_wait_n = g_prof_wait_ns = g_prof_lock_ns = 0;
+    g_prof_frames = 0;
+    g_prof_t0 = g_prof_last = now;
+}
+
 static int raw_send(const void *m, uint32_t n) { return hwgpu_write_all(g_chan, g_gen, 1, m, n); }
 static int raw_recv(void *m, uint32_t n) { return hwgpu_read_all(g_chan, g_gen, 1, m, n); }
 
@@ -136,9 +226,60 @@ static void connect_channel(void)
         g_dev = dev;
         g_slot = o.slot;
         send_program();
-    } else
+    } else {
         hlog("hwd3d: the phone has no HwD3D %u (status 0x%lx), using Windows' Direct3D\n", HWD3D_VERSION,
              (unsigned long)r.r.status);
+        if (opened && g_adapter) {
+            struct hww_escape cl;
+            memset(&cl, 0, sizeof cl);
+            cl.op = HWW_ESC_CLOSE;
+            cl.u.slot = o.slot;
+            hww_call(g_adapter, &cl);
+        } else if (dev != INVALID_HANDLE_VALUE) {
+            CloseHandle(dev);
+        }
+        g_chan = NULL;
+        g_gen = 0;
+    }
+}
+
+static ULONGLONG g_last_connect_try;
+
+static void close_channel_locked(int drop_adapter)
+{
+    if (g_adapter && g_chan) {
+        struct hww_escape cl;
+        memset(&cl, 0, sizeof cl);
+        cl.op = HWW_ESC_CLOSE;
+        cl.u.slot = g_slot;
+        hww_call(g_adapter, &cl);
+    }
+    if (g_dev != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_dev);
+        g_dev = INVALID_HANDLE_VALUE;
+    }
+    if (drop_adapter && g_adapter) {
+        hww_close(g_adapter);
+        g_adapter = NULL;
+    }
+    g_chan = NULL;
+    g_ok = 0;
+    g_gen = 0;
+    g_slot = 0;
+    g_stage = NULL;
+    g_readback = NULL;
+    g_stage_cap = g_stage_pos = 0;
+    g_qpage = NULL;
+    memset(g_qused, 0, sizeof g_qused);
+    g_stage_tried = 0;
+    g_last_connect_try = 0;
+}
+
+static void close_channel(void)
+{
+    AcquireSRWLockExclusive(&g_lock);
+    close_channel_locked(1);
+    ReleaseSRWLockExclusive(&g_lock);
 }
 
 static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
@@ -150,17 +291,17 @@ static BOOL CALLBACK open_channel(PINIT_ONCE once, PVOID param, PVOID *ctx)
 
 /* The phone's GPU process restarted (a driver swap, or it was stopped): every object on the old
  * channel is gone and the devices on it are removed. A program that makes a new device, such as the
- * screen driver or DWM rebuilding, gets a new channel. The old one stays mapped, unused. */
+ * screen driver or DWM rebuilding, gets a new channel. The old one is closed so long-lived processes
+ * do not exhaust HWGPU_CHANNELS. */
 /* A driver update takes the channel's memory away from the process: reading it then would fault. */
 static int chan_alive(void)
 {
+    if (!g_chan) return 0;
     struct hwgpu_ctl *c = hwgpu_chan_ctl(g_chan);
     MEMORY_BASIC_INFORMATION mi;
     if (!VirtualQuery(c, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
     return hwgpu_alive(c, g_gen);
 }
-
-static ULONGLONG g_last_connect_try;
 
 static void reconnect_if_lost(void)
 {
@@ -172,15 +313,9 @@ static void reconnect_if_lost(void)
     if (!g_ok || !chan_alive()) {
         now = GetTickCount64();
         if (g_ok || !g_last_connect_try || now - g_last_connect_try >= 250) {
-            g_last_connect_try = now;
             if (g_ok) hlog("hwd3d: the phone's GPU restarted, opening a new channel\n");
-            g_ok = 0;
-            g_stage = NULL;
-            g_readback = NULL;
-            g_stage_cap = g_stage_pos = 0;
-            g_qpage = NULL;
-            memset(g_qused, 0, sizeof g_qused);
-            g_stage_tried = 0;
+            close_channel_locked(0);
+            g_last_connect_try = now;
             connect_channel();
         }
     }
@@ -190,6 +325,7 @@ static void reconnect_if_lost(void)
 static int ready(void)
 {
     InitOnceExecuteOnce(&g_once, open_channel, NULL, NULL);
+    if (g_prof < 0) prof_on();
     reconnect_if_lost();
     return g_ok;
 }
@@ -299,7 +435,12 @@ static void put_arr(struct wbuf *b, const void *p, uint64_t n, uint32_t el)
 
 static struct wbuf *begin(uint32_t object, uint32_t method, uint16_t op)
 {
-    AcquireSRWLockExclusive(&g_lock);
+    if (g_prof > 0) {
+        uint64_t t = prof_now();
+        AcquireSRWLockExclusive(&g_lock);
+        g_prof_lock_ns += prof_now() - t;
+    } else
+        AcquireSRWLockExclusive(&g_lock);
     struct wbuf *b = &g_w;
     b->n = 0;
     b->op = op;
@@ -331,12 +472,34 @@ static void call_abort(struct wbuf *b)
 static void call_async(struct wbuf *b)
 {
     seal(b, HWD3D_NO_REPLY);
-    raw_send(b->p, b->n);
+    if (g_prof > 0) {
+        uint64_t t = prof_now();
+        raw_send(b->p, b->n);
+        g_prof_async_ns += prof_now() - t;
+        g_prof_async_n++;
+        g_prof_async_bytes += b->n;
+    } else
+        raw_send(b->p, b->n);
     ReleaseSRWLockExclusive(&g_lock);
 }
 
 /* Sends and reads the answer. The lock stays held until call_end, while the outputs are read. */
+static int32_t call_wait_(struct wbuf *b, struct rd *r);
 static int32_t call_wait(struct wbuf *b, struct rd *r)
+{
+    if (g_prof <= 0) return call_wait_(b, r);
+    uint64_t t = prof_now();
+    int key = (int)((b->op & 15) << 9 | (((struct hwd3d_call *)b->p)->method & 511));
+    int32_t st = call_wait_(b, r);
+    uint64_t d = prof_now() - t;
+    g_prof_wait[key].n++;
+    g_prof_wait[key].ns += d;
+    g_prof_wait_n++;
+    g_prof_wait_ns += d;
+    return st;
+}
+
+static int32_t call_wait_(struct wbuf *b, struct rd *r)
 {
     seal(b, 0);
     struct hwd3d_reply rep;

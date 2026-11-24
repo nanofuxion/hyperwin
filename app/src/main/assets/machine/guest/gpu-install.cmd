@@ -4,13 +4,17 @@ rem the Vulkan driver vulkan_hwgpu.dll; also the input driver hwvsinput.sys, the
 rem service hwfiles.exe, the sound driver hwaudio.sys and the touch driver hwhid.sys. Run as administrator or SYSTEM, by firstboot.cmd on new machines and by
 rem the app on older ones. Safe to run again.
 set G=C:\HyperWin\gpu
+set "ERR=0"
+set "IFCHG=-IfChanged"
+if /i "%1"=="force" set "IFCHG="
 rem Only when the ring driver changed: the screen driver holds it open, so stopping it for nothing leaves it
 rem stopping until the next restart and the screen black.
 fc /b %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys >nul 2>&1 || (
-rem The storage service keeps the ring driver open, so it stops first.
-sc stop HyperWinFiles >nul 2>&1 && ping -n 3 127.0.0.1 >nul
+rem If the screen driver still holds hwgpu.sys open, move the old file aside so the new one loads at the next start.
 sc stop hwgpu >nul 2>&1
-copy /y %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys
+del %SystemRoot%\System32\drivers\hwgpu.old >nul 2>&1
+move /y %SystemRoot%\System32\drivers\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.old >nul 2>&1 && echo 1> %G%\reboot.needed
+copy /y %G%\hwgpu.sys %SystemRoot%\System32\drivers\hwgpu.sys || set "ERR=1"
 )
 sc query hwgpu >nul 2>&1 || sc create hwgpu type= kernel start= auto binPath= System32\drivers\hwgpu.sys DisplayName= "HyperWin GPU ring"
 sc config hwgpu start= auto
@@ -27,39 +31,48 @@ rem one is moved aside, and the new one loads at the next start.
 set D=%SystemRoot%\System32\drivers
 fc /b %G%\hwvsinput.sys %D%\hwvsinput.sys >nul 2>&1 || (
   del %D%\hwvsinput.old >nul 2>&1
-  move /y %D%\hwvsinput.sys %D%\hwvsinput.old >nul
-  copy /y %G%\hwvsinput.sys %D%\hwvsinput.sys
+  move /y %D%\hwvsinput.sys %D%\hwvsinput.old >nul && echo 1> %G%\reboot.needed
+  copy /y %G%\hwvsinput.sys %D%\hwvsinput.sys || set "ERR=1"
 )
-rem Phone storage as drives: WinFsp, then the HyperWinFiles service on it (guest/files/hwfiles.c).
-rem It runs from its own folder, so the app can send a new one while it runs.
+rem Repair ROOT\HWVSINPUT\0000 (the gamepad bus PDO) if Windows PnP marked it FAILEDINSTALL (ConfigFlags=64).
+reg query HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 >nul 2>&1 && (
+  reg add HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 /v ConfigFlags /t REG_DWORD /d 0 /f >nul 2>&1
+  reg add HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 /v ClassGUID /t REG_SZ /d "{4d36e97d-e325-11ce-bfc1-08002be10318}" /f >nul 2>&1
+  reg add HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 /v Class /t REG_SZ /d System /f >nul 2>&1
+  reg add HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 /v DeviceDesc /t REG_SZ /d "HyperWin gamepad bus" /f >nul 2>&1
+  reg add HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 /v Mfg /t REG_SZ /d HyperWin /f >nul 2>&1
+  reg delete HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\HWVSINPUT\0000 /v DeviceReported /f >nul 2>&1
+  pnputil /restart-device ROOT\HWVSINPUT\0000 >nul 2>&1
+)
+rem Phone storage as drives: its own kernel mapper (hwfiles.sys), WinFsp, and the HyperWinFiles service.
+fc /b %G%\hwfiles.sys %SystemRoot%\System32\drivers\hwfiles.sys >nul 2>&1 || (
+  sc stop HyperWinFiles >nul 2>&1 && ping -n 3 127.0.0.1 >nul
+  sc stop hwfiles >nul 2>&1
+  del %SystemRoot%\System32\drivers\hwfiles.old >nul 2>&1
+  move /y %SystemRoot%\System32\drivers\hwfiles.sys %SystemRoot%\System32\drivers\hwfiles.old >nul 2>&1 && echo 1> %G%\reboot.needed
+  copy /y %G%\hwfiles.sys %SystemRoot%\System32\drivers\hwfiles.sys || set "ERR=1"
+)
+sc query hwfiles >nul 2>&1 || sc create hwfiles type= kernel start= auto binPath= System32\drivers\hwfiles.sys DisplayName= "HyperWin phone storage driver"
+sc config hwfiles start= auto
+sc start hwfiles >nul 2>&1
 reg query HKLM\SOFTWARE\WOW6432Node\WinFsp /v InstallDir >nul 2>&1 || msiexec /i %G%\winfsp.msi /qn /norestart
 if not exist C:\HyperWin\files mkdir C:\HyperWin\files
-copy /y %G%\hwfiles.exe C:\HyperWin\files\hwfiles.exe
+fc /b %G%\hwfiles.exe C:\HyperWin\files\hwfiles.exe >nul 2>&1 || (
+  sc stop HyperWinFiles >nul 2>&1 && ping -n 3 127.0.0.1 >nul
+  copy /y %G%\hwfiles.exe C:\HyperWin\files\hwfiles.exe || set "ERR=1"
+)
 sc query HyperWinFiles >nul 2>&1 || sc create HyperWinFiles type= own start= auto binPath= C:\HyperWin\files\hwfiles.exe DisplayName= "HyperWin phone storage"
 sc failure HyperWinFiles reset= 60 actions= restart/2000 >nul
 sc start HyperWinFiles
-rem Speakers and microphone over the shared window (audio/README.md), and the touch screen and
-rem touchpad (mouse/README.md), each installed again when its driver changes. The script makes and
-rem signs the package's catalog; for sound it also takes out the older Scream card.
-fc /b %G%\hwaudio\hwaudio.sys %SystemRoot%\System32\drivers\hwaudio.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwaudio Root\HwAudio
-fc /b %G%\hwhid\hwhid.sys %SystemRoot%\System32\drivers\hwhid.sys >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwhid Root\HwHid
-rem The render-only GPU adapter (wddm/README.md). Windows runs it from the driver store, so what is
-rem installed is remembered by the package's hash rather than by a copy in System32.
-rem The firmware describes the GPU as ACPI\HWGP0001, with an interrupt line that Windows needs for the
-rem screen. Older firmware had none, and the adapter was a root device; that one goes once the ACPI one exists.
-set "GPUID=Root\HwGpuAdapter"
-rem (The ACPI device does not take the driver yet: wddm/README.md. The root device stays the one we install.)
-set "NEWH="
-for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwgpuw\hwgpuw.inf SHA256 2^>nul') do if not defined NEWH set "NEWH=%%h"
-set "OLDH="
-if exist %G%\hwgpuw\installed.sha set /p OLDH=<%G%\hwgpuw\installed.sha
-if defined NEWH if not "%NEWH%"=="%OLDH%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwgpuw %GPUID% && (echo %NEWH%> %G%\hwgpuw\installed.sha)
-rem The phone-screen driver (gpu/guest/idd), installed again when its package changes.
-set "NEWI="
-for /f "skip=1 tokens=*" %%h in ('certutil -hashfile %G%\hwidd\hwidd.inf SHA256 2^>nul') do if not defined NEWI set "NEWI=%%h"
-set "OLDI="
-if exist %G%\hwidd\installed.sha set /p OLDI=<%G%\hwidd\installed.sha
-if defined NEWI if not "%NEWI%"=="%OLDI%" powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwidd Root\HwIdd && (echo %NEWI%> %G%\hwidd\installed.sha)
+rem Speakers and microphone, touch screen and touchpad, the ACPI render-only GPU adapter, and phone-screen driver.
+rem install-driver.ps1 hashes all files in each package folder and skips unchanged healthy packages unless forced.
+rem Older installs also created a synthetic ROOT adapter. Remove it so the single-instance miniport has only ACPI\HWGP0001.
+"%G%\hwdev.exe" remove Root\HwGpuAdapter >nul 2>&1
+set "GPUID=ACPI\HWGP0001"
+powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwaudio Root\HwAudio %IFCHG% || set "ERR=1"
+powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwhid Root\HwHid %IFCHG% || set "ERR=1"
+powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwgpuw %GPUID% %IFCHG% || set "ERR=1"
+powershell -NoProfile -ExecutionPolicy Bypass -File %G%\install-driver.ps1 hwidd Root\HwIdd %IFCHG% || set "ERR=1"
 rem The desktop on the phone's GPU (wddm/README.md): DWM and the screen driver use the HyperWin GPU, and the
 rem screen driver asks for it. Set once; a value someone changed is left alone.
 reg query HKLM\SOFTWARE\HyperWin\Gpu /v HWD3D_SYSTEM >nul 2>&1 || reg add HKLM\SOFTWARE\HyperWin\Gpu /v HWD3D_SYSTEM /t REG_SZ /d dwm.exe,WUDFHost.exe /f >nul
@@ -80,7 +93,7 @@ for /d %%u in (C:\Users\*) do if exist "%%u\AppData\Roaming\Microsoft\Windows\Se
 call :sendto "C:\Users\Default\AppData\Roaming\Microsoft\Windows\SendTo"
 rem USB passthrough has its own installer, kept apart so a USB failure never touches the display.
 if exist %G%\usb\install-usb.cmd call %G%\usb\install-usb.cmd
-exit /b 0
+exit /b %ERR%
 
 :sendto
 if not exist "%~1" mkdir "%~1"

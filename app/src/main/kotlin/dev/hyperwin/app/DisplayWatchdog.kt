@@ -64,14 +64,17 @@ object DisplayWatchdog {
     /** Runs [then] when the guest frame is all but black. No frame at all counts as black too. */
     private fun onBlack(ctx: Context, then: () -> Unit) {
         val w = AvfLaunch.sharedWindow
-        val peak = if (w == null) -1 else WindowBridge.nativeFramePeak(w.buffer)
+        val peak = w?.withBuffer { WindowBridge.nativeFramePeak(it) } ?: -1
         note(ctx, "brightest sample in the guest frame: $peak")
         if (peak < 40) then()
     }
 
     private fun failOver(ctx: Context) {
-        note(ctx, "black screen: switching to the software display")
-        GuestAgent.exec("cmd /c reg add $KEY /v IddRender /t REG_DWORD /d 0 /f & pnputil /restart-device ROOT\\DISPLAY\\0000 & " +
+        note(ctx, "FALLBACK: black screen after ${(System.currentTimeMillis() - startedAt) / 1000}s; capturing display-driver state and switching to software display")
+        GuestAgent.exec("cmd /c echo === FALLBACK %DATE% %TIME% === >> C:\\ProgramData\\HyperWin\\watchdog-fallback.log & " +
+            "C:\\HyperWin\\gpu\\dispinfo.exe >> C:\\ProgramData\\HyperWin\\watchdog-fallback.log 2>&1 & " +
+            "powershell -NoProfile -Command \"Get-Content C:\\ProgramData\\HyperWin\\idd.log -Tail 25\" >> C:\\ProgramData\\HyperWin\\watchdog-fallback.log 2>&1 & " +
+            "reg add $KEY /v IddRender /t REG_DWORD /d 0 /f & pnputil /restart-device ROOT\\DISPLAY\\0000 & " +
             // Only this start runs on the software screen; the next one tries the GPU again.
             "ping -n 21 127.0.0.1 >nul & reg add $KEY /v IddRender /t REG_DWORD /d 1 /f")
         main.post { Toast.makeText(ctx, "The display didn't load. Switched to the software display.", Toast.LENGTH_LONG).show() }

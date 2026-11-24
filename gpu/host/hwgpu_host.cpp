@@ -47,6 +47,8 @@
 #ifdef __ANDROID__
 #include <android/hardware_buffer.h>
 #include <android/surface_control.h>
+#include <android/choreographer.h>
+#include <android/looper.h>
 #include <dlfcn.h>
 #include <poll.h>
 #include <unistd.h>
@@ -76,6 +78,7 @@ struct Mapping {
 struct Slot {
     uint32_t generation = 0;  // the connection being served, 0 for none
     bool hwd3d = false;       // libhwd3d.so's thread serves this connection, not serve_one
+    bool handed = false;      // the games process serves it (hwgpu_host_handoff): this one leaves it alone
     std::set<uint32_t> resources, contexts;
     // Heap ranges a process still had mapped when this renderer started: kept from reuse until
     // that process lets go of its channel.
@@ -153,6 +156,14 @@ int heap_release(void* p) {
 uint8_t* g_window = nullptr;
 bool g_inited = false;
 std::atomic<bool> g_run{false};
+
+// Two processes serve the GPU. The desktop one (role 0) owns the rings: it answers every channel first
+// and keeps DWM and the screen driver. A Direct3D program it hands to the games process (role 1,
+// HWGPU_ROLE=games), which serves only those, so a game that takes its process down leaves the desktop up.
+int g_role = 0;
+hwgpu_handoff_cb g_handoff_cb = nullptr;
+hwgpu_hole_cb g_hole_cb = nullptr;
+bool g_remote_hole = false;  // desktop: a windowed game in the games process shows through g_scan.hole
 std::thread g_thread;
 std::vector<vgpu_resp_capset_info> g_capsets;
 std::map<uint32_t, Backing> g_backing;
@@ -250,6 +261,7 @@ struct Scan {
     ASurfaceControl* cursor_layer = nullptr;
     ASurfaceControl* overlay_layer = nullptr;  // a windowed program's frames, over the desktop at its client rect
     bool overlay_visible = false;
+    int32_t hole[4] = {0, 0, 0, 0};  // the windowed program's visible rect, guest screen pixels: cut out of the desktop
     AHardwareBuffer* cursor_ahb = nullptr;
     AHardwareBuffer* last_desk_ahb = nullptr;
 #endif
@@ -270,6 +282,20 @@ struct Scan {
 } g_scan;
 
 #ifdef __ANDROID__
+// The games process's own layer under the desktop, the parent of a windowed game's layer, or null.
+ASurfaceControl* g_under_layer = nullptr;
+
+// Games process: tells the desktop process (through the app) where the desktop must be see-through,
+// when that changed. g_scan.lock held.
+void tell_hole_locked() {
+    if (g_role != 1 || !g_hole_cb) return;
+    static int32_t last[5] = {-1, 0, 0, 0, 0};
+    int32_t now[5] = {g_scan.overlay_visible ? 1 : 0, g_scan.hole[0], g_scan.hole[1], g_scan.hole[2], g_scan.hole[3]};
+    if (!memcmp(last, now, sizeof now)) return;
+    memcpy(last, now, sizeof now);
+    g_hole_cb(now[0], now[1], now[2], now[3], now[4]);
+}
+
 // Hides the overlay layer (g_scan.lock held) when `slot` owns it, or for any slot when slot < 0.
 void hide_overlay_locked(int slot) {
     if (slot >= 0 && g_overlay_slot.load(std::memory_order_relaxed) != slot) return;
@@ -282,6 +308,8 @@ void hide_overlay_locked(int slot) {
         ASurfaceTransaction_delete(t);
     }
     g_scan.overlay_visible = false;
+    memset(g_scan.hole, 0, sizeof g_scan.hole);
+    tell_hole_locked();
 }
 
 // Ensures g_scan.cursor_ahb exists (64x64 RGBA8888), initialized with a default white/black-outline arrow.
@@ -342,6 +370,9 @@ void ensure_cursor_ahb_locked() {
 // Updates the hardware cursor child layer above g_scan.layer (g_scan.lock held).
 void update_cursor_locked(int slot) {
     if (!g_scan.cursor_layer || !g_window) return;
+    // Windows' display driver gives the pointer to the pointer layer (pointer_loop): no second one here.
+    auto* hp = reinterpret_cast<const hwgpu_pointer*>(g_window + HWGPU_POINTER_OFF);
+    if (__atomic_load_n(&hp->magic, __ATOMIC_ACQUIRE) == HWGPU_POINTER_MAGIC) slot = -1;
     if (slot < 0 || slot >= int(HWGPU_CHANNELS) ||
         (g_game_scanout_slot.load(std::memory_order_relaxed) != slot &&
          g_overlay_slot.load(std::memory_order_relaxed) != slot)) {
@@ -497,7 +528,10 @@ void apply_locked(Frame f) {
         ASurfaceTransaction_setOnComplete(t, a, on_complete);
         g_scan.inflight = true;
     }
-    ASurfaceTransaction_setBufferTransparency(t, g_scan.layer, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+    // A windowed program's layer is under the desktop: the desktop is see-through where it shows it.
+    ASurfaceTransaction_setBufferTransparency(t, g_scan.layer, (g_scan.overlay_visible || g_remote_hole) && f.slot == HWGPU_CHANNELS
+                                                                   ? ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT
+                                                                   : ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
     ASurfaceTransaction_setPosition(t, g_scan.layer, 0, 0);
     if (g_scan.view_w > 0 && g_scan.view_h > 0 && f.width && f.height)
         ASurfaceTransaction_setScale(t, g_scan.layer, float(g_scan.view_w) / float(f.width),
@@ -1130,7 +1164,7 @@ bool start_hwd3d(uint32_t i, uint32_t gen, const uint8_t* first, size_t len) {
         // Ended by the program closing, or by a bad stream: then stop serving the channel, and
         // its program gets errors until it closes the device, as with sgpu.
         hwgpu_ctl* c = hwgpu_chan_ctl(chan);
-        if (hwgpu_alive(c, gen)) __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
+        if (!g_slots[i].handed && hwgpu_alive(c, gen)) __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
         g_hwd3d_threads--;
     }).detach();
     return true;
@@ -1161,6 +1195,7 @@ bool serve_one(uint32_t i) {
         __atomic_store_n(&c->scanout_flags, g_scanout_flags.load(), __ATOMIC_RELEASE);
         s.generation = gen;
         s.hwd3d = false;
+        s.handed = false;
         __atomic_store_n(&c->host_state, HWGPU_HOST_READY, __ATOMIC_RELEASE);
         LOG("channel %u open, generation %u", i, gen);
     }
@@ -1275,18 +1310,233 @@ void gpu_name(char* out, size_t size) {
 #endif
 }
 
+#ifdef __ANDROID__
+// ---- Windows' pointer, on a layer of its own over everything (hwgpu_ring.h, struct hwgpu_pointer) ----
+namespace {
+std::mutex g_pointer_lock;
+ASurfaceControl* g_pointer_layer = nullptr;  // the app's layer over the desktop and every game
+AHardwareBuffer* g_pointer_ahb = nullptr;
+std::thread g_pointer_thread;
+uint32_t g_pointer_seq = 0, g_pointer_shape = 0;
+bool g_pointer_shown = false, g_pointer_fresh = true;
+
+// Copies the driver's picture into the layer's buffer. g_pointer_lock held.
+void pointer_shape_locked(const hwgpu_pointer* p) {
+    if (!g_pointer_ahb) {
+        AHardwareBuffer_Desc d{};
+        d.width = HWGPU_POINTER_MAX;
+        d.height = HWGPU_POINTER_MAX;
+        d.layers = 1;
+        d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        d.usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                  AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+        if (AHardwareBuffer_allocate(&d, &g_pointer_ahb)) {
+            d.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
+            if (AHardwareBuffer_allocate(&d, &g_pointer_ahb)) return;
+        }
+    }
+    AHardwareBuffer_Desc d{};
+    AHardwareBuffer_describe(g_pointer_ahb, &d);
+    void* dst = nullptr;
+    if (AHardwareBuffer_lock(g_pointer_ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &dst) || !dst) return;
+    uint32_t w = std::min(p->width, HWGPU_POINTER_MAX), h = std::min(p->height, HWGPU_POINTER_MAX);
+    for (uint32_t y = 0; y < HWGPU_POINTER_MAX; y++) {
+        auto* row = static_cast<uint32_t*>(dst) + size_t(y) * d.stride;
+        for (uint32_t x = 0; x < HWGPU_POINTER_MAX; x++) row[x] = (x < w && y < h) ? p->rgba[y * w + x] : 0;
+    }
+    AHardwareBuffer_unlock(g_pointer_ahb, nullptr);
+    g_pointer_fresh = true;  // the layer takes the buffer again
+}
+
+// Puts the pointer where the driver says, in the view's pixels. g_pointer_lock held.
+void pointer_apply_locked(const hwgpu_pointer* p) {
+    if (!g_pointer_layer) return;
+    int vw, vh;
+    {
+        std::lock_guard<std::mutex> sl(g_scan.lock);
+        vw = g_scan.view_w;
+        vh = g_scan.view_h;
+    }
+    bool show = p->visible && g_pointer_ahb && p->screen_w && p->screen_h && vw > 0 && vh > 0;
+    ASurfaceTransaction* t = ASurfaceTransaction_create();
+    if (show) {
+        float sx = float(vw) / float(p->screen_w), sy = float(vh) / float(p->screen_h);
+        if (g_pointer_fresh) {
+            ASurfaceTransaction_setBuffer(t, g_pointer_layer, g_pointer_ahb, -1);
+            ASurfaceTransaction_setBufferTransparency(t, g_pointer_layer, ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT);
+            g_pointer_fresh = false;
+        }
+        ASurfaceTransaction_setPosition(t, g_pointer_layer, int(float(p->x) * sx), int(float(p->y) * sy));
+        ASurfaceTransaction_setScale(t, g_pointer_layer, sx, sy);
+    }
+    if (show != g_pointer_shown)
+        ASurfaceTransaction_setVisibility(t, g_pointer_layer, show ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
+                                                                   : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+    ASurfaceTransaction_apply(t);
+    ASurfaceTransaction_delete(t);
+    g_pointer_shown = show;
+}
+
+// Follows the driver's pointer block: every 2 ms while it moves, slower when it rests.
+void pointer_loop() {
+    auto* p = reinterpret_cast<const hwgpu_pointer*>(g_window + HWGPU_POINTER_OFF);
+    uint32_t idle = 0;
+    while (g_run.load(std::memory_order_relaxed)) {
+        uint32_t seq = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&p->magic, __ATOMIC_ACQUIRE) == HWGPU_POINTER_MAGIC && seq != g_pointer_seq) {
+            std::lock_guard<std::mutex> l(g_pointer_lock);
+            g_pointer_seq = seq;
+            uint32_t shape = __atomic_load_n(&p->shape_seq, __ATOMIC_ACQUIRE);
+            if (shape != g_pointer_shape) {
+                g_pointer_shape = shape;
+                pointer_shape_locked(p);
+            }
+            pointer_apply_locked(p);
+            idle = 0;
+        } else if (idle < 500) {
+            idle++;
+        }
+        usleep(idle < 500 ? 2000 : 8000);
+    }
+}
+}  // namespace
+#endif
+
+#ifdef __ANDROID__
+// ---- the phone's refreshes, for Windows (hwgpu_ring.h, struct hwgpu_vsync) ----
+namespace {
+std::thread g_vsync_thread;
+
+inline uint64_t counter() {
+    uint64_t v;
+    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+inline uint64_t counter_freq() {
+    uint64_t f;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return f;
+}
+
+struct VsyncState {
+    hwgpu_vsync* v;
+    uint64_t freq;
+    int64_t last_ns = 0;
+};
+
+// CLOCK_MONOTONIC nanoseconds to counter ticks, through a reading of both now.
+uint64_t ns_to_ticks(int64_t ns, uint64_t freq) {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t c = counter();
+    int64_t now = int64_t(ts.tv_sec) * 1000000000ll + ts.tv_nsec;
+    return c - uint64_t(__int128(now - ns) * freq / 1000000000ll);
+}
+
+void on_vsync(const AChoreographerFrameCallbackData* d, void* arg) {
+    auto* st = static_cast<VsyncState*>(arg);
+    hwgpu_vsync* v = st->v;
+    int64_t t = AChoreographerFrameCallbackData_getFrameTimeNanos(d);
+    size_t n = AChoreographerFrameCallbackData_getFrameTimelinesLength(d);
+    size_t pick = AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex(d);
+    int64_t present = n ? AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos(d, pick) : 0;
+    int64_t deadline = n ? AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos(d, pick) : 0;
+    // The period from two timelines when there are, else from the last two refreshes.
+    int64_t period = n >= 2 ? AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos(d, 1) -
+                                  AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos(d, 0)
+                            : (st->last_ns ? t - st->last_ns : 0);
+    st->last_ns = t;
+    __atomic_add_fetch(&v->seq, 1, __ATOMIC_ACQ_REL);  // odd: writing
+    v->count++;
+    v->last = ns_to_ticks(t, st->freq);
+    if (period > 0) {
+        v->period = uint64_t(period) * st->freq / 1000000000ull;
+        v->hz_milli = uint32_t(1000000000000ll / period);
+    }
+    if (present) v->next_present = ns_to_ticks(present, st->freq);
+    if (deadline) v->next_deadline = ns_to_ticks(deadline, st->freq);
+    __atomic_add_fetch(&v->seq, 1, __ATOMIC_ACQ_REL);  // even: stable
+    if (g_run.load(std::memory_order_relaxed)) AChoreographer_postVsyncCallback(AChoreographer_getInstance(), on_vsync, arg);
+}
+
+// Answers Windows' clock questions: polls every 2 ms, and without sleeping for a second once asked.
+void vsync_loop() {
+    ALooper_prepare(0);
+    VsyncState st{reinterpret_cast<hwgpu_vsync*>(g_window + HWGPU_VSYNC_OFF), counter_freq()};
+    hwgpu_vsync* v = st.v;
+    v->freq = uint32_t(st.freq);
+    v->magic = HWGPU_VSYNC_MAGIC;
+    AChoreographer_postVsyncCallback(AChoreographer_getInstance(), on_vsync, &st);
+    while (g_run.load(std::memory_order_relaxed)) {
+        ALooper_pollOnce(2, nullptr, nullptr, nullptr);
+        if (!__atomic_load_n(&v->calibrate, __ATOMIC_ACQUIRE)) continue;
+        uint64_t until = counter() + st.freq;
+        while (counter() < until && g_run.load(std::memory_order_relaxed)) {
+            uint32_t ask = __atomic_load_n(&v->ask, __ATOMIC_ACQUIRE);
+            if (ask == __atomic_load_n(&v->answer, __ATOMIC_RELAXED)) continue;
+            v->host_t = counter();
+            __atomic_store_n(&v->answer, ask, __ATOMIC_RELEASE);
+        }
+        __atomic_store_n(&v->calibrate, 0u, __ATOMIC_RELEASE);
+    }
+    // The callback may still be queued: it sees g_run off and stops; the state outlives the looper.
+    ALooper_pollOnce(50, nullptr, nullptr, nullptr);
+}
+}  // namespace
+#endif
+
+void hwgpu_host_set_pointer_layer(void* layer) {
+#ifdef __ANDROID__
+    std::lock_guard<std::mutex> l(g_pointer_lock);
+    if (g_pointer_layer) ASurfaceControl_release(g_pointer_layer);
+    g_pointer_layer = static_cast<ASurfaceControl*>(layer);
+    g_pointer_shown = false;
+    g_pointer_fresh = true;
+    g_pointer_seq--;  // shown again on the next look
+#else
+    (void)layer;
+#endif
+}
+
 int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_bytes, uint32_t renderer_flags,
                      uint32_t width, uint32_t height) {
     if (!window || window_bytes < HWGPU_RING_OFF + HWGPU_RING_BYTES) return -EINVAL;
     if (g_run.load()) return -EBUSY;
     g_trace = getenv("HWGPU_TRACE") != nullptr;
+    const char* role = getenv("HWGPU_ROLE");
+    g_role = role && !strcmp(role, "games") ? 1 : 0;
     if (heap && heap_bytes && !g_heap) {
         g_heap = static_cast<uint8_t*>(heap);
         g_heap_size = heap_bytes & ~(kHeapPage - 1);
         g_heap_free.clear();
         g_heap_used.clear();
-        g_heap_free[0] = g_heap_size;
-        gfxstream_set_host_memory_allocator(heap_alloc, heap_release);
+        // Each process allocates from its own half, so neither hands out memory the other uses.
+        uint64_t half = (g_heap_size / 2) & ~(kHeapPage - 1);
+        if (g_role == 1) g_heap_free[half] = g_heap_size - half;
+        else g_heap_free[0] = half;
+        if (g_role == 0) gfxstream_set_host_memory_allocator(heap_alloc, heap_release);
+    }
+    if (g_role == 1) {
+        // The games process serves only the channels handed to it, through libhwd3d.so: no gfxstream,
+        // and the rings' header and channel states stay the desktop process's.
+        g_window = static_cast<uint8_t*>(window);
+        // A games process that came before may have lent ranges of this half to programs still
+        // running: those stay out of use while this process lives.
+        for (uint32_t i = 0; i < HWGPU_CHANNELS && g_heap; i++) {
+            hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(i));
+            for (uint32_t g = 0; g < HWGPU_GRANTS; g++) {
+                uint64_t size = __atomic_load_n(&c->grant[g].size, __ATOMIC_ACQUIRE), off = c->grant[g].offset;
+                std::lock_guard<std::mutex> hl(g_heap_lock);
+                if (size && off <= g_heap_size && size <= g_heap_size - off) heap_take(off, size);
+            }
+        }
+#ifdef __ANDROID__
+        g_set_buffer_with_release = reinterpret_cast<SetBufferWithRelease>(
+            dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBufferWithRelease"));
+#endif
+        g_run = true;
+        LOG("games process ready");
+        return 0;
     }
     if (!g_inited) {
         // See SweetCider's tools/gfxstream-android/android.patch: one thread serves every guest
@@ -1390,6 +1640,10 @@ int hwgpu_host_start(void* window, size_t window_bytes, void* heap, size_t heap_
 
     g_run = true;
     g_thread = std::thread(serve_loop);
+#ifdef __ANDROID__
+    g_pointer_thread = std::thread(pointer_loop);
+    g_vsync_thread = std::thread(vsync_loop);
+#endif
     return 0;
 }
 
@@ -1399,7 +1653,10 @@ int hwgpu_host_set_layer(void* layer, int view_width, int view_height) {
     g_scan.view_h = view_height;
 #ifdef __ANDROID__
     auto* sc = static_cast<ASurfaceControl*>(layer);
-    if (sc == g_scan.layer) return 0;  // only a new size
+    // The games process gets the app's layer over the desktop, and makes the game's and the cursor's
+    // layers in it: hiding the game then leaves the cursor up over a windowed game.
+    static ASurfaceControl* top = nullptr;
+    if (g_role == 1 ? sc == top : sc == g_scan.layer) return 0;  // only a new size
     // A new layer (or none): what the old one showed is gone from the screen with it.
     forget_shown_locked();
     g_scan.has_shown = false;
@@ -1419,6 +1676,11 @@ int hwgpu_host_set_layer(void* layer, int view_width, int view_height) {
     g_scan.cursor_buffer_dirty = true;
     if (g_scan.layer) ASurfaceControl_release(g_scan.layer);
     g_scan.layer = sc;  // the caller's reference passes to us
+    if (g_role == 1) {
+        if (top) ASurfaceControl_release(top);
+        top = sc;
+        g_scan.layer = sc ? ASurfaceControl_create(sc, "hyperwin-game") : nullptr;
+    }
     if (sc) g_scan.cursor_layer = ASurfaceControl_create(sc, "hyperwin-cursor");
     {
         std::lock_guard<std::mutex> dl(g_desk_lock);
@@ -1635,7 +1897,8 @@ void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uin
     if (!ahb || slot >= HWGPU_CHANNELS || !width || !height) return;
     std::lock_guard<std::mutex> sl(g_scan.lock);
     if (!g_scan.layer) return;
-    if (!g_scan.overlay_layer) g_scan.overlay_layer = ASurfaceControl_create(g_scan.layer, "hyperwin-window");
+    if (!g_scan.overlay_layer)
+        g_scan.overlay_layer = ASurfaceControl_create(g_under_layer ? g_under_layer : g_scan.layer, "hyperwin-window");
     if (!g_scan.overlay_layer) return;
     if (g_window) __atomic_store_n(&hwgpu_chan_ctl(chan_base(slot))->scanout_active, 1u, __ATOMIC_RELEASE);
     g_overlay_slot.store(int(slot), std::memory_order_release);
@@ -1645,18 +1908,65 @@ void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uin
     ASurfaceTransaction_setPosition(t, g_scan.overlay_layer, x, y);
     ASurfaceTransaction_setScale(t, g_scan.overlay_layer, float(cw) / float(width), float(ch) / float(height));
     if (crop && crop[2] > crop[0] && crop[3] > crop[1]) {
-        ARect cr{int32_t(crop[0]), int32_t(crop[1]), int32_t(crop[2]), int32_t(crop[3])};
+        ARect cr{int32_t(crop[0]), int32_t(crop[1]), int32_t(crop[2]), int32_t(crop[3])};  // client pixels
         ASurfaceTransaction_setCrop(t, g_scan.overlay_layer, cr);
     }
-    ASurfaceTransaction_setZOrder(t, g_scan.overlay_layer, 0);
+    // Under the desktop, not over it: the desktop has a hole there (hwgpu_host_window_hole), so windows
+    // above the program and the desktop itself stay on top, and a program that breaks covers nothing.
+    // In the games process the layer's parent is the app's layer under the desktop, in screen pixels:
+    // it is scaled like the desktop, from Windows' screen size to the view's.
+    ASurfaceTransaction_setZOrder(t, g_scan.overlay_layer, g_under_layer ? 0 : -1);
+    if (g_under_layer) {
+        // Windows' screen mode, as the display driver last said (a game may have changed it), else the app's.
+        auto* wh = reinterpret_cast<const struct hw_header*>(g_window);
+        auto* hp = reinterpret_cast<const hwgpu_pointer*>(g_window + HWGPU_POINTER_OFF);
+        bool mode = __atomic_load_n(&hp->magic, __ATOMIC_ACQUIRE) == HWGPU_POINTER_MAGIC && hp->screen_w && hp->screen_h;
+        uint32_t sw = mode ? hp->screen_w : wh->width, sh = mode ? hp->screen_h : wh->height;
+        if (sw && sh && g_scan.view_w > 0 && g_scan.view_h > 0)
+            ASurfaceTransaction_setScale(t, g_under_layer, float(g_scan.view_w) / float(sw),
+                                         float(g_scan.view_h) / float(sh));
+    }
     if (!g_scan.overlay_visible) ASurfaceTransaction_setVisibility(t, g_scan.overlay_layer, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
     ASurfaceTransaction_apply(t);
     ASurfaceTransaction_delete(t);
+    {
+        static int32_t last[8];
+        int32_t now[8] = {x, y, int32_t(cw), int32_t(ch), crop ? int32_t(crop[0]) : 0, crop ? int32_t(crop[1]) : 0,
+                          crop ? int32_t(crop[2]) : 0, crop ? int32_t(crop[3]) : 0};
+        if (memcmp(last, now, sizeof now)) {
+            memcpy(last, now, sizeof now);
+            __android_log_print(ANDROID_LOG_INFO, "hwgpu", "window layer: buffer %ux%u at %d,%d size %ux%u visible %d,%d-%d,%d view %dx%d",
+                                width, height, x, y, cw, ch, now[4], now[5], now[6], now[7], g_scan.view_w, g_scan.view_h);
+        }
+    }
     g_scan.overlay_visible = true;
+    if (crop && crop[2] > crop[0] && crop[3] > crop[1]) {
+        // crop is the visible part of the client rect, relative to it; the hole is in screen pixels.
+        float sx = width ? float(cw) / float(width) : 1.0f, sy = height ? float(ch) / float(height) : 1.0f;
+        g_scan.hole[0] = x + int32_t(float(crop[0]) * sx); g_scan.hole[1] = y + int32_t(float(crop[1]) * sy);
+        g_scan.hole[2] = x + int32_t(float(crop[2]) * sx); g_scan.hole[3] = y + int32_t(float(crop[3]) * sy);
+    } else {
+        g_scan.hole[0] = x; g_scan.hole[1] = y; g_scan.hole[2] = x + int32_t(cw); g_scan.hole[3] = y + int32_t(ch);
+    }
+    tell_hole_locked();
     g_scan.frames++;
     update_cursor_locked(int(slot));
 #else
     (void)slot; (void)ahb; (void)width; (void)height; (void)x; (void)y; (void)cw; (void)ch; (void)crop;
+#endif
+}
+
+// The part of the desktop a windowed program's own layer shows through, in guest screen pixels
+// (left, top, right, bottom). 0 when no program has a layer.
+int hwgpu_host_window_hole(int32_t* out) {
+#ifdef __ANDROID__
+    std::lock_guard<std::mutex> sl(g_scan.lock);
+    if (!(g_scan.overlay_visible || g_remote_hole) || g_scan.hole[2] <= g_scan.hole[0] || g_scan.hole[3] <= g_scan.hole[1]) return 0;
+    memcpy(out, g_scan.hole, sizeof g_scan.hole);
+    return 1;
+#else
+    (void)out;
+    return 0;
 #endif
 }
 
@@ -1711,11 +2021,103 @@ uint64_t hwgpu_host_scanout_frames(void) {
 
 void hwgpu_host_stop(void) {
     if (!g_run.exchange(false)) return;
+    if (g_role == 1) return;  // its threads end with their channels; the rings are the desktop's
     g_thread.join();
+#ifdef __ANDROID__
+    if (g_pointer_thread.joinable()) g_pointer_thread.join();
+    if (g_vsync_thread.joinable()) g_vsync_thread.join();
+#endif
     // HwD3D threads end when their channel stops being served.
     for (uint32_t i = 0; i < HWGPU_CHANNELS; i++)
         if (g_slots[i].hwd3d) __atomic_store_n(&hwgpu_chan_ctl(chan_base(i))->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
     while (g_hwd3d_threads.load()) hwgpu_pause(1000);
     for (auto& s : g_slots) drop_slot(s);
     __atomic_store_n(&hwgpu_hdr(g_window)->magic, 0, __ATOMIC_RELEASE);
+}
+
+// ---- the desktop and games processes ----
+
+void hwgpu_host_set_callbacks(hwgpu_handoff_cb handoff, hwgpu_hole_cb hole) {
+    g_handoff_cb = handoff;
+    g_hole_cb = hole;
+}
+
+int hwgpu_host_role(void) { return g_role; }
+
+int hwgpu_host_handoff(uint32_t slot, uint32_t generation, const char* exe, const char* conf) {
+    if (g_role != 0 || !g_handoff_cb || slot >= HWGPU_CHANNELS) return 0;
+    g_slots[slot].handed = true;  // before the call: the games process may take it at once
+    if (g_handoff_cb(slot, generation, exe, conf)) return 1;
+    g_slots[slot].handed = false;
+    return 0;
+}
+
+using hwd3d_adopt_fn = void (*)(void* chan, uint32_t slot, uint32_t generation, const char* exe, const char* conf);
+
+int hwgpu_host_adopt(uint32_t slot, uint32_t generation, const char* exe, const char* conf) {
+    if (g_role != 1 || !g_window || slot >= HWGPU_CHANNELS) return 0;
+    static hwd3d_adopt_fn adopt = [] {
+        void* lib = dlopen("libhwd3d.so", RTLD_NOW | RTLD_LOCAL);
+        auto fn = lib ? reinterpret_cast<hwd3d_adopt_fn>(dlsym(lib, "hwd3d_adopt")) : nullptr;
+        if (!fn) LOG("no HwD3D adopt: %s", dlerror());
+        return fn;
+    }();
+    if (!adopt) return 0;
+    hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(slot));
+    if (!hwgpu_alive(c, generation)) return 0;
+    std::string e(exe ? exe : ""), f(conf ? conf : "");
+    g_hwd3d_threads++;
+    std::thread([slot, generation, e, f] {
+        void* chan = chan_base(slot);
+        LOG("channel %u: served in the games process from here on", slot);
+        adopt(chan, slot, generation, e.c_str(), f.c_str());
+        hwgpu_ctl* cc = hwgpu_chan_ctl(chan);
+#ifdef __ANDROID__
+        {
+            std::lock_guard<std::mutex> sl(g_scan.lock);
+            hide_overlay_locked(int(slot));
+        }
+#endif
+        scan_hide(int(slot));
+        if (hwgpu_alive(cc, generation)) __atomic_store_n(&cc->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
+        g_hwd3d_threads--;
+    }).detach();
+    return 1;
+}
+
+void hwgpu_host_games_died(void) {
+    if (g_role != 0 || !g_window) return;
+    for (uint32_t i = 0; i < HWGPU_CHANNELS; i++) {
+        if (!g_slots[i].handed) continue;
+        g_slots[i].handed = false;  // still s.hwd3d: left alone until the program closes the channel
+        hwgpu_ctl* c = hwgpu_chan_ctl(chan_base(i));
+        if (hwgpu_alive(c, g_slots[i].generation)) __atomic_store_n(&c->host_state, HWGPU_HOST_IDLE, __ATOMIC_RELEASE);
+        LOG("channel %u: the games process ended, dropping it", i);
+    }
+    hwgpu_host_set_hole(0, 0, 0, 0, 0);
+}
+
+void hwgpu_host_set_hole(int on, int32_t left, int32_t top, int32_t right, int32_t bottom) {
+    std::lock_guard<std::mutex> sl(g_scan.lock);
+    g_remote_hole = on != 0;
+    if (on) {
+        g_scan.hole[0] = left; g_scan.hole[1] = top; g_scan.hole[2] = right; g_scan.hole[3] = bottom;
+    } else if (!g_scan.overlay_visible) {
+        memset(g_scan.hole, 0, sizeof g_scan.hole);
+    }
+}
+
+void hwgpu_host_set_under_layer(void* layer) {
+#ifdef __ANDROID__
+    std::lock_guard<std::mutex> sl(g_scan.lock);
+    if (g_scan.overlay_layer) {
+        ASurfaceControl_release(g_scan.overlay_layer);
+        g_scan.overlay_layer = nullptr;
+        g_scan.overlay_visible = false;
+    }
+    if (g_under_layer) ASurfaceControl_release(g_under_layer);
+    g_under_layer = static_cast<ASurfaceControl*>(layer);
+#else
+    (void)layer;
+#endif
 }

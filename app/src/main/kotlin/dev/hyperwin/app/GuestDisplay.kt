@@ -37,7 +37,7 @@ class GuestDisplay(
             }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
                 d3dLayer?.let { SurfaceControl.Transaction().setBufferSize(it, width, height).apply() }
-                layer?.let { HwGpu.setLayer(it, d3dLayer, width, height) }
+                layer?.let { HwGpu.setLayer(it, d3dLayer, gameUnder, gameOver, pointer, width, height) }
             }
             override fun surfaceDestroyed(holder: SurfaceHolder) {
                 dropLayer()
@@ -57,6 +57,17 @@ class GuestDisplay(
     private var layer: SurfaceControl? = null
     /** HwD3D's swap chains draw here (d3d/README.md), a layer above that one. */
     private var d3dLayer: SurfaceControl? = null
+    /** The games renderer's layers (HwGpu.kt): a windowed game under the desktop, a full-screen one over it. */
+    private var gameUnder: SurfaceControl? = null
+    private var gameOver: SurfaceControl? = null
+    /** Windows' mouse pointer, over everything (the display driver hands it over). */
+    private var pointer: SurfaceControl? = null
+
+    private fun container(name: String, z: Int) = SurfaceControl.Builder()
+        .setName(name)
+        .setParent(view.surfaceControl)
+        .build()
+        .also { SurfaceControl.Transaction().setLayer(it, z).setVisibility(it, true).apply() }
 
     private fun makeLayer() {
         if (layer != null) return
@@ -66,7 +77,7 @@ class GuestDisplay(
             .setOpaque(true)
             .setHidden(true)   // the renderer shows it with its first frame
             .build()
-        SurfaceControl.Transaction().setLayer(sc, 1).apply {
+        SurfaceControl.Transaction().setLayer(sc, 2).apply {
             // Only a layer that gets frames counts toward the screen's rate, and during a game
             // that is this one: ask for the panel's fastest.
             bestMode(view.display)?.let {
@@ -82,22 +93,29 @@ class GuestDisplay(
             .setOpaque(true)
             .setHidden(true)   // shown while a program has a swap chain
             .build()
-        SurfaceControl.Transaction().setLayer(d3d, 2).apply()
+        SurfaceControl.Transaction().setLayer(d3d, 3).apply()
         d3dLayer = d3d
-        HwGpu.setLayer(sc, d3d, view.width, view.height)
+        gameUnder = container("hyperwin-game-under", 1)
+        gameOver = container("hyperwin-game-over", 4)
+        pointer = SurfaceControl.Builder().setName("hyperwin-pointer").setParent(view.surfaceControl)
+            .setHidden(true).build().also { SurfaceControl.Transaction().setLayer(it, 5).apply() }
+        HwGpu.setLayer(sc, d3d, gameUnder, gameOver, pointer, view.width, view.height)
     }
 
     private fun dropLayer() {
         val sc = layer ?: return
-        val d3d = d3dLayer
+        val others = listOfNotNull(d3dLayer, gameUnder, gameOver, pointer)
         layer = null
         d3dLayer = null
-        HwGpu.setLayer(null, null, 0, 0)
+        gameUnder = null
+        gameOver = null
+        pointer = null
+        HwGpu.setLayer(null, null, null, null, null, 0, 0)
         SurfaceControl.Transaction().reparent(sc, null).apply {
-            d3d?.let { reparent(it, null) }
+            others.forEach { reparent(it, null) }
         }.apply()
         sc.release()
-        d3d?.release()
+        others.forEach { it.release() }
     }
 
     fun vmStarted(sharedWindow: AvfPlan.SharedWindow?) {
@@ -173,10 +191,19 @@ class GuestDisplay(
         var passes = 0
         var refreshHz = 60f
         var nextFrame = System.nanoTime()
+        // Each pass must fit in one refresh: Android hears so, and speeds the CPU up before one is late.
+        val hint = GameSettings.Hint(view.context, 1_000_000_000L / 60)
         try {
             while (isCurrent(runGeneration, sharedWindow)) {
-                if (passes++ % 120 == 0) refreshHz = view.display?.refreshRate?.takeIf { it >= 20f } ?: 60f
-                if (WindowBridge.nativePresent(sharedWindow.buffer) == 1 && ++draws == 2) onLive()
+                if (passes++ % 120 == 0) {
+                    refreshHz = view.display?.refreshRate?.takeIf { it >= 20f } ?: 60f
+                    hint.target((1_000_000_000L / refreshHz).toLong())
+                    hint.powerEfficient(GameSettings.capped(view.context))
+                }
+                val began = System.nanoTime()
+                val presented = sharedWindow.withBuffer { WindowBridge.nativePresent(it) } ?: break
+                hint.report(System.nanoTime() - began)
+                if (presented == 1 && ++draws == 2) onLive()
                 // One pass per screen refresh of the phone, less the time the pass took.
                 nextFrame = maxOf(nextFrame + (1_000_000_000L / refreshHz).toLong(), System.nanoTime() + 1_000_000L)
                 // Never negative: a late pass (the phone was busy) would make Thread.sleep throw.
@@ -186,6 +213,7 @@ class GuestDisplay(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         } finally {
+            hint.close()
             if (renderThread === Thread.currentThread()) renderThread = null
         }
     }

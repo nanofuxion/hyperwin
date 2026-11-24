@@ -118,6 +118,85 @@ void d9_copy_rows(uint8_t* dst, uint32_t dpitch, const uint8_t* src, uint32_t sp
     for (uint32_t y = 0; y < rows; y++) memcpy(dst + size_t(y) * dpitch, src + size_t(y) * spitch, row);
 }
 
+void d9_probe_up(Chan& c, IDirect3DDevice9Ex* dev, const char* what, uint32_t type, uint32_t count, uint32_t stride,
+                 const void* v, uint64_t bytes) {
+    static std::atomic<uint32_t> n{0};
+    uint32_t k = n.fetch_add(1);
+    if (k % 500 != 7) return;
+    char on[PROP_VALUE_MAX] = "";
+    __system_property_get("debug.hwd3d.frames", on);
+    if (on[0] != '1') return;
+    float f[8] = {};
+    memcpy(f, v, std::min<uint64_t>(bytes, sizeof f));
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    dev->GetVertexShader(&vs);
+    dev->GetPixelShader(&ps);
+    DWORD fvf = 0, zen = 0, cull = 0, light = 0;
+    dev->GetFVF(&fvf);
+    dev->GetRenderState(D3DRS_ZENABLE, &zen);
+    dev->GetRenderState(D3DRS_CULLMODE, &cull);
+    dev->GetRenderState(D3DRS_LIGHTING, &light);
+    D3DMATRIX world{}, view{}, proj{};
+    dev->GetTransform(D3DTS_WORLD, &world);
+    dev->GetTransform(D3DTS_VIEW, &view);
+    dev->GetTransform(D3DTS_PROJECTION, &proj);
+    LOG("channel %u: %s #%u type %u count %u stride %u bytes %llu floats %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f vs %p ps %p fvf 0x%x z %u cull %u light %u "
+        "proj %.2f %.2f %.2f %.2f view43 %.2f world11 %.2f",
+        c.slot, what, k, type, count, stride, (unsigned long long)bytes, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], (void*)vs, (void*)ps,
+        unsigned(fvf), unsigned(zen), unsigned(cull), unsigned(light), proj._11, proj._22, proj._33, proj._43, view._43, world._11);
+    if (vs) vs->Release();
+    if (ps) ps->Release();
+}
+
+// adb shell setprop debug.hwd3d.frames 1: now and then, what a draw is about to use.
+void d9_probe_draw(Chan& c, IDirect3DDevice9Ex* dev, const char* what, uint32_t type, uint32_t first, uint32_t count) {
+    static std::atomic<uint32_t> n{0};
+    uint32_t k = n.fetch_add(1);
+    if (k % 500 != 7) return;
+    char on[PROP_VALUE_MAX] = "";
+    __system_property_get("debug.hwd3d.frames", on);
+    if (on[0] != '1') return;
+    IDirect3DVertexBuffer9* vb = nullptr;
+    UINT off = 0, stride = 0;
+    dev->GetStreamSource(0, &vb, &off, &stride);
+    uint32_t nz = 0, size = 0;
+    float f[6] = {};
+    if (vb) {
+        D3DVERTEXBUFFER_DESC bd{};
+        vb->GetDesc(&bd);
+        size = bd.Size;
+        void* p = nullptr;
+        if (SUCCEEDED(vb->Lock(0, 0, &p, D3DLOCK_READONLY)) && p) {
+            const uint8_t* b = static_cast<const uint8_t*>(p);
+            for (uint32_t i = 0; i < bd.Size && i < 4096; i++) nz += b[i] != 0;
+            if (bd.Size >= off + 24) memcpy(f, b + off, 24);
+            vb->Unlock();
+        }
+        vb->Release();
+    }
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    dev->GetVertexShader(&vs);
+    dev->GetPixelShader(&ps);
+    dev->GetVertexDeclaration(&decl);
+    DWORD fvf = 0, zen = 0, cull = 0, light = 0;
+    dev->GetFVF(&fvf);
+    dev->GetRenderState(D3DRS_ZENABLE, &zen);
+    dev->GetRenderState(D3DRS_CULLMODE, &cull);
+    dev->GetRenderState(D3DRS_LIGHTING, &light);
+    D3DVIEWPORT9 vp{};
+    dev->GetViewport(&vp);
+    LOG("channel %u: %s #%u type %u first %u count %u: stream0 %u bytes off %u stride %u, %u of first 4096 bytes not zero, "
+        "first floats %.3f %.3f %.3f %.3f %.3f %.3f; vs %p ps %p decl %p fvf 0x%x z %u cull %u light %u viewport %ux%u at %u,%u",
+        c.slot, what, k, type, first, count, size, off, stride, nz, f[0], f[1], f[2], f[3], f[4], f[5], (void*)vs, (void*)ps,
+        (void*)decl, unsigned(fvf), unsigned(zen), unsigned(cull), unsigned(light), vp.Width, vp.Height, vp.X, vp.Y);
+    if (vs) vs->Release();
+    if (ps) ps->Release();
+    if (decl) decl->Release();
+}
+
 int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
     if (!c.d9) c.d9 = new D9State;
     D9State* s = c.d9;
@@ -278,12 +357,14 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         return dev->SetIndices(d9_get<IDirect3DIndexBuffer9>(s, r.u32(), D9K_IB));
     case HWD3D9_DRAW: {
         uint32_t t = r.u32(), start = r.u32(), n = r.u32();
+        d9_probe_draw(c, dev, "draw", t, start, n);
         return dev->DrawPrimitive(D3DPRIMITIVETYPE(t), start, n);
     }
     case HWD3D9_DRAW_IDX: {
         uint32_t t = r.u32();
         int32_t base = int32_t(r.u32());
         uint32_t mn = r.u32(), nv = r.u32(), start = r.u32(), n = r.u32();
+        d9_probe_draw(c, dev, "indexed draw", t, uint32_t(base), n);
         return dev->DrawIndexedPrimitive(D3DPRIMITIVETYPE(t), base, mn, nv, start, n);
     }
     case HWD3D9_DRAW_UP: {
@@ -291,6 +372,7 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         uint64_t bytes = 0;
         const void* v = r.arr(1, &bytes);
         if (!r.ok || !v) return E_INVALIDARG;
+        d9_probe_up(c, dev, "draw up", t, n, stride, v, bytes);
         return dev->DrawPrimitiveUP(D3DPRIMITIVETYPE(t), n, v, stride);
     }
     case HWD3D9_DRAW_IDX_UP: {
@@ -300,6 +382,7 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         uint32_t stride = r.u32();
         const void* v = r.arr(1, &vb);
         if (!r.ok || !idx || !v) return E_INVALIDARG;
+        d9_probe_up(c, dev, "indexed draw up", t, n, stride, v, vb);
         return dev->DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE(t), mn, nv, n, idx, D3DFORMAT(fmt), v, stride);
     }
     case HWD3D9_CLEAR: {
@@ -448,6 +531,7 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         RECT rc = {LONG(bx.left), LONG(bx.top), LONG(bx.right), LONG(bx.bottom)};
         D3DLOCKED_RECT lr;
         HRESULT hr = sf->LockRect(&lr, bx.valid ? &rc : nullptr, 0);
+        HRESULT lock_hr = hr;
         if (SUCCEEDED(hr)) {
             uint32_t rows = pitch ? uint32_t(n / pitch) : 0;
             d9_copy_rows(static_cast<uint8_t*>(lr.pBits), lr.Pitch, data, pitch, std::min<uint32_t>(pitch, lr.Pitch), rows);
@@ -467,11 +551,26 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
             }
             if (tmp) tmp->Release();
         }
+        if (FAILED(hr)) {
+            static std::atomic<uint32_t> told{0};
+            if (told.fetch_add(1) < 12) {
+                D3DSURFACE_DESC sd{};
+                sf->GetDesc(&sd);
+                LOG("channel %u: write to kind %u sub %u failed 0x%x (lock 0x%x): format %u %ux%u pool %u usage 0x%x box %s %u,%u-%u,%u pitch %u bytes %llu",
+                    c.slot, unsigned(k), sub, unsigned(hr), unsigned(lock_hr), unsigned(sd.Format), sd.Width, sd.Height, unsigned(sd.Pool),
+                    unsigned(sd.Usage), bx.valid ? "yes" : "no", bx.left, bx.top, bx.right, bx.bottom, pitch, (unsigned long long)n);
+            }
+        }
         sf->Release();
         return hr;
     }
     case HWD3D9_READ: {
         uint32_t h = r.u32(), raw_sub = r.u32();
+        {
+            static std::atomic<uint32_t> n{0};
+            uint32_t k = n.fetch_add(1);
+            if (k < 3 || k % 50 == 0) LOG("channel %u: d9 read request #%u", c.slot, k);
+        }
         bool staged_ok = (raw_sub & HWD3D_MAP_STAGED_OK) != 0;
         uint32_t sub = raw_sub & ~HWD3D_MAP_STAGED_OK;
         if (h >= s->objs.size()) return E_INVALIDARG;
@@ -535,6 +634,50 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
                       sd.Format == D3DFMT_DXT5;
             uint32_t rows = bc ? (sd.Height + 3) / 4 : sd.Height;
             uint32_t total = uint32_t(lr.Pitch) * rows;
+            // adb shell setprop debug.hwd3d.frames 1: says now and then how much of a frame read back is not black.
+            static std::atomic<uint32_t> reads{0};
+            if (!bc && sd.Width >= 640 && (reads.fetch_add(1) % 10) == 2) {
+                char on[PROP_VALUE_MAX] = "";
+                __system_property_get("debug.hwd3d.frames", on);
+                if (on[0] == '1') {
+                    uint32_t nz = 0, n = 0, sample = 0;
+                    for (uint32_t y = 0; y < sd.Height; y += 8) {
+                        auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch);
+                        for (uint32_t x = 0; x < sd.Width; x += 8, n++)
+                            if (row[x] & 0x00ffffffu) { nz++; if (!sample) sample = row[x]; }
+                    }
+                    LOG("channel %u: frame read back, format %u %ux%u, %u of %u sampled pixels not black, one is 0x%08x",
+                        c.slot, unsigned(sd.Format), sd.Width, sd.Height, nz, n, sample);
+                    // And every render-target texture the program has: is anything drawn into them at all?
+                    static uint32_t rounds;
+                    if (rounds++ % 5 == 0) {
+                        for (uint32_t oh = 1; oh < s->objs.size(); oh++) {
+                            if (s->kinds[oh] != D9K_TEX || !s->objs[oh]) continue;
+                            auto* tx = static_cast<IDirect3DTexture9*>(s->objs[oh]);
+                            D3DSURFACE_DESC td{};
+                            if (FAILED(tx->GetLevelDesc(0, &td)) || !(td.Usage & D3DUSAGE_RENDERTARGET) || td.Width < 64) continue;
+                            IDirect3DSurface9* lvl = nullptr;
+                            IDirect3DSurface9* sys = nullptr;
+                            uint64_t nonzero = 0, bytes = 0;
+                            HRESULT rh = tx->GetSurfaceLevel(0, &lvl);
+                            if (SUCCEEDED(rh)) rh = dev->CreateOffscreenPlainSurface(td.Width, td.Height, td.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr);
+                            if (SUCCEEDED(rh)) rh = dev->GetRenderTargetData(lvl, sys);
+                            D3DLOCKED_RECT tl{};
+                            if (SUCCEEDED(rh) && SUCCEEDED(rh = sys->LockRect(&tl, nullptr, D3DLOCK_READONLY))) {
+                                for (uint32_t y = 0; y < td.Height; y += 4) {
+                                    auto* row = static_cast<const uint8_t*>(tl.pBits) + size_t(y) * tl.Pitch;
+                                    for (uint32_t b = 0; b < uint32_t(tl.Pitch); b += 16, bytes++) if (row[b] | row[b + 1] | row[b + 2] | row[b + 4] | row[b + 5]) nonzero++;
+                                }
+                                sys->UnlockRect();
+                            }
+                            LOG("channel %u:   render target texture %u format %u %ux%u: %llu of %llu samples not zero (0x%x)", c.slot, oh,
+                                unsigned(td.Format), td.Width, td.Height, (unsigned long long)nonzero, (unsigned long long)bytes, unsigned(rh));
+                            if (sys) sys->Release();
+                            if (lvl) lvl->Release();
+                        }
+                    }
+                }
+            }
             w.u32(uint32_t(lr.Pitch));
             w.u32(rows);
             if (staged_ok && c.readback_ptr() && total <= HWD3D_READBACK_SIZE) {
@@ -643,6 +786,11 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
     }
     case HWD3D9_PRESENT: {
         uint32_t sh = r.u32(), raw_sub = r.u32();
+        {
+            static std::atomic<uint32_t> n{0};
+            uint32_t k = n.fetch_add(1);
+            if (k < 3 || k % 50 == 0) LOG("channel %u: d9 present request #%u surface %u sub 0x%x", c.slot, k, sh, raw_sub);
+        }
         if (!sh) {
             hwgpu_host_hide_game_buffer(c.slot);
             return 0;
@@ -666,7 +814,11 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
         D3DSURFACE_DESC sd{};
         sf->GetDesc(&sd);
         const Dxvk& dx = chan_dxvk(c);
-        if (!sd.Width || !sd.Height || !dx.d9_get_vk_handles || !dx.d9_blit_to_vkimage) {
+        // adb shell setprop debug.hwd3d.noscan 1: no frame goes to a layer of its own, so the program
+        // falls back to reading its frames back. For telling a present fault from a drawing fault.
+        char noscan[PROP_VALUE_MAX] = "";
+        __system_property_get("debug.hwd3d.noscan", noscan);
+        if (noscan[0] == '1' || !sd.Width || !sd.Height || !dx.d9_get_vk_handles || !dx.d9_blit_to_vkimage) {
             sf->Release();
             return E_NOTIMPL;
         }
@@ -693,7 +845,10 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
             }
             static const bool custom_driver = getenv("HWGPU_VK_DRIVER") && *getenv("HWGPU_VK_DRIVER");
             for (int i = 0; i < 3; i++) {
-                AHardwareBuffer_Desc ad{sd.Width, sd.Height, 1, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                // The backbuffer's own byte order where it is BGRA (A8R8G8B8, X8R8G8B8), so DXVK copies
+                // instead of blitting: a blit into this buffer lost the device on Mali. 5 is BGRA_8888.
+                const bool bgra = sd.Format == D3DFMT_A8R8G8B8 || sd.Format == D3DFMT_X8R8G8B8;
+                AHardwareBuffer_Desc ad{sd.Width, sd.Height, 1, bgra ? 5u : uint32_t(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM),
                                         AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                                             AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
                                             (!c.is_desktop && custom_driver ? AHARDWAREBUFFER_USAGE_CPU_READ_RARELY : 0),
@@ -701,11 +856,14 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
                 if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) != 0) {
                     ad.usage &= ~uint64_t(AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY);
                     if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) != 0) {
+                        ad.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;  // no BGRA here: a blit then
+                        if (AHardwareBuffer_allocate(&ad, &c.scan_ring[i].ahb) == 0) goto allocated;
                         c.free_scan_ring();
                         sf->Release();
                         return E_OUTOFMEMORY;
                     }
                 }
+            allocated:
                 VkAndroidHardwareBufferFormatPropertiesANDROID fp{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
                 VkAndroidHardwareBufferPropertiesANDROID props{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, &fp};
                 if (vkGetAndroidHardwareBufferPropertiesANDROID(vkd, c.scan_ring[i].ahb, &props) != VK_SUCCESS ||
@@ -756,7 +914,15 @@ int32_t d9_call(Chan& c, const hwd3d_call& call, Rd& r, Wr& w) {
             LOG("channel %u: fullscreen D3D9 scanout ring %ux%u ready", c.slot, sd.Width, sd.Height);
         }
         auto& buf = c.scan_ring[c.scan_idx++ % 3];
-        HRESULT hr = dx.d9_blit_to_vkimage(dev, sf, buf.vk_img, buf.vk_fmt, sd.Width, sd.Height);
+        // adb shell setprop debug.hwd3d.scantest 1: no copy into the buffer (it shows as it is);
+        // 2: the copy, but the buffer is not shown. For telling which half faults.
+        char scantest[PROP_VALUE_MAX] = "";
+        __system_property_get("debug.hwd3d.scantest", scantest);
+        HRESULT hr = scantest[0] == '1' ? S_OK : dx.d9_blit_to_vkimage(dev, sf, buf.vk_img, buf.vk_fmt, sd.Width, sd.Height);
+        if (scantest[0] == '2') {
+            sf->Release();
+            return E_NOTIMPL;
+        }
         sf->Release();
         if (SUCCEEDED(hr)) {
             if (overlay) hwgpu_host_show_window_buffer(c.slot, buf.ahb, sd.Width, sd.Height, ov_x, ov_y, ov_w, ov_h, ov_crop);

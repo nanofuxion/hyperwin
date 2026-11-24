@@ -265,3 +265,34 @@ Windows uses usbip-win2 (BSD-2-Clause, signed ARM64 drivers), fetched at build t
 leaves it alone once attached. Plugging in is plug and play: Android's own prompt is the consent, the app offers the
 device, the watcher attaches it within two seconds. Unplugging closes the connection and Windows drops the port.
 Input devices and hubs stay with Android. The ring mode stays as `usb_mode=ring`. Phase 3 (a UdeCx driver) is dropped.
+
+## DisplayLink dock test, 2026-11-23 (Plugable UD-6950PDZ, 17e9:6011)
+
+- On the phone the dock dropped off within seconds of Windows taking it, then the phone's power
+  from it flapped and its hub stopped enumerating.
+- Through `usb/test/usbipd-mac.c` (the same USB/IP rules on libusb, run as root on the Mac,
+  `usbip attach -r 10.0.0.16 -b <busid>` in Windows) the cause showed: Windows' DisplayLink driver
+  (12.3.5011.0) flashes the dock's firmware through its DFU interface (56 DFU_DNLOAD blocks of
+  16 KiB, then a zero-length one), and the dock reboots. That reboot is the drop. On the Mac it came
+  back, and on the second attach there was no flash: display, audio and Plugable Ethernet all load
+  and stay up.
+- Fixes made on the way, in both servers: SET_INTERFACE goes through to the device (network and
+  audio need their alternate settings), and Windows' U1/U2/LTM and FUNCTION_SUSPEND requests are
+  answered without reaching the device.
+- Left for the phone: after the dock reboots the app has to offer the new device again, and the dock
+  needs its own power supply (it gave the phone 0.1 to 0.5 A and flapped).
+- Display through the dock works from Windows on the phone (USB/IP from the Mac, 2026-11-23): the HDMI
+  monitor shows the Windows desktop. Colours were red/blue swapped: DWM's surfaces on the HyperWin GPU
+  are BGRA kept as RGBA on the phone, and DisplayLink's raw copy into its own BGRA staging texture kept
+  the phone's order. The UMD now notes such copies per pixel (`note_copy`, `rb_map` in
+  gpu/guest/hwd3d/umd.cpp; DisplayLink copies dirty rectangles from several surfaces into one staging
+  texture, so one flag a texture flashed orange) and swaps red and blue back when it is mapped for reading. Fixed and confirmed on the monitor.
+- After restarting DisplayLink's display devices the monitor stayed dark until a display enumeration
+  (`dispinfo.exe` in the user's session) ran; then it came back without touching the cable.
+- Direct to the phone (2026-11-23): with the firmware already updated and the dock on its own power,
+  the dock plugged straight into the Pixel works in Windows: monitor, colours right. The fixes that
+  mattered: SET_INTERFACE passed through, U1/U2/LTM and FUNCTION_SUSPEND kept from the device.
+- Dock over USB/IP from the Mac kept dropping and DisplayLink found no monitor: the dock's ethernet ("Plugable
+  Ethernet", CDC NCM) reset every few seconds in Windows, took Windows' network with it and so the USB/IP link
+  itself. Disabling that adapter in Windows (pnputil /disable-device ...MI_05...) kept the dock up and the monitor
+  came on. Its NCM data endpoint (0x87) failing on the Mac while the alternate setting flips is the likely cause.

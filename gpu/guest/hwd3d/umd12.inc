@@ -31,6 +31,7 @@ static HRESULT APIENTRY CloseAdapter(D3D12DDI_HADAPTER h)
 {
     ulog("hwd3d_umd: Direct3D 12 CloseAdapter\n");
     delete static_cast<Adapter *>(h.pDrvPrivate);
+    umd_adapter_closed();
     return S_OK;
 }
 
@@ -134,6 +135,7 @@ extern "C" HRESULT APIENTRY OpenAdapter12(void *arg)
     a->pAdapterFuncs->pfnGetOptionalDDITables = d12::GetOptionalDDITables;
     a->pAdapterFuncs->pfnFillDDITable = d12::FillDDITable;
     a->pAdapterFuncs->pfnDestroyDevice = d12::DestroyDevice;
+    umd_adapter_opened();
     return S_OK;
 #endif
 }

@@ -152,6 +152,24 @@ enum class TouchBinding(
     KEY_PERIOD(".", ".", BindingCategory.KEYBOARD, KeyEvent.KEYCODE_PERIOD),
     KEY_SLASH("/", "/", BindingCategory.KEYBOARD, KeyEvent.KEYCODE_SLASH);
 
+    /** Controller names change presentation only; saved bindings keep their positional meaning. */
+    fun controllerLabel(playStation: Boolean): String = when (this) {
+        GAMEPAD_BUTTON_A -> if (playStation) "✕" else "A"
+        GAMEPAD_BUTTON_B -> if (playStation) "○" else "B"
+        GAMEPAD_BUTTON_X -> if (playStation) "□" else "X"
+        GAMEPAD_BUTTON_Y -> if (playStation) "△" else "Y"
+        GAMEPAD_BUTTON_L1 -> if (playStation) "L1" else "LB"
+        GAMEPAD_BUTTON_R1 -> if (playStation) "R1" else "RB"
+        GAMEPAD_BUTTON_L2 -> if (playStation) "L2" else "LT"
+        GAMEPAD_BUTTON_R2 -> if (playStation) "R2" else "RT"
+        GAMEPAD_BUTTON_L3 -> if (playStation) "L3" else "LS"
+        GAMEPAD_BUTTON_R3 -> if (playStation) "R3" else "RS"
+        GAMEPAD_BUTTON_SELECT -> if (playStation) "Share" else "View"
+        GAMEPAD_BUTTON_START -> if (playStation) "Options" else "Menu"
+        GAMEPAD_BUTTON_GUIDE -> if (playStation) "PS" else "Xbox"
+        else -> shortLabel
+    }
+
     val isLeftStick: Boolean
         get() = this == GAMEPAD_LEFT_THUMB_UP || this == GAMEPAD_LEFT_THUMB_RIGHT ||
             this == GAMEPAD_LEFT_THUMB_DOWN || this == GAMEPAD_LEFT_THUMB_LEFT
@@ -268,12 +286,12 @@ data class ControlElement(
 
     fun activeBindings(): List<TouchBinding> = bindings.filter { it != TouchBinding.NONE }
 
-    fun displayText(): String {
+    fun displayText(playStation: Boolean = false): String {
         if (text.isNotBlank()) return text
         val active = activeBindings()
         if (active.isEmpty()) return ""
-        return if (active.size == 1) active[0].shortLabel
-        else active.take(2).joinToString("+") { it.shortLabel }
+        return if (active.size == 1) active[0].controllerLabel(playStation)
+        else active.take(2).joinToString("+") { it.controllerLabel(playStation) }
     }
 
     fun usesGamepad(): Boolean = bindings.any { it.category == BindingCategory.GAMEPAD }

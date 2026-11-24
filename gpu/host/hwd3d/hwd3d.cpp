@@ -15,6 +15,8 @@
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <mutex>
 #include <android/hardware_buffer.h>
 #define VK_USE_PLATFORM_ANDROID_KHR 1
@@ -22,6 +24,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <chrono>
+#include <unordered_map>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -29,6 +32,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -37,6 +42,9 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #include <sys/system_properties.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "hwd3d", __VA_ARGS__)
 #else
 #include <stdio.h>
@@ -62,6 +70,7 @@ struct Dxvk {
     HRESULT(WINAPI* create9ex)(UINT, IDirect3D9Ex**) = nullptr;
     void (*d9_get_vk_handles)(IDirect3DDevice9Ex*, VkInstance*, VkPhysicalDevice*, VkDevice*) = nullptr;
     HRESULT (*d9_blit_to_vkimage)(IDirect3DDevice9Ex*, IDirect3DSurface9*, VkImage, uint32_t, uint32_t, uint32_t) = nullptr;
+    HRESULT (*d11_blit_swap_rb)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, const D3D11_BOX*) = nullptr;
     void apply_program(const std::string& exe, const std::string& conf) const {
         if (set_program) set_program(exe.c_str(), conf.c_str());
         if (set_program_d3d11) set_program_d3d11(exe.c_str(), conf.c_str());
@@ -74,6 +83,9 @@ Dxvk g_dxvk_games;
 extern "C" void* hwgpu_host_heap_grant(uint32_t slot, uint64_t size, uint64_t* offset);
 extern "C" void hwgpu_host_heap_free(void* p);
 extern "C" void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height);
+extern "C" int hwgpu_host_window_hole(int32_t* ltrb);
+extern "C" int hwgpu_host_handoff(uint32_t slot, uint32_t generation, const char* exe, const char* conf);
+extern "C" int hwgpu_host_role(void);
 extern "C" void hwgpu_host_show_game_buffer(uint32_t slot, uint32_t generation, void* ahb, uint32_t width, uint32_t height, int vsync);
 extern "C" void hwgpu_host_hide_game_buffer(uint32_t slot);
 extern "C" void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uint32_t height, int32_t x, int32_t y, uint32_t cw, uint32_t ch, const uint32_t* crop);
@@ -194,8 +206,10 @@ struct Mapped {
 
 struct Shared;
 struct Chan;
+struct HwVkInteropDevice1;
 void drop_shared_object(uint32_t slot, uint32_t object);
 void sync_opened_shares(Chan& c);
+void cut_hole(Chan& c, uint32_t id, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_DESC& desc, const int32_t* hole, bool wait_gpu, ID3D11Texture2D* own_tex);
 
 struct Chan {
     void* chan = nullptr;
@@ -215,9 +229,29 @@ struct Chan {
     uint64_t births = 0;
     std::vector<Mapped> maps;
     ID3D11DeviceContext* immediate = nullptr;  // the first device's, for unmapping at the end
+    // The screen's surfaces as render targets on this channel, for cutting a windowed program's hole.
+    static constexpr size_t kMaxHoleTargets = 4;
+    struct HoleTarget { AHardwareBuffer* ahb; ID3D11Texture2D* tex; ID3D11RenderTargetView* rtv; uint64_t last_used; };
+    std::unordered_map<uint32_t, HoleTarget> hole_targets;
+    uint64_t hole_use_seq = 0;
+    ID3D11Query* hole_done = nullptr;
+    ID3D11Query* finish_done = nullptr;
+    // Cached Vulkan fence pool for async own-primary scanout delivery.
+    static constexpr size_t kScanFences = 4;
+    ID3D11Device* sf_dev = nullptr;
+    HwVkInteropDevice1* sf_interop = nullptr;
+    VkDevice sf_vkd = VK_NULL_HANDLE;
+    VkQueue sf_queue = VK_NULL_HANDLE;
+    PFN_vkQueueSubmit sf_submit = nullptr;
+    PFN_vkWaitForFences sf_wait = nullptr;
+    PFN_vkResetFences sf_reset = nullptr;
+    PFN_vkDestroyFence sf_destroy = nullptr;
+    VkFence sf_fences[kScanFences] = {};
+    uint32_t sf_idx = 0;
     void* window = nullptr;                    // the surface, while this program has it
     uint32_t swapchain = 0;
     std::string exe, conf;                     // the program this channel draws for, and its dxvk.conf
+    bool handed = false;                       // given to the games process: this one stops reading it
     const Dxvk* dxvk = nullptr;                // resolved DXVK set (desktop built-in vs games)
     bool is_desktop = true;                    // desktop/shell program (stock driver, no layers, no vsync wait)
     struct D9State* d9 = nullptr;              // Direct3D 9 objects (hwd3d9.inc)
@@ -263,7 +297,10 @@ struct Chan {
         PFN_vkFreeMemory free_memory = nullptr;
     };
     ScanRingBuf scan_ring[3];
-    uint32_t scan_w = 0, scan_h = 0, scan_idx = 0;
+    uint32_t scan_w = 0, scan_h = 0, scan_idx = 0, scan_bgra = 0;
+    ID3D11Texture2D* swap_scratch = nullptr;   // copy_swapped's in-between texture
+    uint32_t swap_scratch_w = 0, swap_scratch_h = 0;
+    DXGI_FORMAT swap_scratch_fmt = DXGI_FORMAT_UNKNOWN;
     void* scan_dev = nullptr;
 
     void free_scan_ring() {
@@ -430,6 +467,7 @@ struct Chan {
 
     // What the program still held, newest first, as it would have let go.
     void release_all() {
+        if (swap_scratch) { swap_scratch->Release(); swap_scratch = nullptr; }
         hwgpu_host_hide_game_buffer(slot);
         idle();
         free_scan_ring();
@@ -448,6 +486,23 @@ struct Chan {
         pending.clear();
         for (auto& p : pending_d9) p.q->Release();
         pending_d9.clear();
+        for (auto& h : hole_targets) {
+            if (h.second.rtv) h.second.rtv->Release();
+            if (h.second.tex) h.second.tex->Release();
+        }
+        hole_targets.clear();
+        if (hole_done) { hole_done->Release(); hole_done = nullptr; }
+        if (finish_done) { finish_done->Release(); finish_done = nullptr; }
+        if (sf_interop) {
+            for (size_t i = 0; i < kScanFences; i++) {
+                if (sf_fences[i] && sf_wait) sf_wait(sf_vkd, 1, &sf_fences[i], VK_TRUE, 100'000'000ULL);
+                if (sf_fences[i] && sf_destroy) sf_destroy(sf_vkd, sf_fences[i], nullptr);
+                sf_fences[i] = VK_NULL_HANDLE;
+            }
+            reinterpret_cast<IUnknown*>(sf_interop)->Release();
+            sf_interop = nullptr;
+        }
+        if (sf_dev) { sf_dev->Release(); sf_dev = nullptr; }
         if (immediate) {
             for (auto& m : maps) immediate->Unmap(static_cast<ID3D11Resource*>(m.res), m.sub);
             maps.clear();
@@ -903,6 +958,7 @@ bool load_dxvk_set(const char* dir, Dxvk& out) {
     out.create_device = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(dlsym(d3d11, "D3D11CreateDevice"));
     out.set_program = reinterpret_cast<decltype(out.set_program)>(dlsym(dxgi, "hwd3d_set_program"));
     out.set_program_d3d11 = reinterpret_cast<decltype(out.set_program_d3d11)>(dlsym(d3d11, "hwd3d_set_program"));
+    out.d11_blit_swap_rb = reinterpret_cast<decltype(out.d11_blit_swap_rb)>(dlsym(d3d11, "hwd3d11_blit_swap_rb"));
     if (void* d3d9 = open_lib("libdxvk_d3d9")) {
         out.create9ex = reinterpret_cast<decltype(out.create9ex)>(dlsym(d3d9, "Direct3DCreate9Ex"));
         out.set_program_d3d9 = reinterpret_cast<decltype(out.set_program_d3d9)>(dlsym(d3d9, "hwd3d_set_program"));
@@ -911,6 +967,16 @@ bool load_dxvk_set(const char* dir, Dxvk& out) {
     }
     out.label = dir ? dir : "built-in DXVK-Sarek";
     return out.create_factory && out.create_device && out.set_program;
+}
+
+// Names the channel's thread after the program, for stacks and top.
+void name_thread(const std::string& exe) {
+    size_t slash = exe.find_last_of("\\/");
+    std::string base = (slash == std::string::npos) ? exe : exe.substr(slash + 1);
+    if (base.empty()) return;
+    char tname[16]{};
+    strncpy(tname, base.c_str(), 15);
+    pthread_setname_np(pthread_self(), tname);
 }
 
 bool is_desktop_program(const std::string& exe) {
@@ -1073,6 +1139,67 @@ struct Shared {
 std::mutex g_shared_lock;
 std::map<uint32_t, std::shared_ptr<Shared>> g_shared;
 uint32_t g_next_share = 1;
+
+// ---- shared surfaces across the desktop and games processes ----
+// A program in the games process (a browser, say) shares its window's surfaces with DWM, which is in the desktop
+// process. Its ids carry kGamesShare, and the desktop asks the games process for the buffer over an abstract
+// Unix socket (same app, so the same sandbox): the id goes one way, the description and the Android hardware
+// buffer come back (AHardwareBuffer_sendHandleToUnixSocket).
+constexpr uint32_t kGamesShare = 0x40000000u;
+const char kShareSocket[] = "hyperwin-gpu-shares";
+
+socklen_t share_addr(sockaddr_un* a) {
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    memcpy(a->sun_path + 1, kShareSocket, sizeof kShareSocket - 1);   // abstract: leading NUL
+    return socklen_t(offsetof(sockaddr_un, sun_path) + 1 + sizeof kShareSocket - 1);
+}
+
+// Games process: answers the desktop's questions for as long as the process lives.
+void share_server() {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_un a;
+    socklen_t n = share_addr(&a);
+    if (s < 0 || bind(s, reinterpret_cast<sockaddr*>(&a), n) || listen(s, 8)) {
+        LOG("shared surfaces: no socket for the desktop process (%s)", strerror(errno));
+        if (s >= 0) close(s);
+        return;
+    }
+    for (;;) {
+        int c = accept4(s, nullptr, nullptr, SOCK_CLOEXEC);
+        if (c < 0) continue;
+        uint32_t id = 0;
+        if (recv(c, &id, sizeof id, MSG_WAITALL) == sizeof id) {
+            std::shared_ptr<Shared> sp;
+            {
+                std::lock_guard<std::mutex> g(g_shared_lock);
+                auto it = g_shared.find(id);
+                if (it != g_shared.end()) sp = it->second;
+            }
+            struct { int32_t status; D3D11_TEXTURE2D_DESC desc; } reply{};
+            reply.status = (sp && sp->ahb && !sp->cpu_fallback) ? 0 : -1;
+            if (sp) reply.desc = sp->desc;
+            if (send(c, &reply, sizeof reply, MSG_NOSIGNAL) == sizeof reply && !reply.status)
+                AHardwareBuffer_sendHandleToUnixSocket(sp->ahb, c);
+        }
+        close(c);
+    }
+}
+
+// Desktop process: the buffer and description of a games-process surface, or false.
+bool fetch_games_share(uint32_t id, AHardwareBuffer** ahb, D3D11_TEXTURE2D_DESC* desc) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_un a;
+    socklen_t n = share_addr(&a);
+    bool ok = s >= 0 && !connect(s, reinterpret_cast<sockaddr*>(&a), n) && send(s, &id, sizeof id, MSG_NOSIGNAL) == sizeof id;
+    struct { int32_t status; D3D11_TEXTURE2D_DESC desc; } reply{};
+    ok = ok && recv(s, &reply, sizeof reply, MSG_WAITALL) == sizeof reply && !reply.status &&
+         AHardwareBuffer_recvHandleFromUnixSocket(s, ahb) == 0 && *ahb;
+    if (s >= 0) close(s);
+    if (ok) *desc = reply.desc;
+    else LOG("shared surface %u: the games process did not give it", id);
+    return ok;
+}
 
 // The Vulkan entry DXVK itself uses (vulkan_loader.cpp): stock libvulkan.so for the desktop,
 // HWGPU_VK_LOADER (or stock fallback) for games.
@@ -1435,8 +1562,12 @@ int32_t create_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     uint32_t id;
     {
         std::lock_guard<std::mutex> g(g_shared_lock);
-        id = g_next_share++;
+        id = g_next_share++ | (hwgpu_host_role() == 1 ? kGamesShare : 0);
         g_shared[id] = sp;
+    }
+    if (hwgpu_host_role() == 1) {
+        static std::once_flag once;
+        std::call_once(once, [] { std::thread(share_server).detach(); });
     }
     uint32_t object = c.put(tex, HI_ID3D11Texture2D);
     {
@@ -1465,11 +1596,44 @@ int32_t open_shared(Chan& c, uint32_t device, Rd& r, Wr& w) {
     {
         std::lock_guard<std::mutex> g(g_shared_lock);
         auto it = g_shared.find(id);
-        if (it == g_shared.end()) return E_INVALIDARG;
-        sp = it->second;
-        d = sp->desc;
+        if (it != g_shared.end()) {
+            sp = it->second;
+            d = sp->desc;
+        }
+    }
+    if (!sp) {
+        // Made in the games process: borrowed for this open only. DXVK's texture keeps the memory.
+        AHardwareBuffer* ahb = nullptr;
+        if (!(id & kGamesShare) || hwgpu_host_role() == 1 || !fetch_games_share(id, &ahb, &d)) return E_INVALIDARG;
+        sp = std::make_shared<Shared>();
+        sp->ahb = ahb;
+        sp->desc = d;
+        sp->owner = UINT32_MAX;
     }
     if (!sp->cpu_fallback) {
+        // WUDFHost.exe (hwidd.dll) opens DWM's desktop swapchain surfaces solely to pass their shared id
+        // back via HWD3D_OP_SCANOUT; it never renders to or samples them on the phone. Importing the
+        // AHardwareBuffer into WUDFHost's DXVK device via wrap_ahb pinned 3x 3.6 MB buffers per desktop
+        // swapchain rebuild (because IddCx keeps its 3-surface ring alive on the reused D3D11 device).
+        // Hand WUDFHost a zero-memory IUnknown token instead so dead desktop buffers free immediately.
+        bool is_wudf = c.exe.size() >= 12 &&
+                       strcasecmp(c.exe.c_str() + c.exe.size() - 12, "WUDFHost.exe") == 0;
+        if (is_wudf) {
+            struct ScanoutToken final : IUnknown {
+                std::atomic<ULONG> ref{1};
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** ppv) override { if (ppv) *ppv = nullptr; return E_NOINTERFACE; }
+                ULONG STDMETHODCALLTYPE AddRef() override { return ref.fetch_add(1, std::memory_order_relaxed) + 1; }
+                ULONG STDMETHODCALLTYPE Release() override {
+                    ULONG r = ref.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                    if (!r) delete this;
+                    return r;
+                }
+            };
+            w.u32(c.put(new ScanoutToken(), HI_ID3D11Texture2D));
+            w.arr(&d, sizeof d);
+            LOG("channel %u: opened shared surface %u (scanout token)", c.slot, id);
+            return S_OK;
+        }
         chan_dxvk(c);
         AHardwareBuffer* ahb = sp->ahb;
         AHardwareBuffer_acquire(ahb);
@@ -1538,21 +1702,22 @@ int32_t set_cb1(Chan& c, const hwd3d_call& call, Rd& r) {
 // Waits until this channel's GPU work is done, so a surface handed on to another program is whole.
 int32_t finish(Chan& c) {
     if (!c.immediate) return 0;
-    ID3D11Device* dev = nullptr;
-    c.immediate->GetDevice(&dev);
-    D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
-    ID3D11Query* q = nullptr;
-    HRESULT hr = dev ? dev->CreateQuery(&qd, &q) : E_FAIL;
-    if (dev) dev->Release();
-    if (FAILED(hr)) return hr;
-    c.immediate->End(q);
+    if (!c.finish_done) {
+        ID3D11Device* dev = nullptr;
+        c.immediate->GetDevice(&dev);
+        D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+        HRESULT hr = dev ? dev->CreateQuery(&qd, &c.finish_done) : E_FAIL;
+        if (dev) dev->Release();
+        if (FAILED(hr) || !c.finish_done) return FAILED(hr) ? hr : E_FAIL;
+    }
+    c.immediate->End(c.finish_done);
     c.immediate->Flush();
     BOOL done = FALSE;
+    HRESULT hr = S_OK;
     auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while ((hr = c.immediate->GetData(q, &done, sizeof done, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE &&
+    while ((hr = c.immediate->GetData(c.finish_done, &done, sizeof done, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE &&
            std::chrono::steady_clock::now() < give_up)
         sched_yield();
-    q->Release();
     if (hr == S_FALSE) {
         static bool told;
         if (!told) {
@@ -1572,6 +1737,188 @@ int32_t finish(Chan& c) {
         for (auto& sp : mine) sync_owner_to_ahb(*sp);
     }
     return SUCCEEDED(hr) ? 0 : hr;
+}
+
+// 1 for RGBA-ordered 8-bit formats, 2 for BGRA-ordered, 0 for anything else.
+int rb_order(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS: return 1;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_TYPELESS: return 2;
+    default: return 0;
+    }
+}
+
+// Windows' BGRA surfaces that other programs open are RGBA here (the guest's rgba_of): Mali draws an Android buffer
+// only in RGBA order. A copy from one into a program's own BGRA texture converts on the GPU, but into a staging
+// texture (a buffer DXVK copies bytes into) red and blue would come out swapped: DisplayLink's driver reading the
+// desktop. Such a copy goes through a BGRA scratch texture with a converting blit. False: an ordinary copy, left
+// to the generated code (r untouched).
+bool copy_swapped(Chan& c, const hwd3d_call& call, Rd& r, int32_t& st) {
+    Rd peek = r;
+    uint32_t dst_h = peek.u32(), dsub = 0, x = 0, y = 0, z = 0, ssub = 0;
+    const bool region = call.method == 124u /* ID3D11DeviceContext::CopySubresourceRegion (hwd3d_methods.h) */;
+    if (region) { dsub = peek.u32(); x = peek.u32(); y = peek.u32(); z = peek.u32(); }
+    uint32_t src_h = peek.u32();
+    const void* boxp = nullptr;
+    uint64_t boxn = 0;
+    if (region) { ssub = peek.u32(); boxp = peek.arr(sizeof(D3D11_BOX), &boxn); }
+    if (!peek.ok) return false;
+    auto* dst = static_cast<ID3D11Resource*>(c.obj(dst_h, HI_ID3D11Resource));
+    auto* src = static_cast<ID3D11Resource*>(c.obj(src_h, HI_ID3D11Resource));
+    if (!dst || !src || dst == BAD || src == BAD || dsub || ssub || z) return false;
+    ID3D11Texture2D *dt = nullptr, *stx = nullptr;
+    bool ok = SUCCEEDED(dst->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&dt))) &&
+              SUCCEEDED(src->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&stx)));
+    D3D11_TEXTURE2D_DESC dd{}, sd{};
+    if (ok) { dt->GetDesc(&dd); stx->GetDesc(&sd); }
+    const Dxvk& dx = chan_dxvk(c);
+    ok = ok && rb_order(dd.Format) && rb_order(sd.Format) && rb_order(dd.Format) != rb_order(sd.Format) &&
+         dd.Usage == D3D11_USAGE_STAGING && sd.Usage != D3D11_USAGE_STAGING && dx.d11_blit_swap_rb && c.immediate &&
+         sd.SampleDesc.Count == 1 && dd.SampleDesc.Count == 1;
+    if (!ok) {
+        if (dt) dt->Release();
+        if (stx) stx->Release();
+        return false;
+    }
+    r = peek;  // the request is taken here
+    D3D11_BOX box = boxp && boxn == 1 ? *static_cast<const D3D11_BOX*>(boxp) : D3D11_BOX{0, 0, 0, sd.Width, sd.Height, 1};
+    {
+        // Blit into a scratch texture of the target's format, the size of the source, then copy as asked.
+        if (!c.swap_scratch || c.swap_scratch_w != sd.Width || c.swap_scratch_h != sd.Height || c.swap_scratch_fmt != dd.Format) {
+            if (c.swap_scratch) c.swap_scratch->Release();
+            c.swap_scratch = nullptr;
+            D3D11_TEXTURE2D_DESC td = {sd.Width, sd.Height, 1, 1, dd.Format, {1, 0}, D3D11_USAGE_DEFAULT,
+                                       D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+            ID3D11Device* dev = nullptr;
+            c.immediate->GetDevice(&dev);
+            if (dev) { dev->CreateTexture2D(&td, nullptr, &c.swap_scratch); dev->Release(); }
+            c.swap_scratch_w = sd.Width; c.swap_scratch_h = sd.Height; c.swap_scratch_fmt = dd.Format;
+        }
+        if (c.swap_scratch && SUCCEEDED(dx.d11_blit_swap_rb(c.immediate, c.swap_scratch, src, &box))) {
+            if (region) c.immediate->CopySubresourceRegion(dst, 0, x, y, 0, c.swap_scratch, 0, &box);
+            else c.immediate->CopyResource(dst, c.swap_scratch);
+        } else {
+            if (region) c.immediate->CopySubresourceRegion(dst, 0, x, y, 0, src, 0, boxp ? &box : nullptr);
+            else c.immediate->CopyResource(dst, src);
+        }
+    }
+    static std::atomic<uint32_t> told{0};
+    if (told.fetch_add(1) < 3)
+        LOG("channel %u: copy from RGBA into a BGRA staging texture %ux%u converted", c.slot, sd.Width, sd.Height);
+    dt->Release();
+    stx->Release();
+    st = 0;
+    return true;
+}
+
+// Delivers own-primary desktop AHBs to SurfaceFlinger on a dedicated thread after Mali signals a
+// core Vulkan 1.0 VkFence: zero CPU stall on DWM's worker thread and zero half-drawn flicker.
+struct PendingScanout {
+    ID3D11Device* dev;
+    VkDevice vk_dev;
+    VkFence fence;
+    PFN_vkWaitForFences wait_fences;
+    AHardwareBuffer* ahb;
+    uint32_t w, h;
+};
+struct ScanoutDeliverer {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<PendingScanout> q;
+    bool started = false;
+    void enqueue(PendingScanout p) {
+        std::unique_lock<std::mutex> l(mu);
+        if (!started) {
+            started = true;
+            std::thread([this]() { run(); }).detach();
+        }
+        cv.wait(l, [&] { return q.size() < Chan::kScanFences; });
+        q.push_back(p);
+        cv.notify_all();
+    }
+    void drain() {
+        std::unique_lock<std::mutex> l(mu);
+        cv.wait(l, [&] { return q.empty(); });
+    }
+    void run() {
+        for (;;) {
+            PendingScanout p{};
+            {
+                std::unique_lock<std::mutex> l(mu);
+                cv.wait(l, [&] { return !q.empty(); });
+                p = q.front();
+                q.pop_front();
+                cv.notify_all();
+            }
+            if (p.fence && p.wait_fences) p.wait_fences(p.vk_dev, 1, &p.fence, VK_TRUE, 100'000'000ULL);
+            hwgpu_host_show_buffer(p.ahb, p.w, p.h);
+            AHardwareBuffer_release(p.ahb);
+            if (p.dev) p.dev->Release();
+        }
+    }
+} g_scanout_deliver;
+
+static bool queue_fenced_scanout(Chan& c, AHardwareBuffer* ahb, uint32_t w, uint32_t h) {
+    if (!c.immediate) return false;
+    if (!c.sf_interop) {
+        ID3D11Device* dev = nullptr;
+        c.immediate->GetDevice(&dev);
+        if (!dev) return false;
+        HwVkInteropDevice1* interop = nullptr;
+        if (FAILED(dev->QueryInterface(kHwVkInteropGuid, reinterpret_cast<void**>(&interop))) || !interop) {
+            dev->Release();
+            return false;
+        }
+        VkInstance inst = VK_NULL_HANDLE;
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        VkDevice vkd = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        uint32_t qfam = 0;
+        interop->GetVulkanHandles(&inst, &phys, &vkd);
+        interop->GetSubmissionQueue(&queue, &qfam);
+        PFN_vkGetInstanceProcAddr gipa = vk_gipa(c.is_desktop);
+        auto gdpa = gipa ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(inst, "vkGetDeviceProcAddr")) : nullptr;
+        auto create_fence = gdpa ? reinterpret_cast<PFN_vkCreateFence>(gdpa(vkd, "vkCreateFence")) : nullptr;
+        auto submit = gdpa ? reinterpret_cast<PFN_vkQueueSubmit>(gdpa(vkd, "vkQueueSubmit")) : nullptr;
+        auto wait = gdpa ? reinterpret_cast<PFN_vkWaitForFences>(gdpa(vkd, "vkWaitForFences")) : nullptr;
+        auto reset = gdpa ? reinterpret_cast<PFN_vkResetFences>(gdpa(vkd, "vkResetFences")) : nullptr;
+        auto destroy = gdpa ? reinterpret_cast<PFN_vkDestroyFence>(gdpa(vkd, "vkDestroyFence")) : nullptr;
+        if (!vkd || !queue || !create_fence || !submit || !wait || !reset || !destroy) {
+            interop->Release();
+            dev->Release();
+            return false;
+        }
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
+        for (size_t i = 0; i < Chan::kScanFences; i++) {
+            if (create_fence(vkd, &fci, nullptr, &c.sf_fences[i]) != VK_SUCCESS) {
+                for (size_t j = 0; j < i; j++) { destroy(vkd, c.sf_fences[j], nullptr); c.sf_fences[j] = VK_NULL_HANDLE; }
+                interop->Release();
+                dev->Release();
+                return false;
+            }
+        }
+        c.sf_dev = dev;
+        c.sf_interop = interop;
+        c.sf_vkd = vkd;
+        c.sf_queue = queue;
+        c.sf_submit = submit;
+        c.sf_wait = wait;
+        c.sf_reset = reset;
+        c.sf_destroy = destroy;
+    }
+    c.sf_interop->FlushRenderingCommands();
+    VkFence fence = c.sf_fences[c.sf_idx++ % Chan::kScanFences];
+    c.sf_wait(c.sf_vkd, 1, &fence, VK_TRUE, 50'000'000ULL);
+    c.sf_reset(c.sf_vkd, 1, &fence);
+    c.sf_interop->LockSubmissionQueue();
+    VkResult vr = c.sf_submit(c.sf_queue, 0, nullptr, fence);
+    c.sf_interop->ReleaseSubmissionQueue();
+    if (vr != VK_SUCCESS) return false;
+    AHardwareBuffer_acquire(ahb);
+    c.sf_dev->AddRef();
+    g_scanout_deliver.enqueue(PendingScanout{c.sf_dev, c.sf_vkd, fence, c.sf_wait, ahb, w, h});
+    return true;
 }
 
 int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
@@ -1651,7 +1998,7 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
         const bool overlay = call.method == 4;
         uint32_t src_h = r.u32();
         int32_t ov_x = 0, ov_y = 0;
-        uint32_t ov_w = 0, ov_h = 0, ov_crop[4] = {0, 0, 0, 0};
+        uint32_t ov_w = 0, ov_h = 0, ov_crop[4] = {0, 0, 0, 0}, fif_seq = 0;
         if (overlay) {
             ov_x = int32_t(r.u32());
             ov_y = int32_t(r.u32());
@@ -1661,6 +2008,7 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
             ov_crop[1] = r.u32();
             ov_crop[2] = r.u32();
             ov_crop[3] = r.u32();
+            if (r.end - r.p >= 4) fif_seq = r.u32();   // frames in flight: the program's sequence number for this frame
         }
         auto* dev = static_cast<ID3D11Device*>(c.obj(call.object, HI_ID3D11Device));
         auto* src_res = static_cast<ID3D11Resource*>(c.obj(src_h, HI_ID3D11Resource));
@@ -1674,14 +2022,26 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
             src_tex->Release();
             return E_INVALIDARG;
         }
-        // The phone's layer reads the bytes as RGBA: a BGRA backbuffer would come out with red and blue swapped.
-        if (overlay && sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
-            sd.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+        // The phone's layer reads the bytes as RGBA, so the ring's buffers are RGBA (a BGRA Android buffer is RGBA to
+        // Mali's Vulkan and drew black or swapped). A BGRA back buffer reaches them through a converting blit
+        // (hwd3d11_blit_swap_rb), which keeps the colours; an RGBA one by a plain copy. HWD3D_BGRA_COPY=0 (property
+        // debug.hwd3d.bgracopy 0) turns BGRA off: the program then reads its frames back as before.
+        const uint32_t src_bgra = rb_order(sd.Format) == 2 ? 1u : 0u;
+        if (src_bgra) {
+            char v[PROP_VALUE_MAX] = "";
+            __system_property_get("debug.hwd3d.bgracopy", v);
+            if (v[0] == '0' || !chan_dxvk(c).d11_blit_swap_rb || !(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+                src_tex->Release();
+                return E_NOTIMPL;
+            }
+        } else if (overlay && sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+                   sd.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS) {
             src_tex->Release();
             return E_NOTIMPL;
         }
+        const uint32_t bgra = 0;   // the ring itself stays RGBA
         chan_dxvk(c);
-        if (c.scan_dev != dev || c.scan_w != sd.Width || c.scan_h != sd.Height || !c.scan_ring[0].tex11) {
+        if (c.scan_dev != dev || c.scan_w != sd.Width || c.scan_h != sd.Height || c.scan_bgra != bgra || !c.scan_ring[0].tex11) {
             c.idle();
             c.free_scan_ring();
             D3D11_TEXTURE2D_DESC rd{};
@@ -1689,15 +2049,15 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
             rd.Height = sd.Height;
             rd.MipLevels = 1;
             rd.ArraySize = 1;
-            rd.Format = (sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
-                            ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-                            : DXGI_FORMAT_R8G8B8A8_UNORM;
+            const bool srgb = sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            rd.Format = bgra ? (srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM)
+                             : (srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM);
             rd.SampleDesc = {1, 0};
             rd.Usage = D3D11_USAGE_DEFAULT;
             rd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             static const bool custom_driver = getenv("HWGPU_VK_DRIVER") && *getenv("HWGPU_VK_DRIVER");
             for (int i = 0; i < 3; i++) {
-                AHardwareBuffer_Desc ad{sd.Width, sd.Height, 1, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                AHardwareBuffer_Desc ad{sd.Width, sd.Height, 1, bgra ? 5u : uint32_t(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM),
                                         AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                                             AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
                                             (!c.is_desktop && custom_driver ? AHARDWAREBUFFER_USAGE_CPU_READ_RARELY : 0),
@@ -1719,10 +2079,19 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
             c.scan_dev = dev;
             c.scan_w = sd.Width;
             c.scan_h = sd.Height;
-            LOG("channel %u: fullscreen D3D11 scanout ring %ux%u ready", c.slot, sd.Width, sd.Height);
+            c.scan_bgra = bgra;
+            LOG("channel %u: D3D11 scanout ring %ux%u %s ready", c.slot, sd.Width, sd.Height, bgra ? "BGRA" : "RGBA");
         }
         auto& buf = c.scan_ring[c.scan_idx++ % 3];
-        c.immediate->CopyResource(buf.tex11, src_tex);
+        if (src_bgra) {
+            D3D11_BOX whole{0, 0, 0, sd.Width, sd.Height, 1};
+            if (FAILED(chan_dxvk(c).d11_blit_swap_rb(c.immediate, buf.tex11, src_tex, &whole))) {
+                src_tex->Release();
+                return E_NOTIMPL;
+            }
+        } else {
+            c.immediate->CopyResource(buf.tex11, src_tex);
+        }
         src_tex->Release();
         HwVkInteropDevice1* interop = nullptr;
         if (SUCCEEDED(dev->QueryInterface(kHwVkInteropGuid, reinterpret_cast<void**>(&interop))) && interop) {
@@ -1733,6 +2102,11 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
         }
         if (overlay) hwgpu_host_show_window_buffer(c.slot, buf.ahb, sd.Width, sd.Height, ov_x, ov_y, ov_w, ov_h, ov_crop);
         else hwgpu_host_show_game_buffer(c.slot, c.generation, buf.ahb, sd.Width, sd.Height, hwgpu_host_vsync());
+        if (fif_seq && c.stage && c.stage_size > HWD3D_STAGING_DATA + HWD3D_QUERY_PAGE) {
+            // the frame is on its way to the layer: the program may send another (last slot of the query page)
+            auto* fpage = reinterpret_cast<hwd3d_query_slot*>(c.stage + c.stage_size - HWD3D_QUERY_PAGE);
+            __atomic_store_n(&fpage[HWD3D_QUERY_SLOTS - 1].seq, fif_seq, __ATOMIC_RELEASE);
+        }
         c.presents++;
         return S_OK;
     }
@@ -1750,15 +2124,140 @@ int32_t scanout(Chan& c, const hwd3d_call& call, Rd& r, Wr& wr) {
         h = sp->desc.Height;
         AHardwareBuffer_acquire(ahb);
     }
-    if (sp->cpu_fallback && sp->owner == c.slot) sync_owner_to_ahb(*sp);
-    // The program that drew it waited for its GPU work before presenting (HWD3D_OP_FINISH).
+    // When Display=1 owns the screen, dwm.exe's own channel (sp->owner == c.slot) skips the
+    // synchronous guest HWD3D_OP_FINISH and lets scanout merge cut_hole + one finish(c) here.
+    bool own_primary = (sp->owner == c.slot);
     bool tell = c.presents < 3 || !(c.presents % 600);
-    if (tell) LOG("channel %u: screen frame %llu from shared surface %u", c.slot, (unsigned long long)c.presents + 1, id);
+    if (tell) LOG("channel %u: screen frame %llu from shared surface %u (own=%d)", c.slot, (unsigned long long)c.presents + 1, id, own_primary);
+    int32_t hole[4];
+    if (hwgpu_host_window_hole(hole)) {
+        cut_hole(c, id, ahb, sp->desc, hole, !own_primary, own_primary ? sp->owner_tex : nullptr);
+    } else if (!c.hole_targets.empty()) {
+        for (auto& ht : c.hole_targets) {
+            if (ht.second.rtv) ht.second.rtv->Release();
+            if (ht.second.tex) ht.second.tex->Release();
+        }
+        c.hole_targets.clear();
+    }
+    if (own_primary) {
+        // Wait via D3D11_QUERY_EVENT so DXVK's CS thread, submit thread, and Mali GPU have
+        // completed all DWM draws AND cut_hole's ClearView before SurfaceFlinger scans out ahb.
+        // (queue_fenced_scanout submitted a raw VkFence before DXVK's async CS thread finished
+        // recording/submitting, causing half-drawn DWM frames and white-window flashes.)
+        finish(c);
+    } else if (sp->cpu_fallback) {
+        sync_owner_to_ahb(*sp);
+    }
     hwgpu_host_show_buffer(ahb, w, h);
     AHardwareBuffer_release(ahb);
     if (tell) LOG("channel %u: screen frame %llu on the layer", c.slot, (unsigned long long)c.presents + 1);
     c.presents++;
     return S_OK;
+}
+
+// Clears a windowed program's rect of the screen's frame to see-through black: its own layer is under the
+// desktop and shows there. Waits for the GPU, since the frame goes to the compositor right after.
+void cut_hole(Chan& c, uint32_t id, AHardwareBuffer* ahb, const D3D11_TEXTURE2D_DESC& desc, const int32_t* hole, bool wait_gpu, ID3D11Texture2D* own_tex) {
+    if (!c.immediate) return;
+    ID3D11Device* dev = nullptr;
+    c.immediate->GetDevice(&dev);
+    if (!dev) return;
+    static uint64_t misses, evictions;
+    auto it = c.hole_targets.find(id);
+    bool hit = it != c.hole_targets.end() && it->second.ahb == ahb && it->second.rtv &&
+               (!own_tex || it->second.tex == own_tex);
+    if (!hit) {
+        misses++;
+        if (it != c.hole_targets.end()) {
+            if (it->second.rtv) it->second.rtv->Release();
+            if (it->second.tex) it->second.tex->Release();
+            c.hole_targets.erase(it);
+        }
+        while (c.hole_targets.size() >= Chan::kMaxHoleTargets) {
+            auto victim = c.hole_targets.begin();
+            for (auto cur = c.hole_targets.begin(); cur != c.hole_targets.end(); ++cur)
+                if (cur->second.last_used < victim->second.last_used) victim = cur;
+            if (victim->second.rtv) victim->second.rtv->Release();
+            if (victim->second.tex) victim->second.tex->Release();
+            c.hole_targets.erase(victim);
+            evictions++;
+        }
+        Chan::HoleTarget nt{ahb, nullptr, nullptr, ++c.hole_use_seq};
+        // When Display=1 owns the primary on this same D3D11 device (own_tex != nullptr), clear
+        // directly on sp->owner_tex (same VkImage handle) so DXVK orders ClearView strictly AFTER
+        // DWM's draws instead of aliasing a second wrap_ahb VkImage without a Vulkan barrier.
+        bool rtv_ok = false;
+        if (own_tex) {
+            D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
+            const D3D11_RENDER_TARGET_VIEW_DESC* prtvd = nullptr;
+            if (desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+                rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                prtvd = &rtvd;
+            } else if (desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
+                rtvd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                prtvd = &rtvd;
+            }
+            if (SUCCEEDED(dev->CreateRenderTargetView(own_tex, prtvd, &nt.rtv)) && nt.rtv) {
+                nt.tex = own_tex;
+                nt.tex->AddRef();
+                rtv_ok = true;
+            }
+        }
+        if (!rtv_ok && (FAILED(wrap_ahb(c.is_desktop, dev, ahb, desc, &nt.tex)) || !nt.tex ||
+                        FAILED(dev->CreateRenderTargetView(nt.tex, nullptr, &nt.rtv)))) {
+            if (nt.rtv) { nt.rtv->Release(); nt.rtv = nullptr; }
+            if (nt.tex) { nt.tex->Release(); nt.tex = nullptr; }
+            static bool told;
+            if (!told) LOG("channel %u: cannot draw into the screen's surface %u to cut a window's hole", c.slot, id);
+            told = true;
+            dev->Release();
+            return;
+        }
+        it = c.hole_targets.emplace(id, nt).first;
+    } else {
+        it->second.last_used = ++c.hole_use_seq;
+    }
+    auto& t = it->second;
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (t.rtv && SUCCEEDED(c.immediate->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1)) && ctx1) {
+        const FLOAT clear[4] = {0, 0, 0, 0};
+        D3D11_RECT rc{std::max<LONG>(0, hole[0]), std::max<LONG>(0, hole[1]),
+                      std::min<LONG>(LONG(desc.Width), hole[2]), std::min<LONG>(LONG(desc.Height), hole[3])};
+        if (rc.right > rc.left && rc.bottom > rc.top) {
+            ctx1->ClearView(t.rtv, clear, &rc, 1);
+            if (!wait_gpu) {
+                /* Caller runs one merged finish(c) right after cut_hole. */
+            } else {
+                if (!c.hole_done) {
+                    D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+                    dev->CreateQuery(&qd, &c.hole_done);
+                }
+                if (c.hole_done) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    c.immediate->End(c.hole_done);
+                    c.immediate->Flush();
+                    auto give_up = t0 + std::chrono::milliseconds(50);
+                    while (c.immediate->GetData(c.hole_done, nullptr, 0, 0) == S_FALSE && std::chrono::steady_clock::now() < give_up)
+                        sched_yield();
+                    static uint64_t n, total_us, worst_us;
+                    uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+                    n++; total_us += us; if (us > worst_us) worst_us = us;
+                    if (n % 300 == 0) {
+                        LOG("channel %u: window hole %dx%d, GPU wait %llu us avg, %llu us worst (cache=%zu misses=%llu evict=%llu)", c.slot,
+                            int(rc.right - rc.left), int(rc.bottom - rc.top), (unsigned long long)(total_us / n), (unsigned long long)worst_us,
+                            c.hole_targets.size(), (unsigned long long)misses, (unsigned long long)evictions);
+                        total_us = worst_us = 0; n = 0;
+                    }
+                } else {
+                    c.immediate->Flush();
+                }
+            }
+        }
+        ctx1->Release();
+    }
+    dev->Release();
 }
 
 // The owner let go of its texture: no new program can open the surface. Programs that opened it keep
@@ -1855,15 +2354,15 @@ bool handle(Chan& c, const std::vector<uint8_t>& m) {
         const char* at = reinterpret_cast<const char*>(m.data() + sizeof p);
         c.exe.assign(at, p.path_bytes);  // Windows' path: DXVK's profiles match it with backslashes
         c.conf.assign(at + pad_path, p.conf_bytes);
-        {
-            size_t slash = c.exe.find_last_of("\\/");
-            std::string base = (slash == std::string::npos) ? c.exe : c.exe.substr(slash + 1);
-            if (!base.empty()) {
-                char tname[16]{};
-                strncpy(tname, base.c_str(), 15);
-                pthread_setname_np(pthread_self(), tname);
-            }
+        // A program that is not part of the desktop draws in the games process, so its crash leaves
+        // the desktop up. Nothing is set up for it yet: the hello holds no state, staging comes later.
+        if (!c.stage && !is_desktop_program(c.exe) &&
+            hwgpu_host_handoff(c.slot, c.generation, c.exe.c_str(), c.conf.c_str())) {
+            LOG("channel %u: program %s goes to the games process", c.slot, c.exe.c_str());
+            c.handed = true;
+            return false;
         }
+        name_thread(c.exe);
         LOG("channel %u: program %s%s", c.slot, c.exe.c_str(), c.conf.empty() ? "" : ", with a dxvk.conf");
         return true;
     }
@@ -1941,8 +2440,18 @@ int32_t handle_call(Chan& c, const hwd3d_msg& h, const hwd3d_call& call, Rd& r, 
             st = finish(c);
         } else if (h.op == HWD3D_OP_D9) {
             st = d9_call(c, call, r, w);
+            // A Direct3D 9 call the phone refused: the program carries on as if it worked, so say which.
+            if (st < 0 && call.method < 256) {
+                static std::atomic<uint32_t> fails[256];
+                uint32_t k = fails[call.method].fetch_add(1);
+                if (k < 8 || k % 1000 == 0)
+                    LOG("channel %u: Direct3D 9 call %u failed with 0x%08x (%u times)", c.slot, call.method, unsigned(st), k + 1);
+            }
         } else if (h.op == HWD3D_OP_SET_CB1) {
             st = set_cb1(c, call, r);
+        } else if ((call.method == 124u /* ID3D11DeviceContext::CopySubresourceRegion (hwd3d_methods.h) */ ||
+                    call.method == 125u /* ID3D11DeviceContext::CopyResource */) && copy_swapped(c, call, r, st)) {
+            // done: a copy between a surface kept as RGBA and an ordinary BGRA texture
         } else if (call.method >= HM_COUNT || !hm_table[call.method].fn) {
             static bool told[HM_COUNT];
             if (call.method < HM_COUNT && !told[call.method]) {
@@ -2006,16 +2515,265 @@ void wait_request(Chan& ch) {
     }
 }
 
+
+// ---- a request that does not come back ----
+// A channel thread that sits in one request for seconds is stuck in DXVK or the driver, and the program in
+// Windows waits on it for good. The watchdog asks that thread for its own stack and logs it: where it waits.
+#include <unwind.h>
+#include <signal.h>
+#include <pthread.h>
+struct Busy {
+    std::atomic<uint64_t> since{0};   // 0: between requests
+    std::atomic<uint32_t> op{0}, method{0}, seq{0};
+    std::atomic<bool> dumped{false};
+    pthread_t thread{};
+};
+Busy g_busy[HWGPU_CHANNELS];
+
+struct BtState { void** at; void** end; };
+_Unwind_Reason_Code bt_step(struct _Unwind_Context* ctx, void* arg) {
+    auto* st = static_cast<BtState*>(arg);
+    uintptr_t pc = _Unwind_GetIP(ctx);
+    if (pc) {
+        if (st->at == st->end) return _URC_END_OF_STACK;
+        *st->at++ = reinterpret_cast<void*>(pc);
+    }
+    return _URC_NO_REASON;
+}
+void stuck_signal(int) {
+    void* pcs[48];
+    BtState st{pcs, pcs + 48};
+    _Unwind_Backtrace(bt_step, &st);
+    int n = int(st.at - pcs);
+    for (int i = 0; i < n; i++) {
+        Dl_info di{};
+        if (dladdr(pcs[i], &di) && di.dli_fname) {
+            const char* base = strrchr(di.dli_fname, '/');
+            LOG("stuck[%d] #%02d %s+0x%zx %s", gettid(), i, base ? base + 1 : di.dli_fname,
+                size_t(uintptr_t(pcs[i]) - uintptr_t(di.dli_fbase)), di.dli_sname ? di.dli_sname : "");
+        } else {
+            LOG("stuck[%d] #%02d %p", gettid(), i, pcs[i]);
+        }
+    }
+}
+void* stuck_watch(void*) {
+    for (;;) {
+        sleep(1);
+        const uint64_t now = now_ns();
+        for (uint32_t i = 0; i < HWGPU_CHANNELS; i++) {
+            Busy& b = g_busy[i];
+            uint64_t since = b.since.load(std::memory_order_acquire);
+            // `now` was read before `since` may have been set a moment later: that is no age at all, not a huge one.
+            if (!since || since >= now || now - since < 4000000000ull || b.dumped.exchange(true)) continue;
+            LOG("channel %u: stuck for %.1f s in op 0x%x method %u seq %u, its stack follows", i,
+                double(now - since) / 1e9, b.op.load(), b.method.load(), b.seq.load());
+            pthread_kill(b.thread, SIGUSR2);
+            usleep(200000);
+            // DXVK's own threads too: one of them holds what the request waits for.
+            if (DIR* d = opendir("/proc/self/task")) {
+                while (dirent* e = readdir(d)) {
+                    int tid = atoi(e->d_name);
+                    if (tid <= 0) continue;
+                    char path[64], comm[32] = "";
+                    snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+                    if (FILE* f = fopen(path, "r")) {
+                        if (!fgets(comm, sizeof comm, f)) comm[0] = 0;
+                        fclose(f);
+                    }
+                    if (strncmp(comm, "dxvk-submit", 11) && strncmp(comm, "dxvk-queue", 10) && strncmp(comm, "dxvk-cs", 7)) continue;
+                    LOG("stack of %d %s", tid, comm);
+                    tgkill(getpid(), tid, SIGUSR2);
+                    usleep(100000);
+                }
+                closedir(d);
+            }
+        }
+    }
+    return nullptr;
+}
+// ---- a stack sampler for the speed plan (debug.hwd3d.prof 2) ----
+// For 4 s, 250 times a second, the channel threads inside a request and DXVK's and the driver's own threads are
+// asked for their stacks; the top stacks per thread name are logged. It says where a slow frame sits: in DXVK,
+// the driver, a condition wait on another DXVK thread, or a Vulkan fence. Off-CPU time counts too, which perf
+// cannot show here (the process is not profileable).
+struct Sample { void* pc[10]; int n; int tid; };
+Sample g_samples[8192];
+std::atomic<int> g_sample_n{0};
+void sample_signal(int) {
+    int i = g_sample_n.fetch_add(1);
+    if (i >= 8192) return;
+    BtState st{g_samples[i].pc, g_samples[i].pc + 10};
+    _Unwind_Backtrace(bt_step, &st);
+    g_samples[i].n = int(st.at - g_samples[i].pc);
+    g_samples[i].tid = gettid();
+}
+std::string sym_of(void* pc) {
+    Dl_info di{};
+    if (!dladdr(pc, &di) || !di.dli_fname) return "?";
+    const char* base = strrchr(di.dli_fname, '/');
+    base = base ? base + 1 : di.dli_fname;
+    char b[200];
+    if (di.dli_sname) snprintf(b, sizeof b, "%s %s+%lx", base, di.dli_sname, (unsigned long)((char*)pc - (char*)di.dli_saddr));
+    else snprintf(b, sizeof b, "%s+0x%lx", base, (unsigned long)((char*)pc - (char*)di.dli_fbase));
+    return b;
+}
+std::string comm_of(int tid) {
+    char path[64], comm[32] = "";
+    snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+    if (FILE* f = fopen(path, "r")) {
+        if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0;
+        fclose(f);
+    }
+    return comm;
+}
+void sampler_loop() {
+    struct sigaction sa{};
+    sa.sa_handler = sample_signal;
+    sigaction(SIGRTMIN + 4, &sa, nullptr);
+    for (;;) {
+        char v[PROP_VALUE_MAX] = "";
+        __system_property_get("debug.hwd3d.prof", v);
+        if (v[0] != '2') { usleep(500000); continue; }
+        g_sample_n = 0;
+        std::vector<int> tids;
+        for (int k = 0; k < 1000; k++) {
+            if (k % 100 == 0) {
+                tids.clear();
+                if (DIR* d = opendir("/proc/self/task")) {
+                    while (dirent* e = readdir(d)) {
+                        int tid = atoi(e->d_name);
+                        if (tid <= 0 || tid == gettid()) continue;
+                        std::string c = comm_of(tid);
+                        // the program's channel thread (named after the exe), DXVK's and the driver's busy threads
+                        if (c.find("Daemon") != std::string::npos || c.find("perfetto") != std::string::npos || c.find("Finalizer") != std::string::npos ||
+                            c.find("Reference") != std::string::npos || c.find("Signal") != std::string::npos || c.find("Binder") != std::string::npos ||
+                            c.rfind("mali-utility", 0) == 0 || c.rfind("Jit", 0) == 0 || c.find("ADB") != std::string::npos || c.find("HeapTask") != std::string::npos) continue;
+                        if (c.rfind("dxvk-cs", 0) == 0 || c.rfind("dxvk-submit", 0) == 0 || c.rfind("dxvk-queue", 0) == 0 ||
+                            c.rfind("mali-cmar", 0) == 0 || c.rfind("mali-compiler", 0) == 0 || c.find(".exe") != std::string::npos ||
+                            c.rfind("Borderlands", 0) == 0)
+                            tids.push_back(tid);
+                    }
+                    closedir(d);
+                }
+            }
+            for (int tid : tids) syscall(SYS_tgkill, getpid(), tid, SIGRTMIN + 4);
+            usleep(4000);
+        }
+        usleep(50000);
+        int n = std::min(g_sample_n.load(), 8192);
+        std::map<std::string, std::map<std::string, int>> by;
+        std::map<std::string, int> per;
+        for (int i = 0; i < n; i++) {
+            if (g_samples[i].n < 3) continue;
+            std::string c = comm_of(g_samples[i].tid) + ":" + std::to_string(g_samples[i].tid);
+            if (c.find("mali-utility") != std::string::npos || c.find("ADB") != std::string::npos || c.find("Jit") != std::string::npos) continue;
+            std::string st;
+            int shown = 0;
+            for (int d = 0; d < g_samples[i].n && shown < 6; d++) {
+                std::string sy = sym_of(g_samples[i].pc[d]);
+                if (sy.find("sample_signal") != std::string::npos || sy.find("__kernel_rt_sigreturn") != std::string::npos ||
+                    sy.find("hwd3d.so+0x15d") != std::string::npos)
+                    continue;
+                st += (shown ? " < " : "") + sy;
+                shown++;
+            }
+            by[c][st]++;
+            per[c]++;
+        }
+        LOG("sampler: %d samples", n);
+        for (auto& t : by) {
+            std::vector<std::pair<int, std::string>> top;
+            for (auto& e : t.second) top.push_back({e.second, e.first});
+            std::sort(top.rbegin(), top.rend());
+            LOG("sampler: thread %s: %d samples", t.first.c_str(), per[t.first]);
+            for (size_t i = 0; i < top.size() && i < 4; i++)
+                LOG("sampler:   %3d%% %s", 100 * top[i].first / std::max(per[t.first], 1), top[i].second.c_str());
+        }
+        __system_property_set("debug.hwd3d.prof", "1");
+    }
+}
+void busy_begin(uint32_t slot, const std::vector<uint8_t>& m) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa{};
+        sa.sa_handler = stuck_signal;
+        sigaction(SIGUSR2, &sa, nullptr);
+        pthread_t t;
+        if (!pthread_create(&t, nullptr, stuck_watch, nullptr)) pthread_detach(t);
+        std::thread(sampler_loop).detach();
+    });
+    if (slot >= HWGPU_CHANNELS) return;
+    Busy& b = g_busy[slot];
+    b.thread = pthread_self();
+    if (m.size() >= sizeof(hwd3d_msg)) {
+        hwd3d_msg h;
+        memcpy(&h, m.data(), sizeof h);
+        b.op = h.op;
+        b.seq = h.seq;
+    }
+    if (m.size() >= sizeof(hwd3d_call)) {
+        hwd3d_call c;
+        memcpy(&c, m.data(), sizeof c);
+        b.method = c.method;
+    }
+    b.dumped = false;
+    b.since.store(now_ns(), std::memory_order_release);
+}
+void busy_end(uint32_t slot) {
+    if (slot < HWGPU_CHANNELS) g_busy[slot].since.store(0, std::memory_order_release);
+}
+
 }  // namespace
 
-extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, uint32_t slot, uint32_t generation,
-                                                                 const void* first, size_t first_len) {
-    Chan c;
-    c.chan = chan;
-    c.slot = slot;
-    c.generation = generation;
-    std::vector<uint8_t> m(static_cast<const uint8_t*>(first), static_cast<const uint8_t*>(first) + first_len);
-    bool ok = read_message(c, m, first_len) && handle(c, m);
+namespace {
+// Serves a channel until it ends. `m` holds the first message when `ok` says one was read and handled.
+// ---- the frame profile (speed plan, phase 0) ----
+// adb shell setprop debug.hwd3d.prof 1: every 2 s a channel says where the host's time went: idle (nothing in
+// the ring), reading, handling (DXVK and the driver), and which methods took the most, per frame.
+struct Prof {
+    uint64_t idle_ns = 0, read_ns = 0, handle_ns = 0, poll_ns = 0, msgs = 0, answers = 0, bytes = 0;
+    uint64_t t0 = 0, presents0 = 0;
+    std::map<uint32_t, std::pair<uint64_t, uint64_t>> by;   // op << 16 | method -> count, ns
+};
+bool prof_on() {
+    static std::atomic<uint64_t> checked{0};
+    static std::atomic<bool> on{false};
+    uint64_t now = now_ns();
+    if (now - checked.load(std::memory_order_relaxed) > 1000000000ull) {
+        checked = now;
+        char v[PROP_VALUE_MAX] = "";
+        __system_property_get("debug.hwd3d.prof", v);
+        on = v[0] == '1';
+    }
+    return on.load(std::memory_order_relaxed);
+}
+void prof_report(Chan& c, Prof& p, uint64_t now) {
+    double secs = double(now - p.t0) / 1e9;
+    uint64_t frames = c.presents - p.presents0;
+    double f = frames ? double(frames) : 1.0;
+    double total = double(p.idle_ns + p.read_ns + p.handle_ns + p.poll_ns);
+    LOG("prof channel %u: %.1f fps (%llu frames in %.1f s); of the host's time %.0f%% idle, %.0f%% reading, %.0f%% handling, "
+        "%.0f%% polling; per frame %.0f messages, %.1f answers, %.0f ring bytes, %.2f ms idle, %.2f ms handling",
+        c.slot, double(frames) / secs, (unsigned long long)frames, secs, total ? 100.0 * p.idle_ns / total : 0,
+        total ? 100.0 * p.read_ns / total : 0, total ? 100.0 * p.handle_ns / total : 0, total ? 100.0 * p.poll_ns / total : 0,
+        p.msgs / f, p.answers / f, p.bytes / f, p.idle_ns / f / 1e6, p.handle_ns / f / 1e6);
+    std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> top(p.by.begin(), p.by.end());
+    std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second.second > b.second.second; });
+    for (size_t i = 0; i < top.size() && i < 12; i++)
+        LOG("prof channel %u:   op %u method %u: %.1f calls and %.3f ms per frame (%.1f us each)", c.slot, top[i].first >> 16,
+            top[i].first & 0xffff, top[i].second.first / f, top[i].second.second / f / 1e6,
+            top[i].second.first ? top[i].second.second / double(top[i].second.first) / 1e3 : 0.0);
+    p = Prof();
+    p.t0 = now;
+    p.presents0 = c.presents;
+}
+
+void serve(Chan& c, std::vector<uint8_t>& m, bool ok) {
+    Prof prof;
+    prof.t0 = now_ns();
+    prof.presents0 = c.presents;
+    void* chan = c.chan;
+    uint32_t slot = c.slot, generation = c.generation;
     uint32_t prev_op = 0, prev_method = 0, prev_size = 0, prev_seq = 0;
     while (ok) {
         if (m.size() >= sizeof(hwd3d_msg)) {
@@ -2029,11 +2787,44 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
             }
         }
         m.resize(sizeof(hwd3d_msg));
+        const bool pf = prof_on();
+        uint64_t t_a = pf ? now_ns() : 0;
         wait_request(c);
+        uint64_t t_b = pf ? now_ns() : 0;
         if (!hwgpu_read_all(chan, generation, 0, m.data(), sizeof(hwd3d_msg))) break;  // the channel ended
-        ok = read_message(c, m, sizeof(hwd3d_msg)) && handle(c, m);
+        ok = read_message(c, m, sizeof(hwd3d_msg));
+        uint64_t t_c = pf ? now_ns() : 0;
+        if (ok) {
+            busy_begin(slot, m);
+            const uint64_t answers0 = c.answers;
+            ok = handle(c, m);
+            busy_end(slot);
+            if (pf) {
+                uint64_t t_d = now_ns();
+                hwd3d_msg h{};
+                memcpy(&h, m.data(), sizeof h);
+                uint32_t method = 0;
+                if (m.size() >= sizeof(hwd3d_call)) { hwd3d_call cl; memcpy(&cl, m.data(), sizeof cl); method = cl.method & 0xffff; }
+                auto& e = prof.by[(uint32_t(h.op) << 16) | method];
+                e.first++;
+                e.second += t_d - t_c;
+                prof.handle_ns += t_d - t_c;
+                prof.msgs++;
+                prof.bytes += m.size();
+                prof.answers += c.answers - answers0;
+            }
+        }
+        uint64_t t_e = pf ? now_ns() : 0;
         c.poll_queries();
+        if (pf) {
+            uint64_t t_f = now_ns();
+            prof.idle_ns += t_b - t_a;
+            prof.read_ns += t_c - t_b;
+            prof.poll_ns += t_f - t_e;
+            if (t_f - prof.t0 > 2000000000ull) prof_report(c, prof, t_f);
+        }
     }
+    if (c.handed) return;  // the games process reads it from here on; nothing was made for it here
     if (!ok && hwgpu_alive(hwgpu_chan_ctl(chan), generation))
         LOG("channel %u: bad HwD3D stream, dropping it (prev op=0x%x method=%u size=%u seq=%u)",
             slot, prev_op, prev_method, prev_size, prev_seq);
@@ -2048,4 +2839,36 @@ extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, u
             "%.0f bytes staged in the heap", slot, (unsigned long long)c.presents, c.received / f, c.ring_bytes / f,
             c.answers / f, c.staged_bytes / f);
     }
+}
+}  // namespace
+
+extern "C" __attribute__((visibility("default"))) void hwd3d_serve(void* chan, uint32_t slot, uint32_t generation,
+                                                                 const void* first, size_t first_len) {
+    Chan c;
+    c.chan = chan;
+    c.slot = slot;
+    c.generation = generation;
+    std::vector<uint8_t> m(static_cast<const uint8_t*>(first), static_cast<const uint8_t*>(first) + first_len);
+    bool ok = read_message(c, m, first_len);
+    if (ok) {
+        busy_begin(slot, m);
+        ok = handle(c, m);
+        busy_end(slot);
+    }
+    serve(c, m, ok);
+}
+
+// The games process: serves a channel the desktop process read the hello and program of.
+extern "C" __attribute__((visibility("default"))) void hwd3d_adopt(void* chan, uint32_t slot, uint32_t generation,
+                                                                 const char* exe, const char* conf) {
+    Chan c;
+    c.chan = chan;
+    c.slot = slot;
+    c.generation = generation;
+    c.exe = exe ? exe : "";
+    c.conf = conf ? conf : "";
+    name_thread(c.exe);
+    LOG("channel %u: program %s%s", slot, c.exe.c_str(), c.conf.empty() ? "" : ", with a dxvk.conf");
+    std::vector<uint8_t> m;
+    serve(c, m, true);
 }

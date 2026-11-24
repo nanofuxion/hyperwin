@@ -113,8 +113,8 @@ static void stub_note(int n)
 
 template <class R> static R stub_ret() { return R(); }
 template <> long stub_ret<long>() { return E_NOTIMPL; }
-template <> unsigned long long stub_ret<unsigned long long>() { return 192; }   /* SIZE_T, 64-bit: a Calc entry */
-template <> unsigned long stub_ret<unsigned long>() { return 192; }             /* SIZE_T in the i686 build */
+template <> unsigned long long stub_ret<unsigned long long>() { return 256; }   /* SIZE_T, 64-bit: a Calc entry */
+template <> unsigned long stub_ret<unsigned long>() { return 256; }             /* SIZE_T in the i686 build */
 
 template <int N, class F> struct Stub;
 template <int N, class R, class... A> struct Stub<N, R(APIENTRY *)(A...)> {
@@ -128,6 +128,7 @@ template <int N, class R, class... A> struct Stub<N, R(APIENTRY *)(A...)> {
 /* ---- objects ---- */
 
 struct Dev {
+    HANDLE rt_adapter;
     D3D10DDI_HRTDEVICE rt;
     D3D10DDI_HRTCORELAYER core;
     const D3D11DDI_CORELAYER_DEVICECALLBACKS *ucb;
@@ -135,6 +136,15 @@ struct Dev {
     const DXGI_DDI_BASE_CALLBACKS *dxcb;  /* DXGI's: the kernel present of a shared surface */
     uint32_t hdev, hctx;  /* the phone's device and immediate context */
     HANDLE kctx;          /* the kernel context the runtime wants a driver to have */
+    VOID *kcmd;
+    UINT kcmd_sz;
+    D3DDDI_ALLOCATIONLIST *kalist;
+    UINT kalist_sz;
+    D3DDDI_PATCHLOCATIONLIST *kplist;
+    UINT kplist_sz;
+    uint8_t *gdi_buf;
+    size_t gdi_buf_cap;
+    uint32_t gdi_frame;
     UINT flags;
     struct Obj *pstage;   /* the staging copy a windowed present reads back, kept at the last size */
     HWND present_win;
@@ -143,6 +153,9 @@ struct Dev {
     bool overlay_on;      /* a windowed present on the phone's own layer (no readback), scanning_out is set too */
     bool overlay_bad;     /* the phone refused it: back to the read-back for this device */
     uint32_t overlay_n;
+    uint32_t fif_seq;     /* frames sent on the layer without an answer (HWD3D_FIF) */
+    uint32_t fast_streak; /* consecutive fast windowed blt presents (<3ms) -> uncapped; skip notify_dwm */
+    LARGE_INTEGER blt_last_end;
     struct Obj *cur_vs, *cur_layout;  /* bound by the runtime: the phone gets the matching vertex shader variant */
     uint32_t bound_vs;    /* the phone's vertex shader handle last bound */
 };
@@ -161,13 +174,19 @@ struct Obj {
     uint32_t h;            /* the phone's handle */
     uint32_t dim;          /* resources: D3D11_RESOURCE_DIMENSION */
     struct hwd3d_res r;
+    uint32_t swap_rb;      /* a BGRA surface the phone keeps as RGBA (see rgba_of): its views are swapped too */
     uint32_t subs, samples, array, usage;
     Shadow *shadows;
     uint32_t share;        /* shared surfaces: the phone's share id (HWD3D_OP_CREATE_SHARED) */
-    uint32_t swap_rb;      /* a BGRA surface the phone keeps as RGBA (see rgba_of): its views are swapped too */
     uint32_t primary;      /* a surface of a screen this adapter shows (the screen half, wddm/README.md) */
     D3DKMT_HANDLE kalloc;  /* and the kernel allocation that carries it to other programs */
     HANDLE rtres;          /* the runtime's resource, for freeing that allocation */
+    bool gdi;              /* a window bitmap Windows made through our kernel driver (open_gdi_surface) */
+    bool gdi_mapped;       /* RenderCb submitted once so dxgmms1 maps its MDL into the aperture */
+    uint8_t *gdi_prev;     /* last uploaded BGRA pixels for dirty-row diffing */
+    uint32_t gdi_last_frame;
+    uint64_t gdi_hash;
+    uint64_t gdi_next_ms;  /* idle backoff timestamp when bitmap was unchanged */
     /* Views of shared surfaces are remade when DXGI rotates the surfaces (u_dxgi_rotate). */
     struct Obj *views;     /* resources: their views */
     struct Obj *view_of, *next_view;  /* views: the resource, and its next view */
@@ -241,9 +260,10 @@ static UINT misc11(UINT m) { return m & 0xF5u; }
 
 static SIZE_T APIENTRY u_CalcPrivateResourceSize(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATERESOURCE *) { return sizeof(Obj); }
 
-/* Shared BGRA surfaces are RGBA on the phone: the phone's screen reads its buffers as RGBA, and Mali has no
- * BGRA buffer the GPU writes in BGRA order. Their views then name the RGBA format, so shaders still see
- * (r, g, b, a) and the bytes are what the screen expects. */
+/* Shared BGRA surfaces are RGBA on the phone: its screen reads its buffers as RGBA, and a BGRA Android buffer is
+ * RGBA to Mali's Vulkan (drawing into it gave black or swapped colours). Their views then name the RGBA format,
+ * so shaders still see (r, g, b, a) and the bytes are what the screen expects. Copies between such a surface and
+ * an ordinary BGRA texture are converted on the phone (HWD3D_COPY_SWAP_RB). */
 static DXGI_FORMAT rgba_of(DXGI_FORMAT f)
 {
     switch (f) {
@@ -422,7 +442,53 @@ static void APIENTRY u_DestroyResource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE h
         d->kcb->pfnDeallocateCb(d->rt.handle, &cb);
         o->kalloc = 0;
     }
+    free(o->gdi_prev);
+    o->gdi_prev = NULL;
     release_obj(o);
+}
+
+static void update_subresource(D3D10DDI_HDEVICE hd, D3D10DDI_HRESOURCE hr, UINT sub, const D3D10_DDI_BOX *box, const void *src, UINT pitch, UINT slice_pitch);
+static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first = 0);
+
+/* A window bitmap made by Windows through our kernel driver (SupportSoftwareDeviceBitmaps, debug): DWM opens it, and the
+ * phone gets an empty texture of the size so DWM keeps running. Its pixels cannot be read yet (d3d/README.md, parked). */
+static void open_gdi_surface(Dev *d, D3DKMT_HANDLE halloc, const struct hww_alloc *al, Obj *o)
+{
+    D3D11_TEXTURE2D_DESC t2 = {};
+    t2.Width = al->width;
+    t2.Height = al->height;
+    t2.MipLevels = 1;
+    t2.ArraySize = 1;
+    t2.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    t2.SampleDesc.Count = 1;
+    t2.Usage = D3D11_USAGE_DEFAULT;
+    t2.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    struct wbuf *b = dc(d, HMX_ID3D11Device_CreateTexture2D);
+    put_arr(b, &t2, 1, sizeof t2);
+    put32(b, 0);
+    put_want(b, &t2);
+    struct rd r;
+    HRESULT hr = (HRESULT)call_wait(b, &r);
+    o->h = take32(&r);
+    call_end(&r);
+    if (FAILED(hr) || !o->h) {
+        ulog("hwd3d_umd: the phone refused a window bitmap %ux%u (0x%08lx)\n", al->width, al->height, (unsigned long)hr);
+        fail(d, FAILED(hr) ? hr : E_FAIL);
+        return;
+    }
+    o->dim = 3;
+    o->r = {3, (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, t2.Width, t2.Height, 1, 1};
+    o->subs = 1;
+    o->samples = 1;
+    o->array = 1;
+    o->usage = D3D11_USAGE_DEFAULT;
+    o->kalloc = halloc;
+    o->gdi = true;
+    static LONG told;
+    LONG idx = InterlockedIncrement(&told);
+    if (idx <= 8)
+        ulog("hwd3d_umd: window bitmap #%ld: kind=%u id=%llu %ux%u fmt=%u halloc=0x%x\n", idx, (unsigned)al->kind,
+             (unsigned long long)al->id, al->width, al->height, (unsigned)al->format, (unsigned)halloc);
 }
 
 /* Another program's shared surface: the share id rides in the allocation's private data. */
@@ -437,6 +503,15 @@ static void APIENTRY u_OpenResource(D3D10DDI_HDEVICE hd, const D3D10DDIARG_OPENR
     if (!al || a->pOpenAllocationInfo[0].PrivateDriverDataSize < sizeof *al || al->magic != HWW_ALLOC_MAGIC || !al->id) {
         ulog("hwd3d_umd: OpenResource of a surface that is not ours\n");
         fail(d, E_INVALIDARG);
+        return;
+    }
+    {   static LONG told;
+        if (InterlockedIncrement(&told) <= 8)
+            ulog("hwd3d_umd: OpenResource: kind %u, id %llu, %ux%u, format %u, kernel handle %u\n", (unsigned)al->kind, (unsigned long long)al->id,
+                 (unsigned)al->width, (unsigned)al->height, (unsigned)al->format, (unsigned)a->pOpenAllocationInfo[0].hAllocation);
+    }
+    if (al->kind == HWW_ALLOC_SHADOW && a->pOpenAllocationInfo[0].hAllocation) {
+        open_gdi_surface(d, a->pOpenAllocationInfo[0].hAllocation, al, o);
         return;
     }
     struct wbuf *b = begin(d->hdev, 0, HWD3D_OP_OPEN_SHARED);
@@ -467,7 +542,7 @@ static void APIENTRY u_OpenResource(D3D10DDI_HDEVICE hd, const D3D10DDIARG_OPENR
 
 static SIZE_T APIENTRY u_CalcPrivateRenderTargetViewSize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATERENDERTARGETVIEW *) { return sizeof(Obj); }
 
-static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first = 0);
+static uint32_t phone_create(Dev *d, uint32_t method, const void *desc, uint32_t size, uint32_t first);
 static uint32_t make_view(Dev *d, Obj *v, Obj *res, uint32_t method, const void *desc, uint32_t size);
 
 static void APIENTRY u_CreateRenderTargetView(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATERENDERTARGETVIEW *a,
@@ -774,13 +849,16 @@ static void APIENTRY u_DestroyDevice(D3D10DDI_HDEVICE hd)
         d->kcb->pfnDestroyContextCb(d->rt.handle, &dc);
         d->kctx = NULL;
     }
+    free(d->gdi_buf);
+    d->gdi_buf = NULL;
+    d->gdi_buf_cap = 0;
 }
 
 /* ---- the device's function table ---- */
 
 /* ---- the rest of the device: states, shaders, views, draws ---- */
 
-static_assert(sizeof(Obj) <= 192, "the stubs of the Calc entries answer 192");
+static_assert(sizeof(Obj) <= 256, "the stubs of the Calc entries answer 256");
 
 template <class T> static uint32_t H(T t)
 {
@@ -1362,6 +1440,120 @@ template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
     for (UINT i = 0; i < n; i++) put32(b, H(h[i]));
 }
 
+static void gdi_sync(Dev *d, Obj *res)
+{
+    if (!res->kalloc || !d->kcb || !d->kcb->pfnEscapeCb || !d->rt_adapter) return;
+    if (res->gdi_prev && res->gdi_last_frame == d->gdi_frame) return;
+    uint64_t now = GetTickCount64();
+    if (res->gdi_prev && now < res->gdi_next_ms) {
+        res->gdi_last_frame = d->gdi_frame;
+        return;
+    }
+    if (!res->gdi_mapped && d->kcb->pfnRenderCb && d->kctx && d->kalist && d->kalist_sz >= 1) {
+        memset(&d->kalist[0], 0, sizeof d->kalist[0]);
+        d->kalist[0].hAllocation = res->kalloc;
+        D3DDDICB_RENDER rd = {};
+        rd.CommandLength = 16;
+        rd.NumAllocations = 1;
+        if (d->kplist && d->kplist_sz >= 1) {
+            memset(&d->kplist[0], 0, sizeof d->kplist[0]);
+            d->kplist[0].AllocationIndex = 0;
+            d->kplist[0].SlotId = 1;
+            rd.NumPatchLocations = 1;
+        }
+        rd.hContext = d->kctx;
+        HRESULT rhr = d->kcb->pfnRenderCb(d->rt.handle, &rd);
+        if (SUCCEEDED(rhr)) {
+            d->kcmd = rd.pNewCommandBuffer;
+            d->kcmd_sz = rd.NewCommandBufferSize;
+            d->kalist = rd.pNewAllocationList;
+            d->kalist_sz = rd.NewAllocationListSize;
+            d->kplist = rd.pNewPatchLocationList;
+            d->kplist_sz = rd.NewPatchLocationListSize;
+            res->gdi_mapped = true;
+        }
+    }
+    size_t bytes = (size_t)res->r.width * (size_t)res->r.height * 4;
+    if (!bytes || bytes > 32 * 1024 * 1024) return;
+    if (d->gdi_buf_cap < bytes) {
+        uint8_t *nb = (uint8_t *)realloc(d->gdi_buf, bytes);
+        if (!nb) return;
+        d->gdi_buf = nb;
+        d->gdi_buf_cap = bytes;
+    }
+    struct hww_escape he = {};
+    he.magic = HWW_MAGIC;
+    he.size = sizeof he;
+    he.op = HWW_ESC_GDI_COPY;
+    he.u.gdi.halloc = res->kalloc;
+    he.u.gdi.flags = res->gdi_prev ? 1u : 0u;
+    he.u.gdi.hash = res->gdi_hash;
+    he.u.gdi.dst_user = (uint64_t)(uintptr_t)d->gdi_buf;
+    he.u.gdi.dst_size = (uint32_t)bytes;
+    D3DDDICB_ESCAPE esc = {};
+    esc.hDevice = d->rt.handle;
+    esc.pPrivateDriverData = &he;
+    esc.PrivateDriverDataSize = sizeof he;
+    LARGE_INTEGER gt0, gt1;
+    QueryPerformanceCounter(&gt0);
+    HRESULT ehr = d->kcb->pfnEscapeCb(d->rt_adapter, &esc);
+    QueryPerformanceCounter(&gt1);
+    static LONG seen;
+    LONG idx = InterlockedIncrement(&seen);
+    if (idx <= 16) {
+        static LARGE_INTEGER gfreq;
+        if (!gfreq.QuadPart) QueryPerformanceFrequency(&gfreq);
+        double ems = (double)(gt1.QuadPart - gt0.QuadPart) * 1000.0 / (double)gfreq.QuadPart;
+        ulog("hwd3d_umd: gdi_sync #%ld: h=0x%x %ux%u fl=%u esc=%.2fms copied=%u\n",
+             idx, (unsigned)res->kalloc, res->r.width, res->r.height, he.u.gdi.flags, ems, he.u.gdi.copied);
+    }
+    if (SUCCEEDED(ehr) && he.status == 0 && he.u.gdi.map_pages > 0 && he.u.gdi.copied == 0 && res->gdi_prev) {
+        /* Unchanged in kernel hash: back off 33 ms before re-checking this static bitmap. */
+        res->gdi_last_frame = d->gdi_frame;
+        res->gdi_next_ms = now + 50;
+        return;
+    }
+    if (SUCCEEDED(ehr) && he.status == 0 && he.u.gdi.copied >= bytes) {
+        res->gdi_last_frame = d->gdi_frame;
+        res->gdi_hash = he.u.gdi.hash;
+        res->gdi_next_ms = 0; /* active: check again immediately next frame */
+        uint32_t pitch = res->r.width * 4;
+        uint32_t h = res->r.height;
+        if (!res->gdi_prev) {
+            res->gdi_prev = (uint8_t *)malloc(bytes);
+            if (res->gdi_prev) memcpy(res->gdi_prev, d->gdi_buf, bytes);
+            struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_UpdateSubresource);
+            put32(b, res->h);
+            put32(b, 0);
+            put32(b, 0); /* no box */
+            put_rows(b, d->gdi_buf, pitch, h, 1, pitch, 0);
+            call_async(b);
+            return;
+        }
+        uint32_t y0 = h, y1 = 0;
+        for (uint32_t y = 0; y < h; y++) {
+            if (memcmp(d->gdi_buf + (size_t)y * pitch, res->gdi_prev + (size_t)y * pitch, pitch) != 0) {
+                if (y0 == h) y0 = y;
+                y1 = y;
+            }
+        }
+        if (y0 > y1) {
+            res->gdi_next_ms = now + 50;
+            return;
+        }
+        memcpy(res->gdi_prev + (size_t)y0 * pitch, d->gdi_buf + (size_t)y0 * pitch, (size_t)(y1 - y0 + 1) * pitch);
+        D3D10_DDI_BOX box = {0, (LONG)y0, 0, (LONG)res->r.width, (LONG)(y1 + 1), 1};
+        struct wbuf *b = cx(d, HMX_ID3D11DeviceContext_UpdateSubresource);
+        put32(b, res->h);
+        put32(b, 0);
+        put_arr(b, &box, 1, sizeof box);
+        put_rows(b, d->gdi_buf + (size_t)y0 * pitch, pitch, y1 - y0 + 1, 1, pitch, 0);
+        call_async(b);
+    } else if (SUCCEEDED(ehr) && he.status == 0 && he.u.gdi.map_pages == 0) {
+        res->gdi_mapped = false; /* evicted: remap next time */
+    }
+}
+
 #define STAGE(Stage, S) \
     static void APIENTRY u_##Stage##SetShader(D3D10DDI_HDEVICE hd, D3D10DDI_HSHADER s) \
     { \
@@ -1382,6 +1574,12 @@ template <class T> static void put_handles(struct wbuf *b, const T *h, UINT n)
         if (calls_logged()) \
             for (UINT i = 0; i < n; ++i) \
                 ulog("hwd3d_umd: ctx %u " #S " slot %u view %u\n", DV(hd)->hctx, start + i, v ? H(v[i]) : 0); \
+        if (STAGE_##S == STAGE_PS && v) { \
+            for (UINT i = 0; i < n; ++i) { \
+                Obj *srv = static_cast<Obj *>(v[i].pDrvPrivate); \
+                if (srv && srv->view_of && srv->view_of->gdi) gdi_sync(DV(hd), srv->view_of); \
+            } \
+        } \
         struct wbuf *b = cx(DV(hd), HMX_ID3D11DeviceContext_##S##SetShaderResources); \
         put32(b, start); \
         put32(b, n); \
@@ -1866,7 +2064,7 @@ static void APIENTRY u_CreateQuery(D3D10DDI_HDEVICE hd, const D3D10DDIARG_CREATE
     AcquireSRWLockExclusive(&g_lock);
     ensure_staging();
     if (g_qpage)
-        for (uint32_t i = 0; i < HWD3D_QUERY_SLOTS; i++)
+        for (uint32_t i = 0; i < HWD3D_QUERY_SLOTS - 1; i++)
             if (!g_qused[i]) {
                 g_qused[i] = 1;
                 o->qslot1 = i + 1;
@@ -1880,6 +2078,8 @@ static void APIENTRY u_DestroyQuery(D3D10DDI_HDEVICE, D3D10DDI_HQUERY q)
     Obj *o = OB(q);
     if (o->qslot1) g_qused[o->qslot1 - 1] = 0;
     o->qslot1 = 0;
+    free(o->gdi_prev);
+    o->gdi_prev = NULL;
     release_obj(o);
 }
 
@@ -2255,7 +2455,38 @@ struct FindWin {
     UINT w, h;
     HWND best;
     HWND fallback;
+    DWORD parent;   /* second pass: the parent process (a browser's GPU process draws for its browser) */
 };
+
+/* The process that started this one, or 0 (ProcessBasicInformation's InheritedFromUniqueProcessId). */
+static DWORD parent_pid()
+{
+    static DWORD cached = (DWORD)-1;
+    if (cached != (DWORD)-1) return cached;
+    cached = 0;
+    typedef LONG(WINAPI * query_fn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    query_fn q = (query_fn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    struct { LONG_PTR exit; PVOID peb; ULONG_PTR affinity; LONG_PTR priority; ULONG_PTR pid, parent; } pbi = {};
+    ULONG got = 0;
+    if (q && q(GetCurrentProcess(), 0 /* ProcessBasicInformation */, &pbi, sizeof pbi, &got) >= 0) cached = (DWORD)pbi.parent;
+    if (calls_logged()) ulog("hwd3d_umd: parent process %lu\n", (unsigned long)cached);
+    return cached;
+}
+
+/* A child window of another program's window that this process made (Chromium's GPU process puts one in the
+ * browser's window when it does not compose with DirectComposition). */
+static BOOL CALLBACK find_child(HWND w, LPARAM lp)
+{
+    FindWin *f = reinterpret_cast<FindWin *>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    RECT rc;
+    if (pid == f->pid && IsWindowVisible(w) && GetClientRect(w, &rc) && (UINT)rc.right == f->w && (UINT)rc.bottom == f->h) {
+        f->best = w;
+        return FALSE;
+    }
+    return TRUE;
+}
 
 static BOOL CALLBACK find_win(HWND w, LPARAM lp)
 {
@@ -2263,6 +2494,20 @@ static BOOL CALLBACK find_win(HWND w, LPARAM lp)
     DWORD pid = 0;
     GetWindowThreadProcessId(w, &pid);
     RECT rc;
+    if (f->parent) {   /* second pass: the parent's windows, and this process's children in any window */
+        if (!IsWindowVisible(w) || IsIconic(w)) return TRUE;
+        if (pid != f->pid) EnumChildWindows(w, find_child, lp);
+        if (f->best) return FALSE;
+        if (pid == f->parent && calls_logged() && GetClientRect(w, &rc)) {
+            RECT wr = {};
+            GetWindowRect(w, &wr);
+            ulog("hwd3d_umd:   parent window %p client %ldx%ld window %ldx%ld\n", (void *)w, rc.right, rc.bottom,
+                 wr.right - wr.left, wr.bottom - wr.top);
+        }
+        if (pid == f->parent && GetClientRect(w, &rc) && (UINT)rc.right == f->w && (UINT)rc.bottom == f->h)
+            if (!f->fallback || w == GetForegroundWindow()) f->fallback = w;
+        return TRUE;
+    }
     if (pid != f->pid || !IsWindowVisible(w) || IsIconic(w) || !GetClientRect(w, &rc)) return TRUE;
     if (rc.right <= 0 || rc.bottom <= 0) return TRUE;
     if ((UINT)rc.right == f->w && (UINT)rc.bottom == f->h) {
@@ -2285,16 +2530,123 @@ static void send_cursor_shape(uint32_t w, uint32_t h, int32_t hx, int32_t hy, co
     call_async(b);
 }
 
-static HRESULT present_surface(Dev *d, Obj *src);
+
+/* STOPGAP, DEBUG ONLY (off by default, to be removed). DXGI's blt model asks DWM for the window's shared surface on every present, and with more than one buffer it
+ * asks to WAIT until DWM has taken the previous frame (dwmapi!DwmpDxGetWindowSharedSurface, flags bit 0, 30 ms
+ * time-out). A window shown by its own layer on the phone gives DWM nothing new, so the wait never ends: it
+ * times out on every frame, 36 ms for the full AIO GUI (d3d/README.md, speed plan). While this program's
+ * windows are on a layer the wait bit is dropped: the first four instructions of that dwmapi function are
+ * replaced by a jump to the trampoline below, which clears the bit and runs them. Only the 64-bit driver does
+ * this, and only when those four instructions are the ones this was written against. */
+extern "C" volatile LONG hwd3d_overlay_live;
+extern "C" void *hwd3d_dwm_resume;
+volatile LONG hwd3d_overlay_live;
+void *hwd3d_dwm_resume;
+static DWORD reg_flag(const char *name)
+{
+    DWORD v = 0, n = sizeof v;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\HyperWin\\Gpu", name, RRF_RT_REG_DWORD, nullptr, &v, &n) != 0) return 0;
+    return v;
+}
+
+/* How many presents go by between two that wait for the phone's answer (it keeps the guest from running far ahead of
+ * the phone). HKLM\\SOFTWARE\\HyperWin\\Gpu HWD3D_WAIT_EVERY, a power of two, 2 was the first value. */
+static uint32_t wait_every_mask()
+{
+    static uint32_t mask = 0xffffffffu;
+    if (mask == 0xffffffffu) {
+        DWORD v = 4, n = sizeof v;
+        if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\HyperWin\\Gpu", "HWD3D_WAIT_EVERY", RRF_RT_REG_DWORD, nullptr, &v, &n) != 0 || v < 1 || v > 64) v = 4;
+        mask = (v & (v - 1)) ? 3u : v - 1;
+    }
+    return mask;
+}
+
+template <class D> static void set_overlay_on(D *d, bool on)
+{
+    if (d->overlay_on == on) return;
+    d->overlay_on = on;
+    InterlockedAdd(&hwd3d_overlay_live, on ? 1 : -1);
+}
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+extern "C" void hwd3d_dwm_tramp();
+__asm__(
+    ".text\n"
+    ".globl hwd3d_dwm_tramp\n"
+    "hwd3d_dwm_tramp:\n"
+    "  adrp x16, hwd3d_overlay_live\n"
+    "  add x16, x16, :lo12:hwd3d_overlay_live\n"
+    "  ldr w16, [x16]\n"
+    "  cmp w16, #0\n"
+    "  b.le 1f\n"
+    "  lsr w3, w3, #1\n"
+    "  lsl w3, w3, #1\n"
+    "1:\n"
+    "  .inst 0xd503237f\n"   /* pacibsp */
+    "  .inst 0xa9ba7bfd\n"   /* stp fp, lr, [sp, #-0x60]! */
+    "  .inst 0xa90153f3\n"   /* stp x19, x20, [sp, #0x10] */
+    "  .inst 0xa9025bf5\n"   /* stp x21, x22, [sp, #0x20] */
+    "  adrp x16, hwd3d_dwm_resume\n"
+    "  add x16, x16, :lo12:hwd3d_dwm_resume\n"
+    "  ldr x16, [x16]\n"
+    "  br x16\n");
+
+static void hook_dwm_wait()
+{
+    static LONG done;
+    if (InterlockedExchange(&done, 1)) return;
+    /* DEBUG ONLY, for comparing numbers: HKLM\SOFTWARE\HyperWin\Gpu HWD3D_DWM_HOOK = 1. Off by default and not to
+     * ship: nothing in a program's or Windows' code may be patched (anti-cheat). Remove it once the wait is signalled
+     * by ordinary means. */
+    if (!reg_flag("HWD3D_DWM_HOOK")) return;
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    BYTE *fn = dwm ? reinterpret_cast<BYTE *>(GetProcAddress(dwm, "DwmpDxGetWindowSharedSurface")) : nullptr;
+    if (!fn) { ulog("hwd3d_umd: no DwmpDxGetWindowSharedSurface in dwmapi\n"); return; }
+    static const DWORD expect[4] = {0xd503237f, 0xa9ba7bfd, 0xa90153f3, 0xa9025bf5};
+    if (memcmp(fn, expect, sizeof expect)) { ulog("hwd3d_umd: dwmapi's surface call starts differently, wait left alone\n"); return; }
+    DWORD old;
+    if (!VirtualProtect(fn, 16, PAGE_EXECUTE_READWRITE, &old)) return;
+    hwd3d_dwm_resume = fn + 16;
+    DWORD ins[2] = {0x58000050 /* ldr x16, #8 */, 0xd61f0200 /* br x16 */};
+    memcpy(fn, ins, 8);
+    void *to = reinterpret_cast<void *>(&hwd3d_dwm_tramp);
+    memcpy(fn + 8, &to, 8);
+    VirtualProtect(fn, 16, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn, 16);
+    ulog("hwd3d_umd: dxgi's wait for DWM's window surface is dropped while a window is on its own layer\n");
+}
+#else
+static void hook_dwm_wait() {}
+#endif
+
+static HRESULT present_surface(Dev *d, Obj *src, void *dxgi_context = nullptr);
+
 
 /* A surface with a kernel allocation (shared, or a screen's) goes to Windows' own present: DXGI hands it on
  * to whoever shows it, such as the screen driver, and its pixels stay on the phone. */
 static HRESULT kernel_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
 {
     if (!d->dxcb || !d->dxcb->pfnPresentCb) return E_FAIL;
-    struct rd r;   /* the frame is drawn on the phone's GPU before anyone takes it */
-    call_wait(begin(d->hdev, 0, HWD3D_OP_FINISH), &r);
-    call_end(&r);
+    char lp[4];
+    bool prof = log_path(lp, sizeof lp);
+    static LARGE_INTEGER qf, last_end;
+    LARGE_INTEGER t0 = {}, t1 = {}, t2 = {};
+    if (prof) {
+        if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&t0);
+    }
+    /* When Display=1 owns the screen, dwm.exe flips its own primary directly (src->primary && !dst):
+     * skip the synchronous HWD3D_OP_FINISH stall here — the host merges cut_hole + one finish(c)
+     * asynchronously inside HWD3D_OP_SCANOUT before hwgpu_host_show_buffer. Keep synchronous finish
+     * for cross-process shared surfaces (Display=0 / WUDFHost.exe). */
+    bool direct_primary = src->primary && !dst;
+    if (!direct_primary) {
+        struct rd r;   /* the frame is drawn on the phone's GPU before anyone takes it */
+        call_wait(begin(d->hdev, 0, HWD3D_OP_FINISH), &r);
+        call_end(&r);
+    }
+    if (prof) QueryPerformanceCounter(&t1);
     ulog_call("kernel present");
     DXGIDDICB_PRESENT p = {};
     p.hSrcAllocation = src->kalloc;
@@ -2302,6 +2654,29 @@ static HRESULT kernel_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
     p.pDXGIContext = dxgi_context;
     p.hContext = d->kctx;
     HRESULT hr = d->dxcb->pfnPresentCb(d->rt.handle, &p);
+    if (prof) {
+        QueryPerformanceCounter(&t2);
+        static LONG kp_n;
+        static double sum_btw, sum_fin, sum_cb;
+        double btw = last_end.QuadPart ? (t0.QuadPart - last_end.QuadPart) * 1000.0 / qf.QuadPart : 0.0;
+        double fin = (t1.QuadPart - t0.QuadPart) * 1000.0 / qf.QuadPart;
+        double cb = (t2.QuadPart - t1.QuadPart) * 1000.0 / qf.QuadPart;
+        last_end = t2;
+        sum_btw += btw; sum_fin += fin; sum_cb += cb;
+        LONG n = InterlockedIncrement(&kp_n);
+        if (n <= 8 || (n % 60) == 0) {
+            double denom = (n <= 8) ? 1.0 : 60.0;
+            if (n <= 8)
+                ulog("hwd3d_umd: kp#%ld between=%.2fms finish=%.2fms cb=%.2fms pri=%d dst=%d\n",
+                     n, btw, fin, cb, (int)src->primary, dst != nullptr);
+            else {
+                ulog("hwd3d_umd: kp#%ld avg60 between=%.2fms finish=%.2fms cb=%.2fms pri=%d dst=%d\n",
+                     n, sum_btw / denom, sum_fin / denom, sum_cb / denom, (int)src->primary, dst != nullptr);
+                sum_btw = sum_fin = sum_cb = 0.0;
+            }
+            if (n == 8) sum_btw = sum_fin = sum_cb = 0.0;
+        }
+    }
     if (hr != S_OK) ulog("hwd3d_umd: kernel present of shared surface %u: 0x%08lx\n", src->share, (unsigned long)hr);
     static LONG primaries_told;
     if (src->primary && InterlockedIncrement(&primaries_told) <= 40)
@@ -2315,22 +2690,98 @@ static HRESULT kernel_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
     return hr;
 }
 
+/* A windowed blt present that has a DWM surface to go to (SupportSoftwareDeviceBitmaps): the frame itself is shown by
+ * the phone (present_surface), and Windows' present is only told, with no wait, so DWM sees an update and the program's
+ * vsync wait ends (dxgi!PrepareWindowedBltPresent, flags bit 0). */
+static bool blt_dst_layer_on()
+{
+    static int on = -1;
+    if (on < 0) on = reg_flag("HWD3D_BLT_DST_LAYER") ? 1 : 0;
+    return on != 0;
+}
+
+static void notify_dwm(Dev *d, Obj *src, Obj *dst, void *dxgi_context)
+{
+    if (!d->dxcb || !d->dxcb->pfnPresentCb) return;
+    DXGIDDICB_PRESENT p = {};
+    p.hSrcAllocation = src->kalloc;
+    p.hDstAllocation = dst ? dst->kalloc : 0;
+    p.pDXGIContext = dxgi_context;
+    p.hContext = d->kctx;
+    HRESULT hr = d->dxcb->pfnPresentCb(d->rt.handle, &p);
+    static LONG told;
+    if (InterlockedIncrement(&told) <= 5)
+        ulog("hwd3d_umd: notify_dwm: src_kalloc=0x%x dst_kalloc=0x%x dst_gdi=%d dst=%ux%u -> hr=0x%08lx\n",
+             (unsigned)p.hSrcAllocation, (unsigned)p.hDstAllocation, dst ? (int)dst->gdi : -1,
+             dst ? dst->r.width : 0, dst ? dst->r.height : 0, (unsigned long)hr);
+}
+
+static HRESULT blt_dst_layer_present(Dev *d, Obj *src, Obj *dst, void *dxgi_context, UINT flip_interval, UINT flags)
+{
+    static LARGE_INTEGER qf;
+    if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+    LARGE_INTEGER t0 = {}, t1 = {}, t2 = {};
+    QueryPerformanceCounter(&t0);
+    double btw = d->blt_last_end.QuadPart ? (t0.QuadPart - d->blt_last_end.QuadPart) * 1000.0 / qf.QuadPart : 100.0;
+    if (flip_interval >= 1 || !d->overlay_on || btw >= 4.0)
+        d->fast_streak = 0;
+    else if (btw < 2.5 && d->fast_streak < 1000)
+        d->fast_streak++;
+
+    HRESULT hr = present_surface(d, src, dxgi_context);
+    if (!d->overlay_on) d->fast_streak = 0;
+    bool did_notify = !d->overlay_on || d->fast_streak < 1;
+    char lp[4];
+    bool prof = log_path(lp, sizeof lp);
+    if (prof) QueryPerformanceCounter(&t1);
+    if (did_notify)
+        notify_dwm(d, src, dst, dxgi_context);
+    QueryPerformanceCounter(&t2);
+    d->blt_last_end = t2;
+    if (prof) {
+        static LONG p1_n;
+        static double sum_btw, sum_ps, sum_nd;
+        double ps = (t1.QuadPart - t0.QuadPart) * 1000.0 / qf.QuadPart;
+        double nd = (t2.QuadPart - t1.QuadPart) * 1000.0 / qf.QuadPart;
+        sum_btw += btw; sum_ps += ps; sum_nd += nd;
+        LONG n = InterlockedIncrement(&p1_n);
+        if (n <= 10 || (n % 60) == 0) {
+            if (n <= 10)
+                ulog("hwd3d_umd: p1#%ld between=%.2fms pres=%.2fms notify=%.2fms fi=%u fl=0x%x ov=%d fs=%u dn=%d\n",
+                     n, btw, ps, nd, (unsigned)flip_interval, (unsigned)flags, (int)d->overlay_on, d->fast_streak, (int)did_notify);
+            else {
+                ulog("hwd3d_umd: p1#%ld avg60 between=%.2fms pres=%.2fms notify=%.2fms fi=%u fl=0x%x ov=%d fs=%u dn=%d\n",
+                     n, sum_btw / 60.0, sum_ps / 60.0, sum_nd / 60.0, (unsigned)flip_interval, (unsigned)flags, (int)d->overlay_on, d->fast_streak, (int)did_notify);
+                sum_btw = sum_ps = sum_nd = 0.0;
+            }
+            if (n == 10) sum_btw = sum_ps = sum_nd = 0.0;
+        }
+    }
+    return hr;
+}
+
 static HRESULT __stdcall u_dxgi_present(DXGI_DDI_ARG_PRESENT *a)
 {
     ulog_call("dxgi Present");
+    prof_frame();
     Dev *d = reinterpret_cast<Dev *>(a->hDevice);
+    d->gdi_frame++;
     Obj *src = reinterpret_cast<Obj *>(a->hSurfaceToPresent);
+    if (src && src->kalloc && !a->Flags.Flip && a->hDstResource && blt_dst_layer_on())
+        return blt_dst_layer_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext, a->FlipInterval, a->Flags.Value);
     if (src && src->kalloc && (a->Flags.Flip || a->hDstResource))
         return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
-    return present_surface(d, src);
+    return present_surface(d, src, a->pDXGIContext);
 }
 
 /* The same with a list of surfaces: the first one is the frame. */
 static HRESULT __stdcall u_dxgi_present1(DXGI_DDI_ARG_PRESENT1 *a)
 {
     ulog_call("dxgi Present1");
+    prof_frame();
     if (!a->SurfacesToPresent) return S_OK;
     Dev *d = reinterpret_cast<Dev *>(a->hDevice);
+    d->gdi_frame++;
     Obj *src = reinterpret_cast<Obj *>(a->phSurfacesToPresent[0].hSurface);
     static LONG told;
     if (!InterlockedExchange(&told, 1))
@@ -2338,12 +2789,14 @@ static HRESULT __stdcall u_dxgi_present1(DXGI_DDI_ARG_PRESENT1 *a)
     /* A flip hands the surface itself to DWM, which draws on the phone too: no copy. A blt to a window
      * (DXGI's older swap effects) has nowhere on the phone to go yet, so it is read back and drawn into the
      * window. Windows' "optimizations for windowed games" turns those into flips. */
+    if (src && src->kalloc && !a->Flags.Flip && a->hDstResource && blt_dst_layer_on())
+        return blt_dst_layer_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext, a->FlipInterval, a->Flags.Value);
     if (src && src->kalloc && (a->Flags.Flip || a->hDstResource))
         return kernel_present(d, src, reinterpret_cast<Obj *>(a->hDstResource), a->pDXGIContext);
-    return present_surface(d, src);
+    return present_surface(d, src, a->pDXGIContext);
 }
 
-static HRESULT present_surface(Dev *d, Obj *src)
+static HRESULT present_surface(Dev *d, Obj *src, void *dxgi_context)
 {
     if (!d || !src || src->dim != 3) {
         ulog("hwd3d_umd: present of something that is not a 2D resource\n");
@@ -2355,9 +2808,26 @@ static HRESULT present_surface(Dev *d, Obj *src)
         return S_OK;
     HWND win = d->present_win;
     if (!win || d->present_w != w || d->present_h != h || !IsWindow(win) || !IsWindowVisible(win)) {
-        FindWin f = {GetCurrentProcessId(), w, h, nullptr, nullptr};
+        FindWin f = {GetCurrentProcessId(), w, h, nullptr, nullptr, 0};
         EnumWindows(find_win, reinterpret_cast<LPARAM>(&f));
         win = f.best ? f.best : f.fallback;
+        if (!win && src->kalloc && dxgi_context) {
+            /* No window of this process: a swap chain for composition (DirectComposition, as browsers use). Its
+             * surface is shared: Windows hands it to DWM, which opens it and composes it on the phone too. */
+            HRESULT kr = kernel_present(d, src, nullptr, dxgi_context);
+            static LONG told;
+            if (InterlockedIncrement(&told) <= 4) ulog("hwd3d_umd: composition present %ux%u to Windows: 0x%08lx\n", w, h, (unsigned long)kr);
+            if (SUCCEEDED(kr)) return kr;
+        }
+        if (!win) {
+            /* None of this process's own: a browser's GPU process draws for windows of the browser process,
+             * as a child window in it, or composed into its window (DirectComposition) at its client size. */
+            FindWin g = {GetCurrentProcessId(), w, h, nullptr, nullptr, parent_pid()};
+            if (calls_logged()) ulog("hwd3d_umd:   looking in parent %lu for %ux%u\n", (unsigned long)g.parent, w, h);
+            if (g.parent) EnumWindows(find_win, reinterpret_cast<LPARAM>(&g));
+            win = g.best ? g.best : g.fallback;
+            if (win) ulog("hwd3d_umd: present: %ux%u goes to window %p of %s\n", w, h, (void *)win, g.best ? "a child of ours" : "the parent process");
+        }
         if (win) {
             d->present_win = win;
             d->present_w = w;
@@ -2367,7 +2837,7 @@ static HRESULT present_surface(Dev *d, Obj *src)
     if (!win) {
         if (d->scanning_out) {
             d->scanning_out = false;
-            d->overlay_on = false;
+            set_overlay_on(d, false);
             if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
             call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
         }
@@ -2376,16 +2846,42 @@ static HRESULT present_surface(Dev *d, Obj *src)
     }
     bool full = hwgpu_window_fills_screen(win) != 0;
     if (full && src->h && d->overlay_on) {   /* from the window's layer to the whole screen */
-        d->overlay_on = false;
+        set_overlay_on(d, false);
         d->scanning_out = false;
         call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
     }
-    if (!full && src->h && !d->overlay_bad && (fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+    /* A shared BGRA surface is RGBA on the phone (swap_rb), which is what the window's layer takes. */
+    /* BGRA frames too: the phone converts them while it copies them into the layer's buffer (speed plan, phase 1). */
+    if (!full && src->h && !d->overlay_bad &&
+        (src->swap_rb || fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+         fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8X8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
         /* Nothing covers the window: its frames stay on the phone, on a layer at the client rect. No
          * read-back, no GDI, DWM has nothing new to compose. Every second frame waits for the answer, which
          * keeps the guest no more than two frames ahead of the phone. */
         RECT cr = {}, vr = {};
-        if (hwgpu_window_overlay_ok(win, &cr, &vr) && (UINT)(cr.right - cr.left) == w && (UINT)(cr.bottom - cr.top) == h) {
+        const int ok_win = hwgpu_window_overlay_ok(win, &cr, &vr);
+        if (!ok_win || (UINT)(cr.right - cr.left) != w || (UINT)(cr.bottom - cr.top) != h) {
+            static LONG told_no;
+            if (InterlockedIncrement(&told_no) <= 3)
+            {
+                char cls[64] = "";
+                RECT wcr = {};
+                GetClassNameA(win, cls, sizeof cls);
+                GetClientRect(win, &wcr);
+                ulog("hwd3d_umd: no window layer: window ok %d, client %ldx%ld, frame %ux%u; window %p '%s' visible %d iconic %d own client %ldx%ld\n", ok_win,
+                     cr.right - cr.left, cr.bottom - cr.top, w, h, (void *)win, cls, IsWindowVisible(win) ? 1 : 0, IsIconic(win) ? 1 : 0,
+                     wcr.right, wcr.bottom);
+                if (g_hwgpu_overlay_block) {
+                    char bc[64] = "";
+                    RECT br = {};
+                    GetClassNameA(g_hwgpu_overlay_block, bc, sizeof bc);
+                    GetWindowRect(g_hwgpu_overlay_block, &br);
+                    ulog("hwd3d_umd:   refused by window %p '%s' at %ld,%ld,%ld,%ld, its client at the screen %ld,%ld\n", (void *)g_hwgpu_overlay_block, bc, br.left,
+                         br.top, br.right, br.bottom, wcr.left, wcr.top);
+                }
+            }
+        }
+        if (ok_win && (UINT)(cr.right - cr.left) == w && (UINT)(cr.bottom - cr.top) == h) {
             if (d->scanning_out && !d->overlay_on) {   /* from the whole screen to the window's layer */
                 d->scanning_out = false;
                 if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
@@ -2402,18 +2898,33 @@ static HRESULT present_surface(Dev *d, Obj *src)
             put32(ob, (uint32_t)vr.top);
             put32(ob, (uint32_t)vr.right);
             put32(ob, (uint32_t)vr.bottom);
-            if (!d->overlay_on || (++d->overlay_n & 1) == 0) {
+            /* Frames in flight (speed plan, item 3; HKLM\SOFTWARE\HyperWin\Gpu HWD3D_FIF=1, debug, BUILT UNTESTED): once the
+             * layer is on, the frame is sent with a sequence number, no answer is waited for, and the program only
+             * waits when it is more than two frames ahead of the number the phone has written into the last slot of the
+             * query page. */
+            static const bool fif_on = reg_flag("HWD3D_FIF") != 0;
+            if (fif_on && d->overlay_on && g_qpage) {
+                const uint32_t seq = ++d->fif_seq;
+                put32(ob, seq);
+                call_async(ob);
+                volatile struct hwd3d_query_slot *fs = &g_qpage[HWD3D_QUERY_SLOTS - 1];
+                for (int spin = 0; (int32_t)(seq - __atomic_load_n(&fs->seq, __ATOMIC_ACQUIRE)) > 2 && spin < 20000; spin++) {
+                    if (spin < 200) YieldProcessor(); else Sleep(0);
+                }
+                return S_OK;
+            }
+            if (!d->overlay_on || (++d->overlay_n & wait_every_mask()) == 0) {
                 struct rd orr;
                 HRESULT ohr = (HRESULT)call_wait(ob, &orr);
                 call_end(&orr);
                 if (SUCCEEDED(ohr)) {
                     if (!d->overlay_on) ulog("hwd3d_umd: windowed present on its own layer (%ux%u)\n", w, h);
-                    d->overlay_on = true;
+                    set_overlay_on(d, true);
                     d->scanning_out = true;
                     return S_OK;
                 }
                 d->overlay_bad = true;
-                d->overlay_on = false;
+                set_overlay_on(d, false);
                 d->scanning_out = false;
                 if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
                 call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
@@ -2428,7 +2939,7 @@ static HRESULT present_surface(Dev *d, Obj *src)
         if (g_chan) hwgpu_update_fullscreen_cursor(hwgpu_chan_ctl(g_chan), win, send_cursor_shape);
         struct wbuf *sb = begin(d->hdev, 1, HWD3D_OP_SCANOUT);
         put32(sb, src->h);
-        if (!d->scanning_out || (++d->overlay_n & 1) == 0) {
+        if (!d->scanning_out || (++d->overlay_n & wait_every_mask()) == 0) {
             struct rd sr;
             HRESULT shr = (HRESULT)call_wait(sb, &sr);
             call_end(&sr);
@@ -2446,7 +2957,7 @@ static HRESULT present_surface(Dev *d, Obj *src)
     }
     if (d->scanning_out) {
         d->scanning_out = false;
-        d->overlay_on = false;
+        set_overlay_on(d, false);
         if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
         call_async(begin(d->hdev, 2, HWD3D_OP_SCANOUT));
         ulog("hwd3d_umd: direct scanout off, returning to windowed GDI\n");
@@ -2697,7 +3208,7 @@ static bool windows_own_program()
 /* Sub-objects are the video functions; the driver has none, and the runtime calls this to find out. */
 static HRESULT APIENTRY u_RetrieveSubObject(D3D10DDI_HDEVICE, UINT32, SIZE_T, void *, SIZE_T, void *) { return E_NOTIMPL; }
 
-static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVICE *a)
+static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER ha, D3D10DDIARG_CREATEDEVICE *a)
 {
     ulog_call("RetrieveSubObject");
     ulog("hwd3d_umd: CreateDevice, interface 0x%x, version %u, flags 0x%x\n", a->Interface, a->Version, a->Flags);
@@ -2714,6 +3225,7 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
         return E_FAIL;
     }
     Dev *d = new (a->hDrvDevice.pDrvPrivate) Dev();
+    d->rt_adapter = ha.pDrvPrivate;
     d->rt = a->hRTDevice;
     d->core = a->hRTCoreLayer;
     d->ucb = a->p11UMCallbacks;
@@ -2738,8 +3250,17 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
         D3DDDICB_CREATECONTEXT cc;
         memset(&cc, 0, sizeof cc);
         HRESULT kh = d->kcb->pfnCreateContextCb(d->rt.handle, &cc);
-        ulog("hwd3d_umd: kernel context 0x%08lx, handle %p\n", (unsigned long)kh, cc.hContext);
-        if (SUCCEEDED(kh)) d->kctx = cc.hContext;
+        ulog("hwd3d_umd: kernel context 0x%08lx, handle %p cmd=%p(%u) alist=%p(%u)\n", (unsigned long)kh, cc.hContext,
+             cc.pCommandBuffer, cc.CommandBufferSize, cc.pAllocationList, cc.AllocationListSize);
+        if (SUCCEEDED(kh)) {
+            d->kctx = cc.hContext;
+            d->kcmd = cc.pCommandBuffer;
+            d->kcmd_sz = cc.CommandBufferSize;
+            d->kalist = cc.pAllocationList;
+            d->kalist_sz = cc.AllocationListSize;
+            d->kplist = cc.pPatchLocationList;
+            d->kplist_sz = cc.PatchLocationListSize;
+        }
     }
     if (a->Interface == D3D10_1_DDI_INTERFACE_VERSION) fill_device_funcs_10_1(a->p10_1DeviceFuncs);
     else fill_device_funcs(a->pWDDM1_3DeviceFuncs);
@@ -2756,9 +3277,22 @@ static HRESULT APIENTRY a_CreateDevice(D3D10DDI_HADAPTER, D3D10DDIARG_CREATEDEVI
     return S_OK;
 }
 
+static LONG g_umd_adapters = 0;
+
+static void umd_adapter_opened(void)
+{
+    InterlockedIncrement(&g_umd_adapters);
+}
+
+static void umd_adapter_closed(void)
+{
+    if (InterlockedDecrement(&g_umd_adapters) == 0) close_channel();
+}
+
 static HRESULT APIENTRY a_CloseAdapter(D3D10DDI_HADAPTER)
 {
     ulog("hwd3d_umd: CloseAdapter\n");
+    umd_adapter_closed();
     return S_OK;
 }
 
@@ -2810,15 +3344,17 @@ static HRESULT APIENTRY a_GetCaps(D3D10DDI_HADAPTER, const D3D10_2DDIARG_GETCAPS
 extern "C" HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER *a)
 {
     ulog("hwd3d_umd: OpenAdapter10_2, interface 0x%x, version %u\n", a ? a->Interface : 0, a ? a->Version : 0);
+    hook_dwm_wait();
+    g_hwgpu_own_overlays = reg_flag("HWD3D_OWN_OVERLAYS") != 0;
     if (!a || !a->pAdapterFuncs_2) return E_INVALIDARG;
-    static int token;
-    a->hAdapter.pDrvPrivate = &token;
+    a->hAdapter.pDrvPrivate = a->hRTAdapter.handle;
     D3D10_2DDI_ADAPTERFUNCS *f = a->pAdapterFuncs_2;
     f->pfnCalcPrivateDeviceSize = a_CalcPrivateDeviceSize;
     f->pfnCreateDevice = a_CreateDevice;
     f->pfnCloseAdapter = a_CloseAdapter;
     f->pfnGetSupportedVersions = a_GetSupportedVersions;
     f->pfnGetCaps = a_GetCaps;
+    umd_adapter_opened();
     return S_OK;
 }
 
@@ -2857,7 +3393,7 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *p)
 }
 
 /* At exit the program's own submit counts go to the log (HWD3D_UMDLOG), for the baseline in wddm/README.md. */
-extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
+extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *reserved)
 {
     char v[8];
     static LPTOP_LEVEL_EXCEPTION_FILTER before;
@@ -2872,6 +3408,9 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void *)
             ulog("hwd3d_umd: submits to the phone %llu, to Windows %llu\n", (unsigned long long)c->submits_to_phone,
                  (unsigned long long)c->submits_to_guest);
         }
+        /* FreeLibrary unload while the process lives on (e.g. UWP/system apps probing adapters):
+         * release the WDDM channel slot so it cannot leak across repeated loads. */
+        if (!reserved && g_chan) close_channel();
         /* The runtime unloads this driver on a driver update while the process lives on: nothing of ours
          * may stay hooked into it. */
         if (filtered) SetUnhandledExceptionFilter(before);

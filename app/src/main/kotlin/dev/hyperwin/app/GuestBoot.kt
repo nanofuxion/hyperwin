@@ -85,8 +85,19 @@ object GuestBoot {
             Class.forName(PKG + "VirtualMachineCustomImageConfig\$GpuConfig"),
         )
         gpu.invoke(cic, AvfPlan.gpuBuilder())
+        // balloon/README.md: adb shell setprop debug.hyperwin.balloon 1 asks AVF for a memory balloon device (and
+        // its automatic resizing when Android is short of memory). Off by default until Windows takes it.
+        if (systemProperty("debug.hyperwin.balloon") == "1") {
+            runCatching { cicClass.getMethod("useAutoMemoryBalloon", Boolean::class.javaPrimitiveType).invoke(cic, true) }
+                .onFailure { android.util.Log.w("HyperWin", "no memory balloon in this AVF", it) }
+        }
         return cicClass.getMethod("build").invoke(cic)!!
     }
+
+    private fun systemProperty(name: String): String = runCatching {
+        Class.forName("android.os.SystemProperties").getMethod("get", String::class.java, String::class.java)
+            .invoke(null, name, "") as String
+    }.getOrDefault("")
 
     /** Payload plus every install disk: system, OEM drivers, and the ISO. */
     fun installImage(ctx: Context, kernel: File, disks: List<File>): Any {

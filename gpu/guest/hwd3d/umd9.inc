@@ -84,6 +84,12 @@ struct Dev {
     const uint8_t *um_ib;             /* user-memory indices (SetIndicesUm) */
     uint32_t um_isize;
     Res *rts[4];
+    /* System-memory vertex and index buffers bound for drawing. The program writes into them at any time,
+     * often without a lock the driver sees, so what a draw uses is sent with each draw. */
+    Res *sys_vb[16];
+    uint32_t sys_vb_off[16], sys_vb_stride[16];
+    Res *sys_ib;
+    uint32_t sys_ib_size;
     HWND present_win;
     uint32_t present_w, present_h;
     bool scanning_out;
@@ -405,9 +411,12 @@ static HRESULT APIENTRY CreateResource(HANDLE hd, D3DDDIARG_CREATERESOURCE *a)
 
 static HRESULT APIENTRY DestroyResource(HANDLE hd, HANDLE hr)
 {
-    (void)hd;
     Res *o = RS(hr);
     if (!o) return S_OK;
+    if (Dev *d = DV(hd)) {
+        for (Res *&v : d->sys_vb) if (v == o) v = nullptr;
+        if (d->sys_ib == o) d->sys_ib = nullptr;
+    }
     release_handle(o->h);
     delete o;
     return S_OK;
@@ -702,12 +711,51 @@ static void ensure_sysmem_buf(Dev *d, Res *o, uint32_t kind, uint32_t fmt)
     }
 }
 
+/* Sends bytes [off, off + size) of a system-memory buffer to its copy on the phone. */
+static void send_sysmem_range(Dev *d, Res *o, uint32_t off, uint32_t size)
+{
+    if (!o || !o->h || o->subs.empty()) return;
+    Sub &s = o->subs[0];
+    const uint8_t *src = s.sys ? s.sys : (s.mem.size() >= s.w ? s.mem.data() : nullptr);
+    if (!src || off >= s.w) return;
+    if (size > s.w - off) size = s.w - off;
+    if (!size) return;
+    struct wbuf *w = req(d->h, HWD3D9_WRITE);
+    put32(w, o->h);
+    put32(w, 0);
+    hwd3d9_box box = {1, off, 0, 0, off + size, 1, 1};
+    put(w, &box, sizeof box);
+    put32(w, size);
+    put32(w, size);
+    put_arr(w, src + off, size, 1);
+    send(w);
+}
+
+/* Before a draw: the vertices [first, first + count) of every bound system-memory stream, and the
+ * indices it reads. Instanced streams (a frequency divider) are sent whole. */
+static void sync_sysmem(Dev *d, uint32_t first, uint32_t count, uint32_t first_index, uint32_t index_count)
+{
+    for (uint32_t i = 0; i < 16; i++) {
+        Res *o = d->sys_vb[i];
+        if (!o || !o->h || o->subs.empty()) continue;
+        uint32_t stride = d->sys_vb_stride[i];
+        if (!stride || count == ~0u) send_sysmem_range(d, o, d->sys_vb_off[i], o->subs[0].w);
+        else send_sysmem_range(d, o, d->sys_vb_off[i] + first * stride, count * stride);
+    }
+    if (d->sys_ib && index_count) send_sysmem_range(d, d->sys_ib, first_index * d->sys_ib_size, index_count * d->sys_ib_size);
+}
+
 static HRESULT APIENTRY SetStreamSource(HANDLE hd, const D3DDDIARG_SETSTREAMSOURCE *a)
 {
     Dev *d = DV(hd);
     if (a->Stream == d->um_stream) d->um_vb = nullptr;
     Res *vbr = a->hVertexBuffer ? RS(a->hVertexBuffer) : nullptr;
     if (vbr && vbr->sysmem) ensure_sysmem_buf(d, vbr, HWD3D9_VB, 0);
+    if (a->Stream < 16) {
+        d->sys_vb[a->Stream] = vbr && vbr->sysmem ? vbr : nullptr;
+        d->sys_vb_off[a->Stream] = a->Offset;
+        d->sys_vb_stride[a->Stream] = a->Stride;
+    }
     struct wbuf *b = req(d->h, HWD3D9_STREAM);
     put32(b, a->Stream);
     put32(b, vbr ? vbr->h : 0);
@@ -732,9 +780,12 @@ static HRESULT APIENTRY SetIndices(HANDLE hd, const D3DDDIARG_SETINDICES *a)
     Dev *d = DV(hd);
     d->um_ib = nullptr;
     Res *ibr = a->hIndexBuffer ? RS(a->hIndexBuffer) : nullptr;
+    d->sys_ib = nullptr;
     if (ibr && ibr->sysmem) {
         uint32_t fmt = (a->Stride == 4 || (uint32_t)ibr->format == 102) ? D3DFMT_INDEX32 : D3DFMT_INDEX16;
         ensure_sysmem_buf(d, ibr, HWD3D9_IB, fmt);
+        d->sys_ib = ibr;
+        d->sys_ib_size = fmt == D3DFMT_INDEX32 ? 4 : 2;
     }
     struct wbuf *b = req(d->h, HWD3D9_INDICES);
     put32(b, ibr ? ibr->h : 0);
@@ -795,6 +846,7 @@ static HRESULT APIENTRY DrawPrimitive(HANDLE hd, const D3DDDIARG_DRAWPRIMITIVE *
     D9LOG("hwd3d_umd: d9 DrawPrimitive\n");
     Dev *d = DV(hd);
     if (d->um_vb) return draw_up(d, a->PrimitiveType, a->VStart * d->um_stride, a->PrimitiveCount);
+    sync_sysmem(d, a->VStart, vertices_of(a->PrimitiveType, a->PrimitiveCount), 0, 0);
     struct wbuf *b = req(d->h, HWD3D9_DRAW);
     put32(b, (uint32_t)a->PrimitiveType);
     put32(b, a->VStart);
@@ -804,17 +856,37 @@ static HRESULT APIENTRY DrawPrimitive(HANDLE hd, const D3DDDIARG_DRAWPRIMITIVE *
     return S_OK;
 }
 
+/* The bytes of stream 0 when it is a system-memory vertex buffer: DrawPrimitive2 and DrawIndexedPrimitive2
+ * (pre-transformed and software-processed vertices) read their vertices from there. */
+static bool sysmem_stream0(Dev *d)
+{
+    Res *o = d->sys_vb[0];
+    if (!o || o->subs.empty()) return false;
+    Sub &s = o->subs[0];
+    const uint8_t *base = s.sys ? s.sys : (s.mem.size() >= s.w ? s.mem.data() : nullptr);
+    if (!base) return false;
+    d->um_vb = base + d->sys_vb_off[0];
+    d->um_stride = d->sys_vb_stride[0];
+    d->um_stream = 0;
+    return true;
+}
+
 static HRESULT APIENTRY DrawPrimitive2(HANDLE hd, const D3DDDIARG_DRAWPRIMITIVE2 *a)
 {
     D9LOG("hwd3d_umd: d9 DrawPrimitive2\n");
     Dev *d = DV(hd);
+    bool borrowed = !d->um_vb && sysmem_stream0(d);
     if (!d->um_vb) return S_OK;
-    return draw_up(d, a->PrimitiveType, a->FirstVertexOffset, a->PrimitiveCount);
+    HRESULT hr = draw_up(d, a->PrimitiveType, a->FirstVertexOffset, a->PrimitiveCount);
+    if (borrowed) d->um_vb = nullptr;
+    return hr;
 }
 
 static HRESULT APIENTRY DrawIndexedPrimitive(HANDLE hd, const D3DDDIARG_DRAWINDEXEDPRIMITIVE *a)
 {
     Dev *d = DV(hd);
+    sync_sysmem(d, (uint32_t)a->BaseVertexIndex + a->MinIndex, a->NumVertices, a->StartIndex,
+                vertices_of(a->PrimitiveType, a->PrimitiveCount));
     struct wbuf *b = req(d->h, HWD3D9_DRAW_IDX);
     put32(b, (uint32_t)a->PrimitiveType);
     put32(b, (uint32_t)a->BaseVertexIndex);
@@ -831,6 +903,8 @@ static HRESULT APIENTRY DrawIndexedPrimitive2(HANDLE hd, const D3DDDIARG_DRAWIND
 {
     D9LOG("hwd3d_umd: d9 DrawIndexedPrimitive2\n");
     Dev *d = DV(hd);
+    bool borrowed = !d->um_vb && sysmem_stream0(d);
+    struct Unborrow { Dev *d; bool on; ~Unborrow() { if (on) d->um_vb = nullptr; } } unborrow{d, borrowed};
     if (!d->um_vb || !ib || (isize != 2 && isize != 4)) return S_OK;
     uint32_t ni = vertices_of(a->PrimitiveType, a->PrimitiveCount);
     const uint8_t *idx = static_cast<const uint8_t *>(ib) + a->StartIndexOffset;
@@ -1177,10 +1251,16 @@ static HRESULT APIENTRY CreateQuery(HANDLE hd, D3DDDIARG_CREATEQUERY *a)
     uint32_t h = take32(&r);
     call_end(&r);
     if (FAILED(hr) || !h) return E_FAIL;
+    {   /* what a program asks for (speed plan, Borderlands run): the first few, with their kind */
+        static LONG made;
+        LONG n = InterlockedIncrement(&made);
+        static const char *kind[] = {"?", "vcache", "resource manager", "vertex stats", "event", "occlusion", "timestamp", "timestamp disjoint", "timestamp freq", "pipeline timings"};
+        if (n <= 12 || n % 200 == 0) ulog("hwd3d_umd: query %ld made: type %u (%s)\n", (long)n, (unsigned)a->QueryType, (unsigned)a->QueryType < 10 ? kind[a->QueryType] : "other");
+    }
     D9Query *q = new D9Query{h, 0, 0, false};
     if (g_qpage) {
         AcquireSRWLockExclusive(&g_lock);
-        for (uint32_t i = 0; i < HWD3D_QUERY_SLOTS; i++) {
+        for (uint32_t i = 0; i < HWD3D_QUERY_SLOTS - 1; i++) {
             if (!g_qused[i]) {
                 g_qused[i] = 1;
                 q->qslot1 = i + 1;
@@ -1258,6 +1338,7 @@ static HRESULT APIENTRY GetQueryData(HANDLE hd, const D3DDDIARG_GETQUERYDATA *a)
 static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
 {
     D9LOG("hwd3d_umd: d9 Present\n");
+    prof_frame();
     Dev *d = DV(hd);
     Res *s = RS(a->hSrcResource);
     if (!s || !s->h || s->subs.empty()) return S_OK;
@@ -1276,7 +1357,7 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
     if (!win) {
         if (d->scanning_out) {
             d->scanning_out = false;
-            d->overlay_on = false;
+            set_overlay_on(d, false);
             if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
             struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
             put32(hb, 0);
@@ -1288,7 +1369,7 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
     }
     bool full = hwgpu_window_fills_screen(win) != 0;
     if (full && d->overlay_on) {
-        d->overlay_on = false;
+        set_overlay_on(d, false);
         d->scanning_out = false;
         struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
         put32(hb, 0);
@@ -1319,15 +1400,15 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
             put32(ob, (uint32_t)vr.top);
             put32(ob, (uint32_t)vr.right);
             put32(ob, (uint32_t)vr.bottom);
-            if (!d->overlay_on || (++d->overlay_n & 1) == 0) {
+            if (!d->overlay_on || (++d->overlay_n & wait_every_mask()) == 0) {
                 if (SUCCEEDED(wait_status(ob))) {
                     if (!d->overlay_on) ulog("hwd3d_umd: Direct3D 9 windowed present on its own layer (%ux%u)\n", ss.w, ss.h);
-                    d->overlay_on = true;
+                    set_overlay_on(d, true);
                     d->scanning_out = true;
                     return S_OK;
                 }
                 d->overlay_bad = true;
-                d->overlay_on = false;
+                set_overlay_on(d, false);
                 d->scanning_out = false;
                 if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
                 struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
@@ -1345,7 +1426,7 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
         struct wbuf *sb = req(d->h, HWD3D9_PRESENT);
         put32(sb, s->h);
         put32(sb, a->SrcSubResourceIndex);
-        if (!d->scanning_out || (++d->overlay_n & 1) == 0) {
+        if (!d->scanning_out || (++d->overlay_n & wait_every_mask()) == 0) {
             if (SUCCEEDED(wait_status(sb))) {
                 if (!d->scanning_out) {
                     d->scanning_out = true;
@@ -1360,7 +1441,7 @@ static HRESULT APIENTRY Present(HANDLE hd, const D3DDDIARG_PRESENT *a)
     }
     if (d->scanning_out) {
         d->scanning_out = false;
-        d->overlay_on = false;
+        set_overlay_on(d, false);
         if (g_chan) hwgpu_stop_fullscreen_watch(hwgpu_chan_ctl(g_chan));
         struct wbuf *hb = req(d->h, HWD3D9_PRESENT);
         put32(hb, 0);
@@ -1524,6 +1605,7 @@ static HRESULT APIENTRY CreateDevice(HANDLE ha, D3DDDIARG_CREATEDEVICE *a)
 static HRESULT APIENTRY CloseAdapter(HANDLE ha)
 {
     delete static_cast<Adapter *>(ha);
+    umd_adapter_closed();
     return S_OK;
 }
 
@@ -1532,6 +1614,7 @@ static HRESULT APIENTRY CloseAdapter(HANDLE ha)
 /* Windows' d3d9.dll opens the adapter here. */
 extern "C" HRESULT APIENTRY OpenAdapter(D3DDDIARG_OPENADAPTER *a)
 {
+    g_hwgpu_own_overlays = reg_flag("HWD3D_OWN_OVERLAYS") != 0;
     ulog("hwd3d_umd: Direct3D 9 OpenAdapter, interface %u version 0x%x\n", a->Interface, a->Version);
     if (!ready()) return E_FAIL;
     d9::Adapter *ad = new d9::Adapter();
@@ -1542,5 +1625,6 @@ extern "C" HRESULT APIENTRY OpenAdapter(D3DDDIARG_OPENADAPTER *a)
     a->pAdapterFuncs->pfnCreateDevice = d9::CreateDevice;
     a->pAdapterFuncs->pfnCloseAdapter = d9::CloseAdapter;
     a->DriverVersion = D3D_UMD_INTERFACE_VERSION_WIN7;   /* the entry points of this version: the runtime checks the table against it */
+    umd_adapter_opened();
     return S_OK;
 }

@@ -26,6 +26,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "wrap.h"
@@ -446,6 +447,131 @@ static bool drop_clip_distance(std::vector<uint32_t>& w) {
     return true;
 }
 
+// DXVK 3.1+ (dxbc_spv) loads vertex input components via OpAccessChain + OpLoad on scalar pointers,
+// whereas Vortek's shader_inspector.c (convertFormatScaled) only rewrites direct OpLoad on the input
+// vector variable. For any input variable whose pipeline vertex format is USCALED/SSCALED, turn
+//   %p = OpAccessChain %ptr_float %var %const_k ; %x = OpLoad %float %p
+// into
+//   %v = OpLoad %vNfloat %var ; %x = OpCompositeExtract %float %v k
+// so shader_inspector.c converts the vector load cleanly to integer + Convert[SU]ToF.
+static bool flatten_scaled_inputs(std::vector<uint32_t>& w, const VkPipelineVertexInputStateCreateInfo* vi) {
+    if (!vi || w.size() < 5) return false;
+    std::unordered_set<uint32_t> scaled_locs;
+    for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++) {
+        if (isFormatScaled(vi->pVertexAttributeDescriptions[i].format))
+            scaled_locs.insert(vi->pVertexAttributeDescriptions[i].location);
+    }
+    if (scaled_locs.empty()) return false;
+    struct Ins { size_t at; uint32_t wc, op; };
+    std::vector<Ins> ins;
+    for (size_t i = 5; i < w.size();) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > w.size()) return false;
+        ins.push_back({i, wc, op});
+        i += wc;
+    }
+    auto def = [&](uint32_t id, uint32_t op, size_t idw) -> const Ins* {
+        for (auto& x : ins)
+            if (x.op == op && x.wc > idw && w[x.at + idw] == id) return &x;
+        return nullptr;
+    };
+    auto const_u32 = [&](uint32_t id, uint32_t* v) {
+        const Ins* c = def(id, 43 /*OpConstant*/, 2);
+        if (!c || c->wc < 4) return false;
+        *v = w[c->at + 3];
+        return true;
+    };
+    // Find Input variables decorated with a scaled Location, and their vector value type.
+    std::unordered_map<uint32_t, uint32_t> var_vec_type;
+    for (auto& x : ins) {
+        if (x.op == 71 /*OpDecorate*/ && x.wc >= 4 && w[x.at + 2] == 30 /*Location*/ && scaled_locs.count(w[x.at + 3])) {
+            uint32_t var = w[x.at + 1];
+            const Ins* vd = def(var, 59 /*OpVariable*/, 2);
+            if (!vd || vd->wc < 4 || w[vd->at + 3] != 1 /*Input*/) continue;
+            const Ins* ptr = def(w[vd->at + 1], 32 /*OpTypePointer*/, 1);
+            if (!ptr || ptr->wc < 4 || w[ptr->at + 2] != 1 /*Input*/) continue;
+            const Ins* vec = def(w[ptr->at + 3], 23 /*OpTypeVector*/, 1);
+            if (!vec) continue;
+            var_vec_type[var] = w[ptr->at + 3];
+        }
+    }
+    if (var_vec_type.empty()) return false;
+    struct Chain { uint32_t var, vec_type, idx; };
+    std::unordered_map<uint32_t, Chain> chains;
+    for (auto& x : ins) {
+        if ((x.op == 65 /*OpAccessChain*/ || x.op == 66 /*OpInBoundsAccessChain*/) && x.wc == 5) {
+            auto it = var_vec_type.find(w[x.at + 3]);
+            uint32_t idx = 0;
+            if (it != var_vec_type.end() && const_u32(w[x.at + 4], &idx))
+                chains[w[x.at + 2]] = {it->first, it->second, idx};
+        }
+    }
+    if (chains.empty()) return false;
+    // Only rewrite chains whose sole uses inside functions are plain OpLoad.
+    std::unordered_set<uint32_t> bad;
+    bool in_fn = false;
+    for (auto& x : ins) {
+        if (x.op == 54 /*OpFunction*/) in_fn = true;
+        if (!in_fn) continue;
+        if (x.op == 65 || x.op == 66) continue;
+        if (x.op == 61 /*OpLoad*/ && x.wc == 4 && chains.count(w[x.at + 3])) continue;
+        for (uint32_t k = 1; k < x.wc; k++)
+            if (chains.count(w[x.at + k])) bad.insert(w[x.at + k]);
+    }
+    for (uint32_t id : bad) chains.erase(id);
+    if (chains.empty()) return false;
+    uint32_t bound = w[3];
+    std::vector<uint32_t> out(w.begin(), w.begin() + 5);
+    for (auto& x : ins) {
+        const uint32_t* p = &w[x.at];
+        if ((x.op == 65 || x.op == 66) && x.wc == 5 && chains.count(p[2])) continue;
+        if (x.op == 61 && x.wc == 4) {
+            auto it = chains.find(p[3]);
+            if (it != chains.end()) {
+                uint32_t tmp = bound++;
+                out.insert(out.end(), {(4u << 16) | 61, it->second.vec_type, tmp, it->second.var});
+                out.insert(out.end(), {(5u << 16) | 81 /*OpCompositeExtract*/, p[1], p[2], tmp, it->second.idx});
+                continue;
+            }
+        }
+        out.insert(out.end(), p, p + x.wc);
+    }
+    out[3] = bound;
+    w.swap(out);
+    return true;
+}
+
+// Mali Valhall's LLVM backend aborts ("Cannot select: intrinsic %llvm.bifrost.flush.denormal")
+// when DenormFlushToZero 32 is combined with vector int->float conversions (e.g. convertFormatScaled).
+static bool drop_denorm_ftz(std::vector<uint32_t>& w) {
+    if (w.size() < 5) return false;
+    bool any = false;
+    for (size_t i = 5; i < w.size();) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > w.size()) return false;
+        if ((op == 17 /*OpCapability*/ && wc >= 2 && w[i + 1] == 4465 /*DenormFlushToZero*/) ||
+            (op == 16 /*OpExecutionMode*/ && wc >= 3 && w[i + 2] == 4460 /*DenormFlushToZero*/)) {
+            any = true;
+            break;
+        }
+        i += wc;
+    }
+    if (!any) return false;
+    std::vector<uint32_t> out(w.begin(), w.begin() + 5);
+    for (size_t i = 5; i < w.size();) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if ((op == 17 && wc >= 2 && w[i + 1] == 4465) ||
+            (op == 16 && wc >= 3 && w[i + 2] == 4460)) {
+            i += wc;
+            continue;
+        }
+        out.insert(out.end(), w.begin() + i, w.begin() + i + wc);
+        i += wc;
+    }
+    w.swap(out);
+    return true;
+}
+
 VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderStageCreateInfo* in, uint32_t n,
                     const VkPipelineVertexInputStateCreateInfo* vi, StageFix* fix) {
     fix->stages.assign(in, in + n);
@@ -508,6 +634,16 @@ VkResult fix_stages(VkDevice dev, ShaderInspector* si, const VkPipelineShaderSta
         if (!t.module) {
             std::vector<uint32_t> words(code, code + size / 4);
             if (s.stage != VK_SHADER_STAGE_FRAGMENT_BIT && drop_clip_distance(words)) size = words.size() * 4;
+            // adb shell setprop debug.hwgpu.nonewpasses 1: skips the two passes added on 2026-11-22, to tell
+            // whether a picture fault comes from them.
+            static int no_new = -1;
+            if (no_new < 0) {
+                char v[PROP_VALUE_MAX] = "";
+                __system_property_get("debug.hwgpu.nonewpasses", v);
+                no_new = v[0] == '1';
+            }
+            if (!no_new && s.stage == VK_SHADER_STAGE_VERTEX_BIT && flatten_scaled_inputs(words, vi)) size = words.size() * 4;
+            if (!no_new && drop_denorm_ftz(words)) size = words.size() * 4;
             t.code = static_cast<uint32_t*>(malloc(size));
             memcpy(t.code, words.data(), size);
             t.codeSize = size;

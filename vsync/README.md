@@ -3,6 +3,27 @@
 Windows knows when the phone's screen refreshes, and how fast. Games, the
 desktop and DXVK's frame pacing can then line up with the real screen.
 
+## Where it stands (2026-11-22)
+
+Phase 1 is built and measured on the Pixel 6 Pro:
+
+- `struct hwgpu_vsync` at window offset `0x7efc000` (`gpu/include/hwgpu_ring.h`). The desktop
+  renderer (`hwgpu_host.cpp`, `vsync_loop`) fills it from `AChoreographer_postVsyncCallback`:
+  last refresh, period, next expected present and deadline, in counter ticks (CNTVCT, 24.576 MHz).
+- Clock offset through a mailbox in the same block. The phone polls it without sleeping for a
+  second once Windows sets `calibrate`. Best turn-around 0.3 us, so the offset is exact enough.
+- `guest/tools/vsyncprobe.exe` (run as SYSTEM through the agent) prints the refreshes as Windows
+  sees them: spacing within 0.04 ms of the period once settled, seen by Windows 0.2 to 0.8 ms
+  after each refresh. The first one or two after an idle panel come late (LTPO wake).
+- The screen driver (hwidd) offers the phone's rate: modes at the phone's rate plus 120, 90 and
+  60, EDID range up to the rate. When the phone switches (Smooth Display on or off), the target
+  mode follows and Windows changes rate: 60 to 120 and back measured with `Win32_VideoController`.
+  So DWM composes at the phone's rate. Not phase-locked to it yet (IddCx keeps its own timer).
+- Phase 2 (present_id/present_wait in Mesa's WSI) does not reach Direct3D games, which run on
+  the phone through HwD3D. Their pacing is the host's scanout path.
+- Phase 5 (rate matching) is blocked by the app's own `preferredDisplayModeId`, which pins the
+  mode. It needs the app to ask for a refresh-rate range instead.
+
 ## What the main thread already covers
 
 The scanout work in the main thread

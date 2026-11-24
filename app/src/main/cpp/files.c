@@ -28,6 +28,7 @@
 
 struct share {
     uint32_t id;
+    int case_insensitive;  /* 1 when the Android volume itself matches paths case-insensitively */
     char root[512];
 };
 
@@ -360,6 +361,12 @@ static long now_ms(void)
     return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
 }
 
+/* FUSE under memory pressure now and then answers a stat or open with a passing error. Ask again. */
+static int transient(int err)
+{
+    return err == EIO || err == EAGAIN || err == EINTR || err == ENOTCONN || err == ESTALE || err == ETIMEDOUT || err == ENOMEM;
+}
+
 static int direct_ok(void)
 {
     return now_ms() >= __atomic_load_n(&slow_until_ms, __ATOMIC_RELAXED);
@@ -384,7 +391,14 @@ static int stat_at(int dirfd, const char *name, struct stat *st, int ms)
 {
     if (direct_ok()) {
         long t0 = now_ms();
-        int rc = fstatat(dirfd, name && name[0] ? name : ".", st, stat_flags()) ? (errno ? errno : EIO) : 0;
+        int rc = 0, tries = 0;
+        do {
+            rc = fstatat(dirfd, name && name[0] ? name : ".", st, stat_flags()) ? (errno ? errno : EIO) : 0;
+            if (rc && transient(rc)) {
+                __android_log_print(ANDROID_LOG_INFO, "HyperWin", "stat %s: errno %d, again", name ? name : "", rc);
+                usleep(20000);
+            }
+        } while (rc && transient(rc) && ++tries < 4);
         note_time(t0);
         return rc;
     }
@@ -421,8 +435,15 @@ static int open_timeout(const char *path, int flags, int mode, int ms, int *fd_o
 {
     if (direct_ok()) {
         long t0 = now_ms();
-        int fd = open(path, flags, mode);
-        int rc = fd < 0 ? (errno ? errno : EIO) : 0;
+        int fd = -1, rc = 0, tries = 0;
+        do {
+            fd = open(path, flags, mode);
+            rc = fd < 0 ? (errno ? errno : EIO) : 0;
+            if (rc && transient(rc)) {
+                __android_log_print(ANDROID_LOG_INFO, "HyperWin", "open %s: errno %d, again", path, rc);
+                usleep(20000);
+            }
+        } while (rc && transient(rc) && ++tries < 4);
         note_time(t0);
         *fd_out = fd;
         return rc;
@@ -447,10 +468,49 @@ static int open_timeout(const char *path, int flags, int mode, int ms, int *fd_o
     return waited;
 }
 
+/* Looks in dir for a name that matches p in any case. 0 with the stored spelling in name, ENOENT only after
+ * the whole folder was read, else the error. Storage under memory pressure now and then fails a folder read
+ * halfway. That used to look like a missing file, so it is read again. */
+static int find_ci(const char *dir, const char *p, size_t len, char *name, size_t cap)
+{
+    int tries;
+    for (tries = 0; tries < 4; tries++) {
+        DIR *d = opendir(dir);
+        struct dirent *ent;
+        int err;
+        if (!d) {
+            err = errno ? errno : EIO;
+            if (!transient(err)) return err;
+            usleep(20000);
+            continue;
+        }
+        errno = 0;
+        while ((ent = readdir(d))) {
+            if (strlen(ent->d_name) == len && !strncasecmp(ent->d_name, p, len)) {
+                if (len + 1 > cap) {
+                    closedir(d);
+                    return ENAMETOOLONG;
+                }
+                memcpy(name, ent->d_name, len);
+                name[len] = 0;
+                closedir(d);
+                return 0;
+            }
+            errno = 0;
+        }
+        err = errno;
+        closedir(d);
+        if (!err) return ENOENT;
+        __android_log_print(ANDROID_LOG_INFO, "HyperWin", "read of %s failed: errno %d, again", dir, err);
+        usleep(20000);
+    }
+    return EIO;
+}
+
 /* Windows treats the drive as case-insensitive. Android paths are not. */
 static int resolve_ci(uint32_t volume, const char *rel, char *out, size_t size, int final_exact)
 {
-    char root[512], dir[4096];
+    char root[512], dir[4096], name[512];
     const char *p;
     size_t n;
     int err = volume_root(volume, root, sizeof root);
@@ -467,9 +527,7 @@ static int resolve_ci(uint32_t volume, const char *rel, char *out, size_t size, 
     while (*p) {
         const char *e = p;
         size_t len, last = 0;
-        DIR *d;
-        struct dirent *ent;
-        int found = 0;
+        int rc;
         while (*e && *e != '\\') e++;
         len = (size_t)(e - p);
         last = !*e || !e[1];
@@ -480,56 +538,73 @@ static int resolve_ci(uint32_t volume, const char *rel, char *out, size_t size, 
         }
         if ((len == 1 && p[0] == '.') || (len == 2 && p[0] == '.' && p[1] == '.') || memchr(p, '/', len))
             return EINVAL;
+        rc = find_ci(dir, p, len, name, sizeof name);
         if (final_exact && last) {
-            /* An existing name in another case is the file Windows asked for. */
-            d = opendir(dir);
-            if (d) {
-                while ((ent = readdir(d))) {
-                    if (strlen(ent->d_name) == len && !strncasecmp(ent->d_name, p, len)) {
-                        found = 1;
-                        if (n + 1 + len + 1 > size) {
-                            closedir(d);
-                            return ENAMETOOLONG;
-                        }
-                        memcpy(out, dir, n);
-                        out[n] = '/';
-                        memcpy(out + n + 1, ent->d_name, len);
-                        out[n + 1 + len] = 0;
-                        break;
-                    }
-                }
-                closedir(d);
-                if (found) return 0;
-            }
-            if (n + 1 + len + 1 > size) return ENAMETOOLONG;
+            /* An existing name in another case is the file Windows asked for. A new name keeps its own case. */
+            const char *use = rc == 0 ? name : p;
+            size_t ulen = rc == 0 ? strlen(name) : len;
+            if (rc && rc != ENOENT && rc != ENOTDIR && rc != EACCES) return rc;
+            if (n + 1 + ulen + 1 > size) return ENAMETOOLONG;
             memcpy(out, dir, n);
             out[n] = '/';
-            memcpy(out + n + 1, p, len);
-            out[n + 1 + len] = 0;
+            memcpy(out + n + 1, use, ulen);
+            out[n + 1 + ulen] = 0;
             return 0;
         }
-        d = opendir(dir);
-        if (!d) return errno ? errno : EIO;
-        while ((ent = readdir(d))) {
-            if (strlen(ent->d_name) == len && !strncasecmp(ent->d_name, p, len)) {
-                found = 1;
-                if (n + 1 + len + 1 > sizeof dir || n + 1 + len + 1 > size) {
-                    closedir(d);
-                    return ENAMETOOLONG;
-                }
-                dir[n] = '/';
-                memcpy(dir + n + 1, ent->d_name, len);
-                n += 1 + len;
-                dir[n] = 0;
-                break;
-            }
-        }
-        closedir(d);
-        if (!found) return ENOENT;
+        if (rc) return rc;
+        if (n + 1 + strlen(name) + 1 > sizeof dir || n + 1 + strlen(name) + 1 > size) return ENAMETOOLONG;
+        dir[n] = '/';
+        memcpy(dir + n + 1, name, strlen(name));
+        n += 1 + strlen(name);
+        dir[n] = 0;
         p = e;
     }
     memcpy(out, dir, n + 1);
     return 0;
+}
+
+/* Probes whether a volume root matches names case-insensitively (Android /storage/emulated/0 FUSE
+ * and FAT/exFAT SD/USB volumes do; ext4 does not). */
+static int probe_case_insensitive(const char *root)
+{
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    int dfd = dirfd(d), ci = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char flipped[512];
+        size_t len = strlen(e->d_name);
+        if (!len || len >= sizeof flipped) continue;
+        memcpy(flipped, e->d_name, len + 1);
+        int changed = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (flipped[i] >= 'a' && flipped[i] <= 'z') { flipped[i] -= 32; changed = 1; break; }
+            if (flipped[i] >= 'A' && flipped[i] <= 'Z') { flipped[i] += 32; changed = 1; break; }
+        }
+        if (!changed) continue;
+        struct stat s1, s2;
+        if (!fstatat(dfd, e->d_name, &s1, AT_SYMLINK_NOFOLLOW) &&
+            !fstatat(dfd, flipped, &s2, AT_SYMLINK_NOFOLLOW) &&
+            s1.st_dev == s2.st_dev && s1.st_ino == s2.st_ino)
+            ci = 1;
+        break;
+    }
+    closedir(d);
+    return ci;
+}
+
+static int volume_ci(uint32_t volume)
+{
+    int ci = 0;
+    pthread_mutex_lock(&share_lock);
+    for (uint32_t i = 0; i < HWF_VOLUMES; i++)
+        if (shares[i].id && shares[i].id == volume) {
+            ci = shares[i].case_insensitive;
+            break;
+        }
+    pthread_mutex_unlock(&share_lock);
+    return ci;
 }
 
 static int resolve_for(uint32_t volume, const char *rel, char *out, size_t size, int creating)
@@ -541,6 +616,20 @@ static int resolve_for(uint32_t volume, const char *rel, char *out, size_t size,
     if (rc == 0) return 0;
     if (rc > 0 && rc != ENOENT) return rc;
     if (rc < 0) return ETIMEDOUT;
+    if (volume_ci(volume)) {
+        if (!creating) return ENOENT;
+        /* Volume is already case-insensitive: if the parent directory exists, out is ready to create. */
+        char *slash = strrchr(out, '/');
+        if (slash && slash > out) {
+            *slash = 0;
+            int prc = stat_at(AT_FDCWD, out, &st, 1000);
+            *slash = '/';
+            if (prc == 0) return S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
+            if (prc < 0) return ETIMEDOUT;
+            return prc;
+        }
+        return 0;
+    }
     return resolve_ci(volume, rel, out, size, creating);
 }
 
@@ -642,13 +731,20 @@ struct list_name {
     int stated;
 };
 
-static struct {
-    pthread_mutex_t mu;
+#define LIST_CACHE_SLOTS 16u
+
+struct list_cache_entry {
     char path[4096];
     uint64_t until;
+    uint64_t used_at;
     uint8_t *data;
     size_t len;
     uint64_t count;
+};
+
+static struct {
+    pthread_mutex_t mu;
+    struct list_cache_entry entries[LIST_CACHE_SLOTS];
 } list_cache = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static int list_busy;
@@ -668,12 +764,16 @@ static size_t entry_need(size_t name_len)
 static void cache_drop(void)
 {
     pthread_mutex_lock(&list_cache.mu);
-    free(list_cache.data);
-    list_cache.data = NULL;
-    list_cache.len = 0;
-    list_cache.count = 0;
-    list_cache.path[0] = 0;
-    list_cache.until = 0;
+    for (uint32_t i = 0; i < LIST_CACHE_SLOTS; i++) {
+        struct list_cache_entry *c = &list_cache.entries[i];
+        free(c->data);
+        c->data = NULL;
+        c->len = 0;
+        c->count = 0;
+        c->path[0] = 0;
+        c->until = 0;
+        c->used_at = 0;
+    }
     pthread_mutex_unlock(&list_cache.mu);
 }
 
@@ -681,14 +781,17 @@ static void cache_drop(void)
 static int cache_slice(const char *path, uint64_t skip, uint8_t *data, struct hwf_slot *s)
 {
     const uint8_t *p, *end;
-    uint64_t index = 0, count = 0;
+    uint64_t index = 0, count = 0, now = mono_ms();
     size_t used = 0;
     int hit = 0;
     pthread_mutex_lock(&list_cache.mu);
-    if (list_cache.until > mono_ms() && !strcmp(list_cache.path, path)) {
+    for (uint32_t i = 0; i < LIST_CACHE_SLOTS; i++) {
+        struct list_cache_entry *c = &list_cache.entries[i];
+        if (c->until <= now || strcmp(c->path, path)) continue;
+        c->used_at = now;
         hit = 1;
-        p = list_cache.data;
-        end = p + list_cache.len;
+        p = c->data;
+        end = p + c->len;
         s->more = 0;
         while (p && p + sizeof(struct hwf_entry) <= end) {
             const struct hwf_entry *e = (const struct hwf_entry *)p;
@@ -706,9 +809,10 @@ static int cache_slice(const char *path, uint64_t skip, uint8_t *data, struct hw
             index++;
             p += need;
         }
-        if (index < list_cache.count) s->more = 1;
+        if (index < c->count) s->more = 1;
         s->out_length = used;
         s->out_a = (int64_t)count;
+        break;
     }
     pthread_mutex_unlock(&list_cache.mu);
     return hit;
@@ -716,13 +820,28 @@ static int cache_slice(const char *path, uint64_t skip, uint8_t *data, struct hw
 
 static void cache_store(const char *path, uint8_t *data, size_t len, uint64_t count)
 {
+    uint64_t now = mono_ms();
+    struct list_cache_entry *victim = &list_cache.entries[0];
     pthread_mutex_lock(&list_cache.mu);
-    free(list_cache.data);
-    snprintf(list_cache.path, sizeof list_cache.path, "%s", path);
-    list_cache.data = data;
-    list_cache.len = len;
-    list_cache.count = count;
-    list_cache.until = mono_ms() + LIST_CACHE_MS;
+    for (uint32_t i = 0; i < LIST_CACHE_SLOTS; i++) {
+        struct list_cache_entry *c = &list_cache.entries[i];
+        if (!strcmp(c->path, path)) {
+            victim = c;
+            break;
+        }
+        if (c->until <= now) {
+            victim = c;
+        } else if (victim->until > now && c->used_at < victim->used_at) {
+            victim = c;
+        }
+    }
+    free(victim->data);
+    snprintf(victim->path, sizeof victim->path, "%s", path);
+    victim->data = data;
+    victim->len = len;
+    victim->count = count;
+    victim->until = now + LIST_CACHE_MS;
+    victim->used_at = now;
     pthread_mutex_unlock(&list_cache.mu);
 }
 
@@ -761,16 +880,24 @@ static void pack_name(uint8_t **buf, size_t *len, size_t *cap, struct list_name 
 static void *list_thread(void *arg)
 {
     struct listed *L = arg;
-    DIR *d = opendir(L->path);
+    DIR *d;
     struct list_name *names = NULL;
     size_t n = 0, capn = 0, blob_cap = 0, i = 0;
     uint64_t start;
-    int dfd = -1;
+    int dfd = -1, tries = 0, rderr;
+again:
+    d = opendir(L->path);
     if (!d) {
         L->rc = errno ? errno : EIO;
+        if (transient(L->rc) && ++tries < 4) {
+            __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s: open errno %d, again", L->path, L->rc);
+            usleep(20000);
+            goto again;
+        }
         goto finish;
     }
     dfd = dirfd(d);
+    errno = 0;
     while (n < LIST_NAMES) {
         struct dirent *e = readdir(d);
         size_t ncap;
@@ -790,6 +917,22 @@ static void *list_thread(void *arg)
         names[n].stated = 0;
         memset(&names[n].st, 0, sizeof names[n].st);
         n++;
+        errno = 0;
+    }
+    rderr = errno;
+    if (rderr && transient(rderr) && tries + 1 < 4) {
+        /* The read stopped on an error, so the list is short. Start it again. */
+        size_t k;
+        __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s: read errno %d after %zu names, again", L->path, rderr, n);
+        for (k = 0; k < n; k++) free(names[k].name);
+        free(names);
+        names = NULL;
+        n = capn = 0;
+        closedir(d);
+        dfd = -1;
+        tries++;
+        usleep(20000);
+        goto again;
     }
     start = mono_ms();
     i = 0;
@@ -868,42 +1011,45 @@ finish:
     return NULL;
 }
 
+/* One listing runs at a time and its result is kept briefly for the folder it was made for. A request
+ * for another folder must wait its turn and then list for itself. It used to wait for the other
+ * folder's result and give up after 8 s, which Windows showed as an I/O error. */
 static int do_list(struct hwf_slot *s, const char *path, uint8_t *data)
 {
-    struct listed *L;
-    pthread_t thread;
-    int busy = 0, waited, rc;
-    if (cache_slice(path, s->offset, data, s)) return 0;
-    if (!__atomic_compare_exchange_n(&list_busy, &busy, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-        uint64_t start = mono_ms();
-        while (mono_ms() - start < 8000) {
-            if (cache_slice(path, s->offset, data, s)) return 0;
-            usleep(20000);
-        }
-        return ETIMEDOUT;
-    }
-    L = calloc(1, sizeof *L);
-    if (!L) {
-        __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
-        return ENOMEM;
-    }
-    snprintf(L->path, sizeof L->path, "%s", path);
-    if (pthread_create(&thread, NULL, list_thread, L)) {
-        free(L);
-        __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
-        return EAGAIN;
-    }
-    waited = wait_state(&L->state, thread, 8000);
-    if (waited) {
+    uint64_t start = mono_ms();
+    while (mono_ms() - start < 8000) {
+        struct listed *L;
+        pthread_t thread;
+        int busy = 0, waited, rc;
         if (cache_slice(path, s->offset, data, s)) return 0;
-        __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s timed out", path);
-        return ETIMEDOUT;
+        if (!__atomic_compare_exchange_n(&list_busy, &busy, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            usleep(2000);
+            continue;
+        }
+        L = calloc(1, sizeof *L);
+        if (!L) {
+            __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
+            return ENOMEM;
+        }
+        snprintf(L->path, sizeof L->path, "%s", path);
+        if (pthread_create(&thread, NULL, list_thread, L)) {
+            free(L);
+            __atomic_store_n(&list_busy, 0, __ATOMIC_RELEASE);
+            return EAGAIN;
+        }
+        waited = wait_state(&L->state, thread, 8000);
+        if (waited) {
+            if (cache_slice(path, s->offset, data, s)) return 0;
+            __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s timed out", path);
+            return ETIMEDOUT;
+        }
+        rc = L->rc;
+        free(L);
+        if (rc) return rc;
+        /* The result is in the cache now. If another folder's listing replaced it already, go round. */
     }
-    rc = L->rc;
-    free(L);
-    if (rc) return rc;
-    if (!cache_slice(path, s->offset, data, s)) return EIO;
-    return 0;
+    __android_log_print(ANDROID_LOG_INFO, "HyperWin", "list %s gave up waiting", path);
+    return ETIMEDOUT;
 }
 
 static int same_file(const char *a, const char *b)
@@ -1150,6 +1296,9 @@ Java_dev_hyperwin_app_FileShare_nativeSetVolumes(JNIEnv *env, jclass cls, jintAr
         list[i].flags = (uint32_t)fl[i];
         strncpy(list[i].label, l, sizeof list[i].label - 1);
         strncpy(next[i].root, r, sizeof next[i].root - 1);
+        next[i].case_insensitive = probe_case_insensitive(next[i].root);
+        __android_log_print(ANDROID_LOG_INFO, "HyperWin", "volume %u %s ci=%d", next[i].id, next[i].root,
+                            next[i].case_insensitive);
         (*env)->ReleaseStringUTFChars(env, label, l);
         (*env)->ReleaseStringUTFChars(env, root, r);
     }

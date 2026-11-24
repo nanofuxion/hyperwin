@@ -30,6 +30,13 @@ class InputControlsView(context: Context) : View(context) {
         private const val COLOR_TOGGLE = 0xFF81C784.toInt()
     }
 
+    private val controllerPrefs = context.getSharedPreferences("hyperwin", Context.MODE_PRIVATE)
+    private val playStation: Boolean
+        get() = controllerPrefs.getString(GamepadInput.PLAYER1, "xbox") == "ds4"
+    private val controllerListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == GamepadInput.PLAYER1) postInvalidate()
+    }
+
     var profile: ControlsProfile? = null
         set(value) {
             releaseAll()
@@ -147,8 +154,23 @@ class InputControlsView(context: Context) : View(context) {
         GamepadInput.setTouchActive(visibility == VISIBLE && !editMode && profile?.usesGamepad() == true)
     }
 
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility != VISIBLE) releaseAll()
+        GamepadInput.setTouchActive(visibility == VISIBLE && isShown && !editMode && profile?.usesGamepad() == true)
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        controllerPrefs.registerOnSharedPreferenceChangeListener(controllerListener)
+        GamepadInput.setTouchActive(isShown && !editMode && profile?.usesGamepad() == true)
+        invalidate()
+    }
+
     override fun onDetachedFromWindow() {
+        controllerPrefs.unregisterOnSharedPreferenceChangeListener(controllerListener)
         releaseAll()
+        GamepadInput.setTouchActive(false)
         super.onDetachedFromWindow()
     }
 
@@ -312,7 +334,31 @@ class InputControlsView(context: Context) : View(context) {
                 canvas.drawRoundRect(r, rad, rad, strokePaint)
             }
         }
-        val label = el.displayText()
+        // Draw face symbols as geometry so device fonts cannot substitute missing glyphs.
+        val face = el.activeBindings().singleOrNull()
+        if (playStation && el.text.isBlank() && face in listOf(
+                TouchBinding.GAMEPAD_BUTTON_A, TouchBinding.GAMEPAD_BUTTON_B,
+                TouchBinding.GAMEPAD_BUTTON_X, TouchBinding.GAMEPAD_BUTTON_Y)) {
+            val x = r.centerX(); val y = r.centerY()
+            val a = min(r.width(), r.height()) * 0.19f
+            tempPath.reset()
+            when (face) {
+                TouchBinding.GAMEPAD_BUTTON_A -> {
+                    tempPath.moveTo(x - a, y - a); tempPath.lineTo(x + a, y + a)
+                    tempPath.moveTo(x + a, y - a); tempPath.lineTo(x - a, y + a)
+                }
+                TouchBinding.GAMEPAD_BUTTON_B -> tempPath.addCircle(x, y, a, Path.Direction.CW)
+                TouchBinding.GAMEPAD_BUTTON_X -> tempPath.addRect(x - a, y - a, x + a, y + a, Path.Direction.CW)
+                TouchBinding.GAMEPAD_BUTTON_Y -> {
+                    tempPath.moveTo(x, y - a); tempPath.lineTo(x + a, y + a)
+                    tempPath.lineTo(x - a, y + a); tempPath.close()
+                }
+                else -> Unit
+            }
+            canvas.drawPath(tempPath, strokePaint)
+            return
+        }
+        val label = el.displayText(playStation)
         if (label.isNotEmpty()) {
             val maxW = r.width() * 0.78f
             var ts = (min(r.height() * 0.42f, u * 1.7f * el.scale)).coerceAtLeast(18f)
@@ -483,7 +529,7 @@ class InputControlsView(context: Context) : View(context) {
                 if (vertical) canvas.drawLine(r.left, cellRect.top, r.right, cellRect.top, divPaint)
                 else canvas.drawLine(cellRect.left, r.top, cellRect.left, r.bottom, divPaint)
             }
-            val label = items[i].shortLabel
+            val label = items[i].controllerLabel(playStation)
             canvas.drawText(label, cellRect.centerX(), cellRect.centerY() - (fm.ascent + fm.descent) / 2f, textPaint)
         }
         canvas.restore()

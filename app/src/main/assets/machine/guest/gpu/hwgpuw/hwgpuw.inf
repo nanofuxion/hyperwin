@@ -1,13 +1,13 @@
-; HyperWin GPU: a render-only WDDM adapter (wddm/README.md). One root device, ROOT\HwGpuAdapter. Like Windows'
-; own Basic Render Driver it is in the System class: the Display class expects screens.
+; HyperWin GPU: one render-only WDDM adapter, supplied by the AVF ACPI device ACPI\HWGP0001.
+; Do not add a synthetic ROOT device too: the miniport has one adapter state and cannot serve two instances.
 ; The Vulkan driver is registered on the adapter (VulkanDriverName) instead of in Khronos' global key.
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = System
-ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Class       = Display
+ClassGuid   = {4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider    = %Mfg%
 CatalogFile = hwgpuw.cat
-DriverVer   = 11/18/2026,1.0.36402.7823
+DriverVer   = 11/28/2026,1.2.19369.29849
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -34,7 +34,6 @@ hwgl_x86.dll      = 1
 %Mfg% = Hw, NTarm64
 
 [Hw.NTarm64]
-%Desc% = Install, Root\HwGpuAdapter
 %Desc% = Install, ACPI\HWGP0001
 
 [Install.NT]

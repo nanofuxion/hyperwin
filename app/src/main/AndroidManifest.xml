@@ -14,6 +14,8 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Phone motion at 250 Hz for player 1's DualShock 4 (GamepadInput.kt); above 200 Hz needs this. -->
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <!-- Updates from GitHub Releases, confirmed on Android's own install screen (Updater.kt). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
@@ -22,9 +24,13 @@
     <queries><package android:name="moe.shizuku.privileged.api" /></queries>
 
     <application
+        android:name=".HyperWinApp"
         android:label="HyperWin"
         android:icon="@drawable/ic_launcher"
-        android:theme="@style/Theme.HyperWin">
+        android:theme="@style/Theme.HyperWin"
+        android:appCategory="game">
+        <!-- game-mode/README.md: the Game Dashboard's Performance and Battery modes. -->
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -38,6 +44,8 @@
         </activity>
         <!-- The GPU renderer and its Vulkan driver, apart from the VM's owner (HwGpu.kt). -->
         <service android:name=".GpuService" android:process=":gpu" android:exported="false" />
+        <!-- Direct3D programs other than the desktop's, so one that crashes leaves the desktop up. -->
+        <service android:name=".GameGpuService" android:process=":games" android:exported="false" />
         <service android:name=".WindowsService" android:exported="false"
             android:foregroundServiceType="mediaPlayback|microphone" />
         <provider

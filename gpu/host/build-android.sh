@@ -28,7 +28,13 @@ DXN=$HERE/../work/dxvk-native/include
   -I"$DXN/native/windows" -I"$DXN/native/directx" -I"$DXN/native" -I"$GEN" \
   -I"$HERE/../include" -I"$HERE/../../include" "$HERE/hwd3d/hwd3d.cpp" -L"$OUT" \
   -lhwgpu -llog -ldl -landroid -nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -o "$OUT/libhwd3d.so"
-for l in d3d11 dxgi d3d9; do "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" -o "$OUT/libdxvk_$l.so" "$DXVK/libdxvk_$l.so"; done
+# Built-in DXVK = our Android DXVK-Sarek build (version-stamped *_builtin.so so a second
+# games DXVK build can load alongside it in the same process).
+SAREK_STAGE=${SAREK_STAGE:-/Volumes/Storage/.t3/projects/hyperwin-dxvk/work/stage-sarek-1.14.1-builtin}
+rm -f "$OUT"/libdxvk_*.so
+for l in dxgi d3d11 d3d10core d3d9 d3d8; do
+  cp "$SAREK_STAGE/libdxvk_${l}_builtin.so" "$OUT/"
+done
 cp "$GFX/lib/arm64-v8a/libgfxstream_backend.so" "$GFX/lib/arm64-v8a/libc++_shared.so" "$OUT/"
 ls -la "$OUT"
 # ring_test for the phone's shell: adb push gpu/work/android/arm64-v8a /data/local/tmp/hwgpu, then
@@ -71,6 +77,20 @@ done
 # bctest: one BC1 block through a wrapper, read back. ./bctest ./libvulkan_bcn.so
 "$CXX" -std=c++17 -O1 -fPIE -pie -Wall -DVK_NO_PROTOTYPES -I"$MESA_INC" "$HERE/icd/bctest.cpp" -ldl \
   -nostdlib++ -lc++_shared -o "$OUT/bctest"
+
+# libvulkan_vkcap.so: triggered raw-Vulkan capture wrapper (captures DXVK -> MaliVK calls for a named game)
+# vkreplay: stand-alone off-screen adb shell replay tool (runs with HyperWin closed)
+"$CXX" -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra -Wno-missing-field-initializers -DVK_NO_PROTOTYPES -I"$MESA_INC" \
+  "$HERE/icd/wrap.cpp" "$HERE/icd/vkcap.cpp" -llog -ldl -nostdlib++ -lc++_shared \
+  -Wl,-z,max-page-size=16384 -o "$OUT/libvulkan_vkcap.so"
+"$CXX" -std=c++17 -O2 -fPIE -pie -Wall -Wextra -Wno-missing-field-initializers -DVK_NO_PROTOTYPES -I"$MESA_INC" \
+  "$HERE/icd/vkreplay.cpp" -ldl -nostdlib++ -lc++_shared -o "$OUT/vkreplay"
+
+# Optional MaliVK wrapper (from ../malivk/out/libvulkan_malivk.so)
+MALIVK=${MALIVK:-/Volumes/Storage/.t3/projects/malivk/out/libvulkan_malivk.so}
+if [ -f "$MALIVK" ]; then
+  cp "$MALIVK" "$OUT/libvulkan_malivk.so"
+fi
 
 # libvulkan_vortek.so (icd/vortek.cpp): Vortek's Mali workarounds. Vortek's SPIR-V passes,
 # shader_inspector.c, are built unchanged from winlator-app (LGPL-2.1) against icd/vortek_shim.

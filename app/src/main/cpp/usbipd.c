@@ -156,6 +156,11 @@ static void *reaper(void *arg)
         while (ioctl(c->d->fd, USBDEVFS_REAPURBNDELAY, &u) == 0 && u) {
             struct req *q = (struct req *)u;
             int32_t st = u->status ? (u->status < 0 ? u->status : -u->status) : 0;
+            {
+                static int told;
+                if (st && st != -ENOENT && st != -ECONNRESET && told++ < 40)
+                    LOG("ep %02x done with %d (%s), %d bytes", u->endpoint, st, strerror(-st), u->actual_length);
+            }
             uint32_t act = (uint32_t)u->actual_length;
             if (q->urb.type == USBDEVFS_URB_TYPE_CONTROL) {
                 /* usbfs counts the setup packet in neither length; the data is behind it */
@@ -200,9 +205,24 @@ static int serve_urbs(struct conn *c)
                 LOG("ctl %02x %02x %02x%02x %02x%02x len %u", rt, rq, buf[3], buf[2], buf[5], buf[4], len);
                 /* Standard requests that would change what Android configured: answer them without sending.
                  * SET_ADDRESS, SET_CONFIGURATION, SET_INTERFACE, SET_SEL, SET_ISOCH_DELAY. */
-                if (rt == 0x00 && (rq == 0x05 || rq == 0x09 || rq == 0x30 || rq == 0x31) ||
-                    rt == 0x01 && rq == 0x0b) {
+                /* Link power: SET/CLEAR_FEATURE U1_ENABLE, U2_ENABLE, LTM_ENABLE on the device, and
+                 * FUNCTION_SUSPEND on an interface. Android's kernel runs the link's power states; Windows
+                 * turning U1/U2 on behind its back dropped a SuperSpeed dock off the phone within seconds. */
+                uint16_t wv = (uint16_t)(buf[2] | buf[3] << 8);
+                if ((rq == 0x01 || rq == 0x03) &&
+                    ((rt == 0x00 && (wv == 48 || wv == 49 || wv == 50)) || (rt == 0x01 && wv == 0))) {
                     send_ret_submit(c, q, 0, 0, 0); free_req(q); continue;
+                }
+                if (rt == 0x00 && (rq == 0x05 || rq == 0x09 || rq == 0x30 || rq == 0x31)) {
+                    send_ret_submit(c, q, 0, 0, 0); free_req(q); continue;
+                }
+                /* SET_INTERFACE goes through usbfs, which keeps its own state right: a network adapter's
+                 * data interface and an audio stream only have endpoints in their other setting. */
+                if (rt == 0x01 && rq == 0x0b) {
+                    struct usbdevfs_setinterface si = {buf[4] | buf[5] << 8, buf[2] | buf[3] << 8};
+                    int r = ioctl(c->d->fd, USBDEVFS_SETINTERFACE, &si);
+                    if (r) LOG("set interface %u alt %u: %s", si.interface, si.altsetting, strerror(errno));
+                    send_ret_submit(c, q, r ? -errno : 0, 0, 0); free_req(q); continue;
                 }
                 q->urb.type = USBDEVFS_URB_TYPE_CONTROL;
                 q->urb.endpoint = 0;
@@ -217,7 +237,12 @@ static int serve_urbs(struct conn *c)
                 if (flags & 0x1) q->urb.flags |= USBDEVFS_URB_SHORT_NOT_OK;
                 if (flags & 0x40) q->urb.flags |= USBDEVFS_URB_ZERO_PACKET;
             }
-            if (ioctl(c->d->fd, USBDEVFS_SUBMITURB, &q->urb)) { int e = -errno; send_ret_submit(c, q, e, 0, 0); free_req(q); }
+            if (ioctl(c->d->fd, USBDEVFS_SUBMITURB, &q->urb)) {
+                int e = -errno;
+                static int told;
+                if (told++ < 20) LOG("submit ep %02x len %u: %s", q->urb.endpoint, len, strerror(-e));
+                send_ret_submit(c, q, e, 0, 0); free_req(q);
+            }
         } else if (cmd == CMD_UNLINK) {
             uint32_t victim = get32(h + 20);
             int32_t st = 0;

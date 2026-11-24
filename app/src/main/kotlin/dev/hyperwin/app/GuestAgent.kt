@@ -59,6 +59,10 @@ object GuestAgent {
         private set
     /** Told when a game in Windows starts or stops wanting mouse-look (HW_AGENT_CURSOR). */
     @Volatile var onCursor: ((Boolean) -> Unit)? = null
+    /** Told when a post-patch PnP driver update needs a Windows restart to take effect. */
+    @Volatile var onGuestRebootNeeded: (() -> Unit)? = null
+    @Volatile var guestRebootNeeded = false
+        private set
     @Volatile var agentVersion = 0
         private set
     private var updateSent = false
@@ -79,6 +83,7 @@ object GuestAgent {
         lan = lanMode
         vm = machine
         updateSent = false
+        guestRebootNeeded = false
         registerDebugCommands(ctx.applicationContext)
         Thread({ connectLoop(machine) }, "hw-agent").apply { isDaemon = true; start() }
     }
@@ -86,6 +91,10 @@ object GuestAgent {
     fun stop() {
         vm = null
         connected = false
+        guestRebootNeeded = false
+        doneWatchers.keys.toList().forEach { doneWatchers.remove(it)?.invoke(-1) }
+        fileResultOk = false
+        fileResultLatch?.countDown()
         runCatching { out?.close() }
         out = null
         net?.close()
@@ -126,6 +135,9 @@ object GuestAgent {
                 connected = false
                 agentVersion = 0
                 out = null
+                doneWatchers.keys.toList().forEach { doneWatchers.remove(it)?.invoke(-1) }
+                fileResultOk = false
+                fileResultLatch?.countDown()
                 net?.close()
                 net = null
                 runCatching { pfd.close() }
@@ -159,11 +171,17 @@ object GuestAgent {
             PACKET -> net?.fromGuest(buf, len)
             EXEC_OUT -> String(buf, 4, len - 4).lines().forEach { if (it.isNotBlank()) Log.i(TAG, "out| ${it.trimEnd()}") }
             EXEC_DONE -> {
-                Log.i(TAG, "exit ${le32(buf, 4)} (command ${le32(buf, 0)})")
-                if (le32(buf, 0) == gpuCheck && le32(buf, 4) != 0) syncGpu()
-                doneWatchers.remove(le32(buf, 0))?.invoke(le32(buf, 4))
+                val cmdId = le32(buf, 0)
+                val code = le32(buf, 4)
+                Log.i(TAG, "exit $code (command $cmdId)")
+                doneWatchers.remove(cmdId)?.invoke(code)
             }
-            FILE_RESULT -> Log.i(TAG, if (le32(buf, 0) == 1) "file written" else "file write failed")
+            FILE_RESULT -> {
+                val ok = le32(buf, 0) == 1
+                Log.i(TAG, if (ok) "file written" else "file write failed")
+                fileResultOk = ok
+                fileResultLatch?.countDown()
+            }
             HELLO -> {
                 agentVersion = buf[0].toInt()
                 Log.i(TAG, "agent version ${buf[0]}, network adapter ${if (buf[1].toInt() == 1) "ready" else "missing"}")
@@ -174,13 +192,25 @@ object GuestAgent {
                 exec("cmd /c bcdedit /set {current} recoveryenabled no & bcdedit /set {current} bootstatuspolicy ignoreallfailures")
                 val mhz = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(AvfPlan.hostCpuMhz()).array()
                 if (agentVersion >= 3 && AvfPlan.hostCpuMhz() > 0) send(CPU_MHZ, mhz, 4)
-                // The GPU driver files this app carries, against the ones on the Windows disk.
-                // The folders come first: file copies into Windows do not make them.
-                val c = appContext ?: return
-                val dirs = MachinePrep.gpuFiles(c).mapNotNull { it.substringBeforeLast('/', "").ifEmpty { null } }.toSet()
-                    .joinToString(" ") { it.replace('/', '\\') }
-                if (agentVersion >= VERSION) gpuCheck = exec("cmd /c (for %d in (. $dirs) do @mkdir C:\\HyperWin\\gpu\\%d 2>nul) & " +
-                    "findstr /x /c:${MachinePrep.gpuStamp(c)} C:\\HyperWin\\gpu\\stamp.txt")
+                // If an offline pre-boot patch staged new driver packages, finish PnP registration now.
+                if (agentVersion >= VERSION) {
+                    val id = exec(
+                        "cmd /c if exist C:\\HyperWin\\gpu\\pending.install (" +
+                            "del /q C:\\HyperWin\\gpu\\reboot.needed 2>nul & " +
+                            "C:\\HyperWin\\gpu-install.cmd && del /q C:\\HyperWin\\gpu\\pending.install)",
+                    )
+                    onceDone(id) { rc ->
+                        if (rc == 0) {
+                            val rId = exec("cmd /c if exist C:\\HyperWin\\gpu\\reboot.needed (del /q C:\\HyperWin\\gpu\\reboot.needed 2>nul & exit 0) else (exit 1)")
+                            onceDone(rId) { rRc ->
+                                if (rRc == 0) {
+                                    guestRebootNeeded = true
+                                    onGuestRebootNeeded?.invoke()
+                                }
+                            }
+                        }
+                    }
+                }
             }
             CURSOR -> if (len >= 1) onCursor?.invoke(buf[0].toInt() != 0)
             PORTS -> {
@@ -214,30 +244,15 @@ object GuestAgent {
         return id
     }
 
-    @Volatile private var gpuCheck = -1
     private val doneWatchers = java.util.concurrent.ConcurrentHashMap<Int, (Int) -> Unit>()
+    @Volatile private var fileResultLatch: java.util.concurrent.CountDownLatch? = null
+    @Volatile private var fileResultOk = false
 
     /** Calls [onExit] with the exit code when command [id] (from [exec]) finishes. */
     fun onceDone(id: Int, onExit: (Int) -> Unit) { doneWatchers[id] = onExit }
     private val pushLock = Any()
 
-    /**
-     * Brings Windows' GPU drivers up to this app's (machines made before the GPU, or by an older
-     * app): sends the files and runs gpu-install.cmd, which loads the ring driver and registers the
-     * Vulkan driver. New machines get them at setup and skip this.
-     */
-    private fun syncGpu() {
-        val ctx = appContext ?: return
-        gpuCheck = -1
-        Thread {
-            runCatching {
-                for (name in MachinePrep.gpuFiles(ctx)) push(ctx.assets.open("machine/guest/gpu/$name"), "C:\\HyperWin\\gpu\\" + name.replace('/', '\\'))
-                push(ctx.assets.open("machine/guest/gpu-install.cmd"), "C:\\HyperWin\\gpu-install.cmd")
-                exec("cmd /c C:\\HyperWin\\gpu-install.cmd & (echo ${MachinePrep.gpuStamp(ctx)})> C:\\HyperWin\\gpu\\stamp.txt")
-                Log.i(TAG, "GPU drivers sent to Windows")
-            }.onFailure { Log.e(TAG, "GPU driver update failed", it) }
-        }.start()
-    }
+    fun clearRebootNeeded() { guestRebootNeeded = false }
 
     /** A machine made by an older app has an older agent: send ours and swap it in. Once per boot. */
     private fun updateAgent() {
@@ -254,9 +269,12 @@ object GuestAgent {
         }.start()
     }
 
-    fun push(local: File, guestPath: String) = push(local.inputStream(), guestPath)
+    fun push(local: File, guestPath: String): Boolean = push(local.inputStream(), guestPath)
 
-    fun push(source: java.io.InputStream, guestPath: String) = synchronized(pushLock) {
+    fun push(source: java.io.InputStream, guestPath: String): Boolean = synchronized(pushLock) {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        fileResultOk = false
+        fileResultLatch = latch
         val path = guestPath.toByteArray()
         send(FILE_OPEN, path, path.size)
         source.use { input ->
@@ -268,6 +286,9 @@ object GuestAgent {
             }
         }
         send(FILE_CLOSE, ByteArray(0), 0)
+        val got = latch.await(120, java.util.concurrent.TimeUnit.SECONDS)
+        fileResultLatch = null
+        got && fileResultOk
     }
 
     /**

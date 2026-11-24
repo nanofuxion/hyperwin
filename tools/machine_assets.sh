@@ -7,6 +7,9 @@ OUT=$ROOT/app/src/main/assets/machine
 rm -rf "$OUT"
 mkdir -p "$OUT/drivers" "$OUT/efi"
 [ "$ROOT/build/hwusbraw/hwusbraw.sys" -nt "$ROOT/guest/drivers/hwusbraw/hwusbraw.c" ] || sh "$ROOT/guest/drivers/hwusbraw/build.sh" >/dev/null
+for f in "$ROOT/guest/drivers/hwvsinput/hwvsinput.c" "$ROOT/guest/drivers/hwvsinput/usbpad.c" "$ROOT/guest/drivers/hwvsinput/usbpad.h" "$ROOT/include/hw_abi.h"; do
+  [ "$ROOT/build/hwvsinput/hwvsinput.sys" -nt "$f" ] || { sh "$ROOT/guest/drivers/hwvsinput/build.sh" >/dev/null; break; }
+done
 cp "$ROOT/guest/drivers/drivers.json" "$OUT/"
 python3 -I - "$ROOT/guest/drivers/drivers.json" <<'PY' | while read -r f; do cp "$ROOT/$f" "$OUT/drivers/"; done
 import json, sys
@@ -53,7 +56,7 @@ for d in hwaudio hwhid; do
 done
 # The render-only GPU adapter's package (wddm/README.md): driver, INF, and the Vulkan driver the INF
 # registers. Built here when its sources changed (the WDK headers are fetched into gpu/work, never kept).
-for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROOT"/gpu/guest/wddm/hwdisplay.inc "$ROOT"/include/hw_wddm.h "$ROOT"/gpu/include/hwgpu_ring.h "$ROOT"/gpu/guest/hwd3d/umd.cpp "$ROOT"/gpu/guest/hwd3d/umd9.inc "$ROOT"/gpu/guest/hwd3d/wire.h; do
+for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROOT"/gpu/guest/wddm/hwdisplay.inc "$ROOT"/include/hw_wddm.h "$ROOT"/gpu/include/hwgpu_ring.h "$ROOT"/gpu/guest/hwd3d/umd.cpp "$ROOT"/gpu/guest/hwd3d/umd9.inc "$ROOT"/gpu/guest/hwd3d/umd12.inc "$ROOT"/gpu/guest/hwd3d/wire.h; do
   [ "$ROOT/build/hwgpuw/pkg/hwgpuw.sys" -nt "$f" ] || { sh "$ROOT/gpu/guest/wddm/build.sh" >/dev/null; break; }
 done
 mkdir -p "$OUT/guest/gpu/hwgpuw"
@@ -77,9 +80,11 @@ for f in install-usb.cmd remove-usb.cmd; do perl -pe 's/\r?\n/\r\n/' "$ROOT/gues
 # Makes the HyperWin screen the only display once, at first logon (guest/tools/dispset.c).
 [ "$ROOT/build/dispset.exe" -nt "$ROOT/guest/tools/dispset.c" ] || "$ROOT/build/third_party/win/llvm-mingw/bin/aarch64-w64-mingw32-clang" -O2 "$ROOT/guest/tools/dispset.c" -o "$ROOT/build/dispset.exe" -luser32
 cp "$ROOT/build/dispset.exe" "$OUT/guest/gpu/"
-# Phone storage as drives: the service and the WinFsp installer it needs.
-[ -f "$ROOT/build/files/hwfiles.exe" ] || sh "$ROOT/guest/files/build.sh"
-cp "$ROOT/build/files/hwfiles.exe" "$ROOT/build/files/winfsp.msi" "$OUT/guest/gpu/"
+# Phone storage as drives: the kernel mapper, the WinFsp service, and the WinFsp installer.
+for f in "$ROOT/guest/files/hwfiles.c" "$ROOT/guest/files/hwfiles_drv.c" "$ROOT/include/hw_files.h" "$ROOT/include/hw_abi.h"; do
+  [ "$ROOT/build/files/hwfiles.exe" -nt "$f" ] && [ "$ROOT/build/files/hwfiles.sys" -nt "$f" ] || { sh "$ROOT/guest/files/build.sh" >/dev/null; break; }
+done
+cp "$ROOT/build/files/hwfiles.exe" "$ROOT/build/files/hwfiles.sys" "$ROOT/build/files/winfsp.msi" "$OUT/guest/gpu/"
 # HwD3D's DLLs (d3d/README.md), rebuilt when their sources or the thunk generator changed.
 for f in "$ROOT"/gpu/guest/hwd3d/* "$ROOT/gpu/host/hwd3d/gen_thunks.py" "$ROOT/include/hw_d3d.h"; do
   [ "$ROOT/gpu/work/out/dx/hwd3d/d3d11.dll" -nt "$f" ] || { bash "$ROOT/gpu/guest/hwd3d/build.sh" >/dev/null; break; }
@@ -89,11 +94,11 @@ cp -R "$ROOT/gpu/work/out/dx" "$OUT/guest/gpu/"
 rm -rf "$OUT/guest/gpu/dx/test"   # developer test programs stay out of the app
 perl -pe 's/\r?\n/\r\n/' "$ROOT/gpu/guest/dx/use.cmd" > "$OUT/guest/gpu/dx/use.cmd"
 cp "$ROOT/gpu/guest/dx/hasmanifest.ps1" "$OUT/guest/gpu/dx/hasmanifest.ps1"
-# The app compares this with C:\HyperWin\gpu\stamp.txt and sends the files again when they differ.
-STAMP=$(cd "$OUT/guest/gpu" && find . -type f | LC_ALL=C sort | xargs shasum | shasum | cut -c1-16)
-printf '%s\r\n' "$STAMP" > "$OUT/guest/gpu/stamp.txt"
 # guest/ lands in C:\HyperWin. Batch files need CRLF line ends.
 for f in "$ROOT"/tools/offline/guest/*.cmd; do
   perl -pe 's/\r?\n/\r\n/' "$f" > "$OUT/guest/$(basename "$f")"
 done
+# The app compares this with machine.guestStamp and offers to patch Windows offline before boot when they differ.
+STAMP=$(cd "$OUT" && { find ./drivers ./guest -type f ! -name stamp.txt; } | LC_ALL=C sort | xargs shasum | shasum | cut -c1-16)
+printf '%s\r\n' "$STAMP" > "$OUT/guest/gpu/stamp.txt"
 find "$OUT" -type f | sort

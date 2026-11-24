@@ -224,6 +224,8 @@ object VsockInput {
     private var padDragging = false
     private var padLastTap = 0L
     private var padScroll = 0f
+    private val tapHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val pendingTap = Runnable { relative(0, 0, 1); relative(0, 0, 0) }
 
     /**
      * Finger on the guest view. Touch mode sends every finger to Windows as a touch screen contact
@@ -242,7 +244,8 @@ object VsockInput {
                 HidInput.screen(event) { x, y -> guestPosition(x, y, viewWidth, viewHeight, clamp = true) } ||
                     contacts(event, viewWidth, viewHeight)
             }
-            2 -> HidInput.pad(event, viewWidth, viewHeight) || trackpad(event, viewWidth, viewHeight)
+            // A relative mouse, not Windows' touchpad: games that read the mouse turn with it too.
+            2 -> trackpad(event, viewWidth, viewHeight)
             else -> finger(event, viewWidth, viewHeight)
         }
     }
@@ -267,18 +270,26 @@ object VsockInput {
         return GuestAgent.touch(out.toByteArray().also { it[0] = n.toByte() })
     }
 
-    /** Laptop trackpad: drag moves the pointer, tap clicks, two fingers scroll or right-click, tap then drag holds. */
+    /**
+     * Laptop trackpad as a relative mouse: drag moves, tap clicks, two fingers scroll or right-click,
+     * tap then drag holds. Movement goes as mouse counts, so games that hide the cursor still turn.
+     */
     private fun trackpad(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
         val skip = if (event.actionMasked == MotionEvent.ACTION_POINTER_UP) event.actionIndex else -1
         val live = (0 until event.pointerCount).filter { it != skip }
         val x = live.map { event.getX(it) }.average().toFloat()
         val y = live.map { event.getY(it) }.average().toFloat()
-        val here = lastX to lastY
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 padTravel = 0f; padScroll = 0f; padFingers = 1; padDownAt = event.eventTime
-                padDragging = event.eventTime - padLastTap < TAP_MS
-                if (padDragging) pointer(here, 1)
+                restX = 0f; restY = 0f
+                // A touch right after a tap: the tap's click has not gone yet (pendingTap), so this is
+                // tap-and-drag: the button goes down and stays down until this finger lifts.
+                padDragging = event.eventTime - padLastTap < TAP_MS && tapHandler.hasCallbacks(pendingTap)
+                if (padDragging) {
+                    tapHandler.removeCallbacks(pendingTap)
+                    relative(0, 0, 1)
+                }
             }
             MotionEvent.ACTION_POINTER_DOWN -> padFingers = maxOf(padFingers, event.pointerCount)
             MotionEvent.ACTION_MOVE -> {
@@ -288,24 +299,33 @@ object VsockInput {
                 if (event.pointerCount >= 2) {
                     padScroll += dy
                     val steps = (padScroll / SCROLL_STEP_PX).toInt()
-                    if (steps != 0) { padScroll -= steps * SCROLL_STEP_PX; pointer(here, buttons, steps * 120) }
+                    if (steps != 0) { padScroll -= steps * SCROLL_STEP_PX; relative(0, 0, buttons, steps * 120) }
                 } else if (padTravel > TAP_SLOP_PX) {
+                    // Phone pixels to Windows pixels, so a drag across the view crosses Windows' screen.
                     val scale = minOf(viewWidth.toFloat() / AvfPlan.frameWidth, viewHeight.toFloat() / AvfPlan.frameHeight)
-                    val nx = lastX + dx * PAD_SPEED * AXIS_MAX / (AvfPlan.frameWidth * scale)
-                    val ny = lastY + dy * PAD_SPEED * AXIS_MAX / (AvfPlan.frameHeight * scale)
-                    pointer(nx.toInt().coerceIn(0, AXIS_MAX) to ny.toInt().coerceIn(0, AXIS_MAX), buttons)
+                    val mx = restX + dx * PAD_SPEED * gameSpeed / scale
+                    val my = restY + dy * PAD_SPEED * gameSpeed / scale
+                    val ix = mx.toInt()
+                    val iy = my.toInt()
+                    restX = mx - ix
+                    restY = my - iy
+                    relative(ix, iy, buttons)
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 val tapped = event.actionMasked == MotionEvent.ACTION_UP && padTravel <= TAP_SLOP_PX &&
                     event.eventTime - padDownAt < TAP_MS
                 if (padDragging) {
-                    pointer(here, 0)
+                    relative(0, 0, 0)
+                    // Two quick taps with no drag: a double click.
+                    if (tapped) { relative(0, 0, 1); relative(0, 0, 0) }
+                } else if (tapped && padFingers >= 2) {
+                    relative(0, 0, 2)
+                    relative(0, 0, 0)
                 } else if (tapped) {
-                    val button = if (padFingers >= 2) 2 else 1
-                    pointer(here, button)
-                    pointer(here, 0)
-                    if (button == 1) padLastTap = event.eventTime
+                    // The click waits a moment: another touch in that time turns it into a drag instead.
+                    padLastTap = event.eventTime
+                    tapHandler.postDelayed(pendingTap, TAP_MS)
                 }
                 padDragging = false
             }
@@ -330,15 +350,53 @@ object VsockInput {
         }
     }
 
-    /** Hardware mouse: hover moves, buttons follow the Android button state, wheels scroll. */
-    fun mouse(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
-        val pos = guestPosition(event.x, event.y, viewWidth, viewHeight)
+    /**
+     * A mouse held by the app (View.requestPointerCapture, MainActivity.updateCapture): Android's own pointer is
+     * gone and every movement comes as counts, sent on as a relative mouse like a PC's. Wheels too.
+     */
+    fun captured(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
             val (v, h) = wheels(event)
-            return (v == 0 && h == 0) || pointer(pos ?: (lastX to lastY), buttons, v, h)
+            return relative(0, 0, buttons, v, h)
         }
-        pos ?: return true
-        return pointer(pos, mouseButtons(event))
+        var dx = restX
+        var dy = restY
+        for (i in 0 until event.historySize) {
+            dx += event.getHistoricalAxisValue(MotionEvent.AXIS_X, i) * gameSpeed
+            dy += event.getHistoricalAxisValue(MotionEvent.AXIS_Y, i) * gameSpeed
+        }
+        dx += event.getAxisValue(MotionEvent.AXIS_X) * gameSpeed
+        dy += event.getAxisValue(MotionEvent.AXIS_Y) * gameSpeed
+        val ix = dx.toInt()
+        val iy = dy.toInt()
+        restX = dx - ix
+        restY = dy - iy
+        return relative(ix, iy, mouseButtons(event))
+    }
+
+    /** Hardware mouse: hover moves, buttons follow the Android button state, wheels scroll. */
+    fun mouse(event: MotionEvent, viewWidth: Int, viewHeight: Int): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            val (v, h) = wheels(event)
+            return (v == 0 && h == 0) || relative(0, 0, buttons, v, h)
+        }
+        // Movement as mouse counts, as a mouse on a PC sends: games that hold the pointer still turn.
+        if (event.actionMasked == MotionEvent.ACTION_HOVER_MOVE || event.actionMasked == MotionEvent.ACTION_MOVE) {
+            var dx = restX
+            var dy = restY
+            for (i in 0 until event.historySize) {
+                dx += event.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_X, i) * gameSpeed
+                dy += event.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_Y, i) * gameSpeed
+            }
+            dx += event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * gameSpeed
+            dy += event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * gameSpeed
+            val ix = dx.toInt()
+            val iy = dy.toInt()
+            restX = dx - ix
+            restY = dy - iy
+            return relative(ix, iy, mouseButtons(event))
+        }
+        return relative(0, 0, mouseButtons(event))
     }
 
     private fun mouseButtons(event: MotionEvent): Int {
@@ -372,34 +430,10 @@ object VsockInput {
         return vi to hi
     }
 
-    /** "Mouse speed in games", 0.25 to 4. */
+    /** "Mouse speed", 0.25 to 4: the trackpad and a plugged-in mouse. */
     @Volatile var gameSpeed = 1f
     private var restX = 0f
     private var restY = 0f
-
-    /**
-     * A captured mouse (View.requestPointerCapture): movement since the last event, every sample in
-     * the event's history added up, fractions carried over, and sent as relative mouse counts.
-     */
-    fun captured(event: MotionEvent): Boolean {
-        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
-            val (v, h) = wheels(event)
-            return relative(0, 0, buttons, v, h)
-        }
-        var dx = restX
-        var dy = restY
-        for (i in 0 until event.historySize) {
-            dx += event.getHistoricalAxisValue(MotionEvent.AXIS_X, i) * gameSpeed
-            dy += event.getHistoricalAxisValue(MotionEvent.AXIS_Y, i) * gameSpeed
-        }
-        dx += event.getAxisValue(MotionEvent.AXIS_X) * gameSpeed
-        dy += event.getAxisValue(MotionEvent.AXIS_Y) * gameSpeed
-        val ix = dx.toInt()
-        val iy = dy.toInt()
-        restX = dx - ix
-        restY = dy - iy
-        return relative(ix, iy, mouseButtons(event))
-    }
 
     /** Relative movement in mouse counts, split into messages that fit 16 bits. */
     fun relative(dx: Int, dy: Int, state: Int, wheel: Int = 0, hwheel: Int = 0): Boolean = synchronized(lock) {

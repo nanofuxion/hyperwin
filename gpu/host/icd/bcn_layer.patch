@@ -1,8 +1,128 @@
+diff --git a/src/bcn.cpp b/src/bcn.cpp
+index 8b5dc95..8f13fd1 100644
+--- a/src/bcn.cpp
++++ b/src/bcn.cpp
+@@ -81,6 +81,20 @@ VkFormat get_format_for_bcn(VkFormat format) {
+ 	}
+ }
+ 
++// What a view of a decoded BC image reads as: sRGB formats keep their hardware sRGB decode.
++VkFormat get_view_format_for_bcn(VkFormat format) {
++	switch (format) {
++		case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
++		case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
++		case VK_FORMAT_BC2_SRGB_BLOCK:
++		case VK_FORMAT_BC3_SRGB_BLOCK:
++		case VK_FORMAT_BC7_SRGB_BLOCK:
++			return VK_FORMAT_R8G8B8A8_SRGB;
++		default:
++			return get_format_for_bcn(format);
++	}
++}
++
+ bool is_supported_bcn_format(struct device *device, VkFormat format) {
+     VkPhysicalDeviceProperties2 props2 = device->props2;
+     VkPhysicalDeviceDriverProperties driverProps = device->driverProps;
+diff --git a/src/bcn.hpp b/src/bcn.hpp
+index ef2423f..07b262d 100755
+--- a/src/bcn.hpp
++++ b/src/bcn.hpp
+@@ -20,6 +20,7 @@ bool is_bc6(VkFormat);
+ bool is_bc7(VkFormat);
+ bool is_supported_bcn_format(struct device *, VkFormat);
+ VkFormat get_format_for_bcn(VkFormat);
++VkFormat get_view_format_for_bcn(VkFormat format);
+ VkResult create_bcn_compute_pipelines(struct device *dev);
+ VkResult decompress_bcn_compute(struct device *dev,
+                        			VkCommandBuffer commandbuffer,
 diff --git a/src/bcn_layer.cpp b/src/bcn_layer.cpp
-index 6536b4b..fce9e8c 100644
+index 6536b4b..b5c6e41 100644
 --- a/src/bcn_layer.cpp
 +++ b/src/bcn_layer.cpp
-@@ -400,11 +400,17 @@ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
+@@ -67,6 +67,7 @@ BCnLayer_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+     table.EnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)gip(*pInstance, "vkEnumeratePhysicalDevices");
+     table.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)gip(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
+     table.GetPhysicalDeviceFormatProperties = (PFN_vkGetPhysicalDeviceFormatProperties)gip(*pInstance, "vkGetPhysicalDeviceFormatProperties");
++    table.GetPhysicalDeviceFormatProperties2 = (PFN_vkGetPhysicalDeviceFormatProperties2)gip(*pInstance, "vkGetPhysicalDeviceFormatProperties2");
+     table.GetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)gip(*pInstance, "vkGetPhysicalDeviceProperties");
+     table.GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)gip(*pInstance, "vkGetPhysicalDeviceProperties2");
+     table.GetPhysicalDeviceImageFormatProperties = (PFN_vkGetPhysicalDeviceImageFormatProperties)gip(*pInstance, "vkGetPhysicalDeviceImageFormatProperties");
+@@ -353,13 +354,73 @@ BCnLayer_GetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
+    				break;
+    			}
+    			                                        
+-   			pFormatProperties->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++   			pFormatProperties->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    			return;
+    		default:
+    			break;
+    }
+ }
+ 
++VKAPI_ATTR void VKAPI_CALL
++BCnLayer_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
++                                            VkFormat format,
++                                            VkFormatProperties2* pFormatProperties)
++{
++	scoped_lock l(global_lock);
++
++	auto& disp = instanceDispatch[GetKey(physicalDevice)];
++	if (disp.GetPhysicalDeviceFormatProperties2) {
++		disp.GetPhysicalDeviceFormatProperties2(physicalDevice, format, pFormatProperties);
++	} else {
++		disp.GetPhysicalDeviceFormatProperties(physicalDevice, format, &pFormatProperties->formatProperties);
++	}
++
++	VkPhysicalDeviceProperties2 props2 = propertiesMap[GetKey(physicalDevice)];
++	VkPhysicalDeviceDriverProperties driverProps = driverPropertiesMap[GetKey(physicalDevice)];
++
++	switch (format) {
++		case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
++		case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
++		case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
++		case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
++		case VK_FORMAT_BC2_UNORM_BLOCK:
++		case VK_FORMAT_BC2_SRGB_BLOCK:
++		case VK_FORMAT_BC3_UNORM_BLOCK:
++		case VK_FORMAT_BC3_SRGB_BLOCK:
++			if (bcn_compute_auto && driverProps.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY)
++				break;
++		case VK_FORMAT_BC4_UNORM_BLOCK:
++		case VK_FORMAT_BC4_SNORM_BLOCK:
++		case VK_FORMAT_BC5_UNORM_BLOCK:
++		case VK_FORMAT_BC5_SNORM_BLOCK:
++		case VK_FORMAT_BC6H_UFLOAT_BLOCK:
++		case VK_FORMAT_BC6H_SFLOAT_BLOCK:
++		case VK_FORMAT_BC7_UNORM_BLOCK:
++		case VK_FORMAT_BC7_SRGB_BLOCK:
++			if (bcn_compute_auto && ((driverProps.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && props2.properties.driverVersion > VK_MAKE_VERSION(512, 530, 0)) ||
++			                         driverProps.driverID == VK_DRIVER_ID_MESA_TURNIP))
++			{
++				break;
++			}
++			{
++				const VkFormatFeatureFlags bits =
++					VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++					VK_FORMAT_FEATURE_BLIT_SRC_BIT |
++					VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
++					VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
++					VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
++				pFormatProperties->formatProperties.optimalTilingFeatures |= bits;
++				for (VkBaseOutStructure* s = (VkBaseOutStructure*)pFormatProperties->pNext; s; s = s->pNext) {
++					if (s->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3)
++						((VkFormatProperties3*)s)->optimalTilingFeatures |= bits;
++				}
++			}
++			return;
++		default:
++			break;
++	}
++}
++
+ VK_LAYER_EXPORT VkResult VKAPI_CALL
+ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
+ 					  const VkDeviceCreateInfo *pCreateInfo,
+@@ -400,11 +461,17 @@ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
  
      memoryIndex = idx < memoryProps.memoryTypeCount ? idx : UINT32_MAX;
  
@@ -21,3 +141,77 @@ index 6536b4b..fce9e8c 100644
  
      PFN_vkCreateDevice createDevice = (PFN_vkCreateDevice)gipa(instance, "vkCreateDevice");
      result = createDevice(physicalDevice, &createInfo, pAllocator, pDevice);
+@@ -568,9 +635,16 @@ BCnLayer_GetInstanceProcAddr(VkInstance instance,
+ 	GETPROCADDR(EnumeratePhysicalDevices)
+ 	GETPROCADDR(GetPhysicalDeviceFeatures);
+ 	GETPROCADDR(GetPhysicalDeviceFormatProperties);
++	GETPROCADDR(GetPhysicalDeviceFormatProperties2);
++	if (!strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR"))
++		return (PFN_vkVoidFunction)&BCnLayer_GetPhysicalDeviceFormatProperties2;
+ 	GETPROCADDR(GetPhysicalDeviceImageFormatProperties);
+ 	GETPROCADDR(GetPhysicalDeviceImageFormatProperties2);
++	if (!strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR"))
++		return (PFN_vkVoidFunction)&BCnLayer_GetPhysicalDeviceImageFormatProperties2;
+ 	GETPROCADDR(GetPhysicalDeviceFeatures2);
++	if (!strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR"))
++		return (PFN_vkVoidFunction)&BCnLayer_GetPhysicalDeviceFeatures2;
+ 	GETPROCADDR(DestroyInstance);
+ 	GETPROCADDR(CreateDevice);
+ 
+diff --git a/src/image.cpp b/src/image.cpp
+index dd9b955..d5b7888 100755
+--- a/src/image.cpp
++++ b/src/image.cpp
+@@ -21,6 +21,7 @@ BCnLayer_CreateImage(VkDevice device,
+ 	VkResult result;
+ 	VkLayerDispatchTable table;
+ 	VkImageCreateInfo create_info = *pCreateInfo;
++	VkBaseOutStructure *unlinked_from = nullptr, *unlinked = nullptr;
+ 
+ 	struct device *dev = get_device(device);
+ 	if (!dev)
+@@ -31,10 +32,22 @@ BCnLayer_CreateImage(VkDevice device,
+ 	if (is_supported_bcn_format(dev, pCreateInfo->format)) {
+ 	    create_info.format = get_format_for_bcn(pCreateInfo->format);
+ 	    create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+-	    create_info.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++	    // The views are UNORM or SRGB RGBA8 (get_view_format_for_bcn), so the decoded image stays mutable.
++	    // The app's format list names BC formats this image does not have: leave it out.
++	    create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++	    for (auto *n = reinterpret_cast<VkBaseOutStructure *>(&create_info); n->pNext; n = n->pNext) {
++	        if (n->pNext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
++	            unlinked_from = n;
++	            unlinked = n->pNext;
++	            n->pNext = unlinked->pNext;
++	            break;
++	        }
++	    }
+ 	}
+ 
+ 	result = table.CreateImage(device, &create_info, pAllocator, pImage);
++	if (unlinked_from && unlinked_from != reinterpret_cast<VkBaseOutStructure *>(&create_info))
++		unlinked_from->pNext = unlinked;	// the app's own chain, as it was
+ 
+ 	if (result != VK_SUCCESS) {
+ 		Logger::log("error", "Failed to create image, res %d", result);
+@@ -72,7 +85,7 @@ BCnLayer_CreateImageView(VkDevice device,
+ 	table = dev->table;
+ 
+ 	if (is_supported_bcn_format(dev, pCreateInfo->format)) {
+-		create_info.format = get_format_for_bcn(pCreateInfo->format);
++		create_info.format = get_view_format_for_bcn(pCreateInfo->format);
+ 	}
+ 
+ 	result = table.CreateImageView(device, &create_info, pAllocator, pImageView);
+diff --git a/src/vulkan/vk_layer.h b/src/vulkan/vk_layer.h
+index 4a7ded1..84b2051 100755
+--- a/src/vulkan/vk_layer.h
++++ b/src/vulkan/vk_layer.h
+@@ -188,6 +188,7 @@ typedef struct VkLayerInstanceDispatchTable_ {
+     PFN_vkGetPhysicalDeviceImageFormatProperties2
+     	GetPhysicalDeviceImageFormatProperties2;     
+     PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties;
++    PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
+     PFN_vkGetPhysicalDeviceSparseImageFormatProperties
+         GetPhysicalDeviceSparseImageFormatProperties;
+     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;

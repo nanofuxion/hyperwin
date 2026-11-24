@@ -6,7 +6,7 @@ Class       = Display
 ClassGuid   = {4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider    = %Mfg%
 CatalogFile = hwidd.cat
-DriverVer   = 11/18/2026,1.0.20049.4975
+DriverVer   = 11/18/2026,1.0.2281.59263
 PnpLockdown = 1
 
 [DestinationDirs]

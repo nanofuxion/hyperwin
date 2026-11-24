@@ -23,6 +23,7 @@
 #define HWW_ESC_UNMAP    5u   /* map.user */
 #define HWW_ESC_COUNTERS 6u   /* -> counters */
 #define HWW_ESC_CHANNEL  7u   /* chan.index -> chan: the index-th open channel, for submits per program */
+#define HWW_ESC_GDI_COPY 8u   /* gdi: copy a mapped GDI redirection bitmap's pages to caller buffer */
 
 #pragma pack(push, 8)
 struct hww_info {
@@ -74,6 +75,19 @@ struct hww_chan {
     uint64_t submits_to_guest;
 };
 
+struct hww_gdi_copy {
+    uint32_t halloc;        /* in: D3DKMT_HANDLE of the GDI allocation */
+    uint32_t flags;         /* in: bit 0 = skip copy if hash matches prev_hash */
+    uint64_t dst_user;      /* in: caller's user buffer */
+    uint32_t dst_size;      /* in: buffer size in bytes */
+    uint32_t copied;        /* out: bytes copied (0 if unchanged) */
+    uint32_t width, height; /* out: allocation dimensions */
+    uint32_t map_pages;     /* out: mapped aperture pages (0 if unmapped) */
+    uint32_t nmap;          /* out: global MapApertureSegment count */
+    uint32_t px0, px1;      /* out: first two 32-bit pixels */
+    uint64_t hash;          /* in: prev_hash (when flags & 1); out: current 64-bit hash */
+};
+
 struct hww_escape {
     uint32_t magic;            /* HWW_MAGIC */
     uint32_t size;             /* sizeof(struct hww_escape) */
@@ -85,6 +99,7 @@ struct hww_escape {
         struct hww_map map;
         struct hww_counters counters;
         struct hww_chan chan;
+        struct hww_gdi_copy gdi;
         uint32_t slot;         /* HWW_ESC_CLOSE */
     } u;
 };

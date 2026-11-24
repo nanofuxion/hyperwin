@@ -16,7 +16,6 @@
 #include <winfsp/winfsp.h>
 #include "hw_abi.h"
 #include "hw_files.h"
-#include "hwgpu_ioctl.h"
 
 #define MAX_PARALLEL 16u         /* slots one read or write may use at once */
 #define AHEAD_WINDOWS 2u         /* read-ahead per file: this many slots of what comes next */
@@ -96,12 +95,12 @@ static int load_winfsp(void)
 
 static int map_region(void)
 {
-    HANDLE h = CreateFileW(HWGPU_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE h = CreateFileW(HWFILES_USER_PATH, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    struct hwgpu_map_out out = {0};
+    struct hwfiles_map_out out = {0};
     DWORD got = 0;
     /* The handle stays open: closing it would unmap the slots. */
-    if (!DeviceIoControl(h, IOCTL_HWGPU_FILES, NULL, 0, &out, sizeof out, &got, NULL) || !out.user) {
+    if (!DeviceIoControl(h, IOCTL_HWFILES_MAP, NULL, 0, &out, sizeof out, &got, NULL) || !out.user) {
         CloseHandle(h);
         return 0;
     }

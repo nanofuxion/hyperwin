@@ -207,18 +207,40 @@ object AvfPlan {
         val usbBuffer: ByteBuffer,
         val usbFd: ParcelFileDescriptor,
     ) {
+        private val lock = java.util.concurrent.locks.ReentrantReadWriteLock()
+        @Volatile private var closed = false
+        val isOpen get() = !closed
+
+        fun <T> withBuffer(block: (ByteBuffer) -> T): T? {
+            val rl = lock.readLock()
+            rl.lock()
+            return try {
+                if (closed) null else block(buffer)
+            } finally {
+                rl.unlock()
+            }
+        }
+
         fun close() {
-            FileShare.stop()   // its threads read the window
-            UsbBridge.stop()   // and so do the USB workers
-            GuestAudio.stop()  // so do its streams
-            runCatching { SharedMemory.unmap(buffer) }
-            runCatching { fd.close() }
-            runCatching { memory.close() }
-            runCatching { heapFd.close() }
-            runCatching { heap.close() }
-            runCatching { SharedMemory.unmap(usbBuffer) }
-            runCatching { usbFd.close() }
-            runCatching { usb.close() }
+            val wl = lock.writeLock()
+            wl.lock()
+            try {
+                if (closed) return
+                closed = true
+                FileShare.stop()   // its threads read the window
+                UsbBridge.stop()   // and so do the USB workers
+                GuestAudio.stop()  // so do its streams
+                runCatching { SharedMemory.unmap(buffer) }
+                runCatching { fd.close() }
+                runCatching { memory.close() }
+                runCatching { heapFd.close() }
+                runCatching { heap.close() }
+                runCatching { SharedMemory.unmap(usbBuffer) }
+                runCatching { usbFd.close() }
+                runCatching { usb.close() }
+            } finally {
+                wl.unlock()
+            }
         }
     }
 }

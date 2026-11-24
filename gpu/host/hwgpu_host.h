@@ -49,9 +49,28 @@ void hwgpu_host_show_buffer(void* ahb, uint32_t width, uint32_t height);
 void hwgpu_host_show_game_buffer(uint32_t slot, uint32_t generation, void* ahb, uint32_t width, uint32_t height, int vsync);
 void hwgpu_host_hide_game_buffer(uint32_t slot);
 void hwgpu_host_show_window_buffer(uint32_t slot, void* ahb, uint32_t width, uint32_t height, int32_t x, int32_t y, uint32_t cw, uint32_t ch, const uint32_t* crop);
+int hwgpu_host_window_hole(int32_t* ltrb);  /* the desktop rect a windowed program shows through, or 0 */
 /* Updates the cursor image (RGBA8888, up to 64x64) shown over a fullscreen game. */
 void hwgpu_host_set_cursor_shape(uint32_t slot, uint32_t width, uint32_t height, int32_t hot_x, int32_t hot_y,
                                  const void* rgba);
+
+/* The desktop and games processes (hwgpu_host.cpp, g_role). */
+typedef int (*hwgpu_handoff_cb)(uint32_t slot, uint32_t generation, const char* exe, const char* conf);
+typedef void (*hwgpu_hole_cb)(int on, int32_t left, int32_t top, int32_t right, int32_t bottom);
+void hwgpu_host_set_callbacks(hwgpu_handoff_cb handoff, hwgpu_hole_cb hole);
+int hwgpu_host_role(void);  /* 0 the desktop process, 1 the games process */
+/* Desktop process: gives a Direct3D program's channel to the games process. 1 when it took it. */
+int hwgpu_host_handoff(uint32_t slot, uint32_t generation, const char* exe, const char* conf);
+/* Games process: serves a channel handed over. 1 when it started. */
+int hwgpu_host_adopt(uint32_t slot, uint32_t generation, const char* exe, const char* conf);
+/* Desktop process: the games process ended; the channels it had are dropped. */
+void hwgpu_host_games_died(void);
+/* Desktop process: where a windowed game in the games process shows, in screen pixels. */
+void hwgpu_host_set_hole(int on, int32_t left, int32_t top, int32_t right, int32_t bottom);
+/* Desktop process: the app's layer for Windows' pointer, over everything (an ASurfaceControl*), or null. */
+void hwgpu_host_set_pointer_layer(void* layer);
+/* Games process: the app's layer under the desktop (an ASurfaceControl*, reference passes), or null. */
+void hwgpu_host_set_under_layer(void* layer);
 
 #ifdef __cplusplus
 }

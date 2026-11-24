@@ -20,6 +20,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -191,14 +192,6 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (screen == Screen.WINDOWS && GamepadInput.onKey(event)) return true
-        // Ctrl + Alt always lets a captured mouse go, so a game can never trap it. Windows gets the keys too.
-        if (guest.hasPointerCapture() && event.action == KeyEvent.ACTION_DOWN &&
-            ((KeyEvent.isModifierKey(event.keyCode) && event.isCtrlPressed && event.isAltPressed))
-        ) {
-            manualLook = false
-            lookHeldOff = true
-            updateCapture()
-        }
         if (screen == Screen.WINDOWS && event.keyCode !in HOST_KEYS &&
             (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) && AvfLaunch.key(event)
         ) return true
@@ -211,14 +204,14 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         VsockInput.touchMode = if (prefs.getBoolean(TRACKPAD, false)) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
         VsockInput.gameSpeed = prefs.getFloat(GAME_SPEED, 1f)
-        GuestAgent.onCursor = { look ->
-            runOnUiThread {
-                guestLook = look
-                if (!look) lookHeldOff = false
-                updateCapture()
-            }
-        }
         GamepadInput.register(this)
+        // A mouse plugged in or taken out: Windows takes it over, or lets it go.
+        getSystemService(android.hardware.input.InputManager::class.java).registerInputDeviceListener(
+            object : android.hardware.input.InputManager.InputDeviceListener {
+                override fun onInputDeviceAdded(id: Int) = updateCapture()
+                override fun onInputDeviceRemoved(id: Int) = updateCapture()
+                override fun onInputDeviceChanged(id: Int) = updateCapture()
+            }, ui)
         // A fresh process holds no VM, so one still running from an earlier session cannot be resumed.
         if (AvfLaunch.machine == null && VmAccess.granted(this)) Thread { AvfLaunch.killStale(this) }.start()
 
@@ -238,6 +231,8 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                 }
                 true
             }
+            // Windows draws the pointer; the phone's own would sit beside it.
+            pointerIcon = android.view.PointerIcon.getSystemIcon(this@MainActivity, android.view.PointerIcon.TYPE_NULL)
             setOnCapturedPointerListener { _, event -> VsockInput.captured(event) }
             setOnGenericMotionListener { view, event ->
                 if (GamepadInput.isGamepad(event.source)) GamepadInput.onMotion(event)
@@ -253,6 +248,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         guestDisplay = GuestDisplay(guest) {
             // The first changed frame after the firmware's blank one is Windows drawing.
             runOnUiThread { ui.removeCallbacks(hideBooting); hideBooting.run() }
+            GameSettings.loading(this, false)
         }
         bootingText = Ui.text(this, M.attr.textAppearanceTitleMedium).apply { setTextColor(0xffffffff.toInt()) }
         booting = LinearLayout(this).apply {
@@ -289,9 +285,13 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             toolbar.requestLayout()
             insets
         }
-        // Run the phone's screen at its fastest rate, so Windows frames are shown as soon as they change.
-        GuestDisplay.bestMode(display)?.let { mode ->
-            window.attributes = window.attributes.also { it.preferredDisplayModeId = mode.modeId }
+        // Run the phone's screen at its fastest rate, so Windows frames are shown as soon as they change,
+        // or at 60 Hz in the Game Dashboard's Battery mode or while the phone is hot.
+        applyDisplayMode()
+        GameSettings.onChange = {
+            applyDisplayMode()
+            if (GameSettings.hot && screen == Screen.WINDOWS)
+                android.widget.Toast.makeText(this, "Phone is hot, limiting to 60 fps", android.widget.Toast.LENGTH_LONG).show()
         }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -336,53 +336,53 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         GuestAudio.micChanged(this)   // so may the microphone
         GuestAudio.askMic = { runOnUiThread { askMic() } }
         if (GuestAudio.micWanted) askMic()
+        GuestAgent.onGuestRebootNeeded = { runOnUiThread { askGuestReboot() } }
+        if (GuestAgent.guestRebootNeeded) askGuestReboot()
         GamepadInput.resume()
         if (AvfLaunch.machine != null) guestDisplay.vmStarted(AvfLaunch.sharedWindow)
         if (screen == Screen.WINDOWS) immersive(true)
+        applyDisplayMode()   // the Game Dashboard mode may have changed meanwhile
+    }
+
+    private fun applyDisplayMode() {
+        GameSettings.displayMode(this, display)?.let { mode ->
+            if (window.attributes.preferredDisplayModeId != mode.modeId)
+                window.attributes = window.attributes.also { it.preferredDisplayModeId = mode.modeId }
+        }
     }
 
     override fun onPause() {
         super.onPause()
         GuestAudio.askMic = null
+        GuestAgent.onGuestRebootNeeded = null
         GamepadInput.pause()
     }
 
-    // ---- game mouse: pointer capture for mouse-look (mouse/README.md) ----
-
-    private var guestLook = false     // the program in front in Windows hides the cursor and holds it in
-    private var lookHeldOff = false   // let go by Ctrl + Alt or the toolbar, until Windows shows the cursor again
-    private var manualLook = false    // turned on from the toolbar
+    // ---- a plugged-in mouse belongs to Windows ----
+    // While the Windows screen is up, a mouse is held by the app (pointer capture): Android's pointer is hidden
+    // and cannot click the app around Windows, and Windows gets relative counts, as from a PC's mouse, so it
+    // works across several Windows screens and in games. Touch the screen for the app's own controls.
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         updateCapture()
     }
 
+    private fun mousePresent() = android.view.InputDevice.getDeviceIds().any { id ->
+        val d = android.view.InputDevice.getDevice(id) ?: return@any false
+        !d.isVirtual && d.supportsSource(android.view.InputDevice.SOURCE_MOUSE) &&
+            !d.supportsSource(android.view.InputDevice.SOURCE_TOUCHPAD)
+    }
+
     private fun updateCapture() {
-        val want = screen == Screen.WINDOWS && hasWindowFocus() && (manualLook || when (prefs.getString(GAME_MOUSE, "auto")) {
-            "always" -> !lookHeldOff
-            "never" -> false
-            else -> guestLook && !lookHeldOff
-        })
+        if (!::guest.isInitialized) return
+        val want = screen == Screen.WINDOWS && hasWindowFocus() && mousePresent()
         if (want && !guest.hasPointerCapture()) {
             guest.requestFocus()
             guest.requestPointerCapture()
-            Log.i("HyperWin", "game mouse captured")
         } else if (!want && guest.hasPointerCapture()) {
             guest.releasePointerCapture()
-            Log.i("HyperWin", "game mouse released")
         }
-    }
-
-    private fun toggleGameMouse() {
-        if (guest.hasPointerCapture()) {
-            manualLook = false
-            lookHeldOff = true
-        } else {
-            manualLook = true
-            lookHeldOff = false
-        }
-        updateCapture()
     }
 
     /** Once per launch, when Windows has opened the microphone. */
@@ -401,7 +401,11 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         setupLayer.visibility = if (next == Screen.SETUP) View.VISIBLE else View.GONE
         homeLayer.visibility = if (next == Screen.HOME) View.VISIBLE else View.GONE
         toolbar.visibility = if (next == Screen.WINDOWS) View.VISIBLE else View.GONE
-        if (next == Screen.HOME) home.refresh(AvfLaunch.machine != null, status)
+        if (next == Screen.HOME) {
+            home.refresh(AvfLaunch.machine != null, status)
+            // At most once a day, and never over the Windows screen.
+            Updater.check(this, manual = false) { screen == Screen.HOME }
+        }
         if (next == Screen.WINDOWS) {
             showBar(false)
             guest.requestFocus()
@@ -412,6 +416,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         }
         immersive(next == Screen.WINDOWS)
         updateCapture()
+        if (next == Screen.WINDOWS) GameSettings.watchHeat(this) else GameSettings.stopHeat()
         if (next != Screen.WINDOWS) GamepadInput.stopAllRumble()
     }
 
@@ -453,19 +458,26 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                     setOnClickListener { menu(it, "Android keyboard" to { togglePhoneKeyboard() }, "Windows keyboard" to { showWindowsKeyboard() }) }
                 })
                 addView(action("Mouse", R.drawable.ic_drag) {}.apply {
-                    contentDescription = "Choose how fingers on the screen act: touch screen, trackpad or game mouse"
+                    contentDescription = "Choose how fingers on the screen act: touch screen or trackpad"
                     setOnClickListener {
                         val pad = VsockInput.touchMode == VsockInput.TouchMode.TRACKPAD
-                        val look = guest.hasPointerCapture()
                         fun mode(trackpad: Boolean) {
                             VsockInput.touchMode = if (trackpad) VsockInput.TouchMode.TRACKPAD else VsockInput.TouchMode.TOUCH
                             prefs.edit().putBoolean(TRACKPAD, trackpad).apply()
-                            if (look) toggleGameMouse()
                         }
                         menu(it,
-                            (if (!pad && !look) "✓ " else "") + "Touch screen (multi-touch)" to { mode(false) },
-                            (if (pad && !look) "✓ " else "") + "Trackpad" to { mode(true) },
-                            (if (look) "✓ " else "") + "Game mouse" to { if (!look) toggleGameMouse() })
+                            (if (!pad) "✓ " else "") + "Touch screen (multi-touch)" to { mode(false) },
+                            (if (pad) "✓ " else "") + "Trackpad (moves the mouse, in games too)" to { mode(true) })
+                    }
+                })
+                addView(action("Shortcuts", R.drawable.ic_shortcuts) {}.apply {
+                    contentDescription = "Send a Windows key shortcut"
+                    setOnClickListener {
+                        menu(it,
+                            "Task Manager (Ctrl + Shift + Esc)" to { AvfLaunch.shortcut(KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_ESCAPE) },
+                            "Reset graphics driver (Win + Ctrl + Shift + B)" to { AvfLaunch.shortcut(KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_B) },
+                            "Switch window (Alt + Tab)" to { AvfLaunch.shortcut(KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_TAB) },
+                            "Close window (Alt + F4)" to { AvfLaunch.shortcut(KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_F4) })
                     }
                 })
                 addView(action("Controls", R.drawable.ic_gamepad) {}.also { b -> b.setOnClickListener { controlsMenu(b) } })
@@ -563,7 +575,15 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
 
     private fun startWindows(restart: Boolean = false, attempt: Int = 1) {
         if (starting || AvfLaunch.machine != null) return     // one Windows at a time: they share a disk
+        GameSettings.loading(this, true)
         if (!VmAccess.granted(this)) { VmAccess.ensure(this) { startWindows(restart, attempt) }; return }
+        if (!restart && attempt == 1 && !skipGuestPatch) {
+            val m = preparedMachine()
+            if (m != null && MachinePrep.guestNeedsPatch(this, m)) {
+                askOfflinePatch(m)
+                return
+            }
+        }
         starting = true
         show(Screen.WINDOWS)
         bootingText.text = if (restart) "Windows is restarting" else "Starting Windows"
@@ -571,6 +591,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         ui.removeCallbacks(hideBooting)
         ui.postDelayed(hideBooting, 60_000)
         Thread {
+            var retryable = true
             val report = runCatching {
                 AvfLaunch.bootWindows(
                     this,
@@ -595,7 +616,13 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                         if (console.length > 12000) console.delete(0, console.length - 12000)
                     }
                 }
-            }.getOrElse { it.message ?: "Windows could not start." }
+            }.getOrElse { t ->
+                val root = generateSequence(t) { it.cause }.last()
+                if (root is ReflectiveOperationException || root is SecurityException || root is UnsupportedOperationException) {
+                    retryable = false
+                }
+                t.message ?: "Windows could not start."
+            }
             runOnUiThread {
                 if (isFinishing) return@runOnUiThread
                 starting = false
@@ -606,7 +633,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
                     status = "Windows is running."
                 } else if (report.startsWith("stopped") && AvfLaunch.lastStopWasReboot) {
                     startWindows(restart = true)
-                } else if (attempt < 4) {
+                } else if (retryable && attempt < 4) {
                     // The firmware sometimes faults at power-on (ArmCpuDxe, splitting a live page
                     // table entry under KVM), and sometimes twice running. A try costs about a second.
                     synchronized(console) { console.append("\n").append(report).append("\nTrying once more.\n") }
@@ -672,9 +699,108 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             .show()
     }
 
-    override fun importDxvk() = pickDxvk.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+    override fun importDxvk() = pickDxvk.launch(arrayOf("application/zip", "application/gzip", "application/x-gzip", "application/x-tar", "application/octet-stream", "*/*"))
 
     override fun importDriver() = pickDriver.launch(arrayOf("application/octet-stream", "application/zip", "application/x-sharedlib", "*/*"))
+
+    private var guestPatchDialog: AlertDialog? = null
+    private var skipGuestPatch = false
+    private var offlinePatchRunning = false
+
+    private fun askOfflinePatch(machine: Machine) {
+        if (isFinishing || isDestroyed || guestPatchDialog?.isShowing == true || offlinePatchRunning) return
+        if (screen != Screen.HOME) show(Screen.HOME)
+        guestPatchDialog = MaterialAlertDialogBuilder(this)
+            .setTitle("Update Windows?")
+            .setMessage("This version of HyperWin includes updated drivers and tools for Windows. Patch Windows before starting?")
+            .setNegativeButton("Start without updating") { _, _ ->
+                skipGuestPatch = true
+                startWindows()
+            }
+            .setPositiveButton("Update and start") { _, _ -> runOfflinePatch(machine, thenStart = true) }
+            .show()
+    }
+
+    private fun askGuestReboot() {
+        if (isFinishing || isDestroyed || guestPatchDialog?.isShowing == true) return
+        GuestAgent.clearRebootNeeded()
+        guestPatchDialog = MaterialAlertDialogBuilder(this)
+            .setTitle("Windows drivers updated")
+            .setMessage("Restart Windows for the new drivers to take effect.")
+            .setNegativeButton("Later", null)
+            .setPositiveButton("Restart now") { _, _ -> GuestAgent.exec("shutdown /r /t 0") }
+            .show()
+    }
+
+    override fun updateGuestDrivers() {
+        val m = preparedMachine() ?: return
+        if (AvfLaunch.machine != null) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Shut down Windows first")
+                .setMessage("Driver updates are applied before Windows starts.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        if (MachinePrep.guestNeedsPatch(this, m)) {
+            runOfflinePatch(m, thenStart = false)
+            return
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Reapply Windows drivers?")
+            .setMessage("Windows already matches this version of HyperWin. Reapply the HyperWin drivers and tools anyway?")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Reapply") { _, _ -> runOfflinePatch(m, thenStart = false) }
+            .show()
+    }
+
+    private fun runOfflinePatch(machine: Machine, thenStart: Boolean) {
+        if (offlinePatchRunning) return
+        offlinePatchRunning = true
+        val progress = MaterialAlertDialogBuilder(this)
+            .setTitle("Updating Windows")
+            .setMessage("Preparing update files…")
+            .setCancelable(false)
+            .show()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Thread {
+            val report = runCatching {
+                MachinePrep.patchGuest(this, machine) { percent, message ->
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed) {
+                            progress.setMessage(if (percent > 0) "$message $percent%" else message)
+                        }
+                    }
+                }
+            }.getOrElse { it.message ?: "Something went wrong." }
+            runOnUiThread {
+                offlinePatchRunning = false
+                runCatching { progress.dismiss() }
+                if (AvfLaunch.machine == null) window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (screen == Screen.HOME) home.refresh(AvfLaunch.machine != null, status)
+                if (report == "ok") {
+                    skipGuestPatch = false
+                    if (thenStart) startWindows()
+                    else Toast.makeText(this, "Windows drivers are up to date.", Toast.LENGTH_LONG).show()
+                } else {
+                    val b = MaterialAlertDialogBuilder(this)
+                        .setTitle("Windows update did not finish")
+                        .setMessage(report)
+                    if (thenStart) {
+                        b.setNegativeButton("Cancel", null)
+                            .setPositiveButton("Start anyway") { _, _ ->
+                                skipGuestPatch = true
+                                startWindows()
+                            }
+                    } else {
+                        b.setPositiveButton("OK", null)
+                    }
+                    b.show()
+                }
+            }
+        }.start()
+    }
 
     override fun reinstall() {
         replaceOldMachines = true
@@ -684,8 +810,6 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     companion object {
         const val BOOT_ON_LAUNCH = "bootOnLaunch"
         const val TRACKPAD = "trackpadMode"
-        const val GAME_MOUSE = "gameMouse"
-        val GAME_MOUSE_MODES = listOf("auto", "always", "never")
         const val GAME_SPEED = "gameMouseSpeed"
         private const val EXTRA_PREPARE_ISO = "prepareIso"
         private val HOST_KEYS = setOf(
