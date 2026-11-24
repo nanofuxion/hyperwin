@@ -35,6 +35,10 @@ object Updater {
 
     fun current(ctx: Context): String = ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "0"
 
+    /** The GitHub release the user declined. A later tag still prompts; this one stays in Settings. */
+    fun declined(ctx: Context): String? =
+        ctx.getSharedPreferences("hyperwin", Context.MODE_PRIVATE).getString(DECLINED, null)
+
     /** [manual] is the Settings button: it always checks, says what it found, and offers a declined version again. */
     fun check(activity: Activity, manual: Boolean, mayAsk: () -> Boolean = { true }) {
         if (!enabled(activity) || busy) return

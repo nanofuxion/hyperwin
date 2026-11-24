@@ -486,8 +486,13 @@ class HomeScreen(
                     .show()
             }
         }
-        if (Updater.enabled(ctx)) rows += Ui.row(ctx, "Check for updates", "HyperWin ${Updater.current(ctx)}", Ui.chevron(ctx)) {
-            (ctx as? android.app.Activity)?.let { Updater.check(it, manual = true) }
+        if (Updater.enabled(ctx)) {
+            val skipped = Updater.declined(ctx)
+            val summary = if (skipped == null) "HyperWin ${Updater.current(ctx)}"
+            else "HyperWin ${Updater.current(ctx)}. Skipped $skipped. A newer GitHub release will ask again."
+            rows += Ui.row(ctx, "Check for updates", summary, Ui.chevron(ctx)) {
+                (ctx as? android.app.Activity)?.let { Updater.check(it, manual = true) }
+            }
         }
         return Ui.section(ctx, "Advanced", *rows.toTypedArray())
     }
