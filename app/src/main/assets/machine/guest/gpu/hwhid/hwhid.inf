@@ -7,7 +7,7 @@ Class=HIDClass
 ClassGUID={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
 Provider=%HyperWin%
 ; build.sh sets the version from the driver's hash
-DriverVer=11/18/2026,1.0.42499.21397
+DriverVer=11/18/2026,1.0.38674.4586
 CatalogFile=hwhid.cat
 PnpLockdown=1
 

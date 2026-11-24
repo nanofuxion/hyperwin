@@ -99,6 +99,21 @@
 #define HW_CPPC 0xB00000u
 #define HW_CPPC_REGS (HW_CPPC + 8u)
 #define HW_CPPC_MAX_CPUS 64u
+/* Opt-in guest bridge telemetry, above the PCC per-CPU registers. */
+#define HW_CPPC_BRIDGE_OFF 0x800u
+#define HW_CPPC_BRIDGE_MAGIC 0x43504642u
+struct hw_cppc_bridge_diag {
+    uint32_t magic, count;
+    volatile uint32_t writes[HW_CPPC_MAX_CPUS];
+    volatile uint32_t khz[HW_CPPC_MAX_CPUS];
+    volatile uint32_t load_permille[HW_CPPC_MAX_CPUS];
+    volatile uint32_t reported_khz[HW_CPPC_MAX_CPUS];
+    volatile uint32_t samples, accounting_errors;
+};
+_Static_assert(HW_CPPC_BRIDGE_OFF >= 8u + 16u + 16u * HW_CPPC_MAX_CPUS,
+               "bridge telemetry must not overlap PCC registers");
+_Static_assert(HW_CPPC_BRIDGE_OFF + sizeof(struct hw_cppc_bridge_diag) <= 0x1000u,
+               "bridge telemetry must fit in the PCC page");
 
 #define HW_GUEST_FOUND 1u
 #define HW_GUEST_FRAME 2u
@@ -161,6 +176,20 @@ struct hw_header {
     uint32_t screen_native_height;
     uint32_t screen_seq;
     uint32_t screen_guest;
+    /* Per-core host CPU topology for MATCH_HOST multicore VMs (guest/efi/cpu_acpi.c).
+     * When cpu_topo_count matches the MADT enabled processor count, cpu_acpi.c sets each
+     * GICC's ProcessorPowerEfficiencyClass and emits per-CPU _CPC performance and MHz. */
+    uint32_t cpu_topo_count;
+    uint16_t cpu_max_mhz[HW_CPPC_MAX_CPUS];
+    uint16_t cpu_min_mhz[HW_CPPC_MAX_CPUS];
+    uint16_t cpu_capacity[HW_CPPC_MAX_CPUS];
+    uint8_t  cpu_eff_class[HW_CPPC_MAX_CPUS];
+    /* Virtual cpufreq MMIO discovered from the live FDT (guest/efi/cpu_acpi.c).
+     * proto: 0 = absent, 1 = "virtual,android-v-only-cpufreq" (8-byte stride),
+     *        2 = "qemu,virtual-cpufreq" (0x1000-byte stride). */
+    uint64_t virt_cpufreq_base;
+    uint32_t virt_cpufreq_size;
+    uint32_t virt_cpufreq_proto;
 };
 
 _Static_assert(sizeof(struct hw_header) < 0x1000, "header must fit in the first page");

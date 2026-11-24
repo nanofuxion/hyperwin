@@ -69,7 +69,12 @@ object AvfPlan {
     }
 
     /** ashmem region crosvm maps with --file-backed-mapping. Same hook SweetCider uses. */
-    fun createWindow(seed: ByteArray, width: Int = FRAME_WIDTH, height: Int = FRAME_HEIGHT): SharedWindow {
+    fun createWindow(
+        seed: ByteArray,
+        width: Int = FRAME_WIDTH,
+        height: Int = FRAME_HEIGHT,
+        matchHostTopology: Boolean = false,
+    ): SharedWindow {
         val shm = SharedMemory.create("hyperwin", WINDOW_SIZE)
         val map = shm.mapReadWrite().order(ByteOrder.LITTLE_ENDIAN)
         WindowBridge.nativeInit(map, seed)
@@ -79,11 +84,16 @@ object AvfPlan {
         // Windows shows these as the computer and processor instead of the firmware's "Gunyah" text.
         val soc = listOf(android.os.Build.SOC_MANUFACTURER, android.os.Build.SOC_MODEL)
             .filter { it.isNotBlank() && it != android.os.Build.UNKNOWN }
+        val topo = hostCpuTopology()
+        val topMhz = topo?.maxMhz?.maxOrNull() ?: hostCpuMhz()
         WindowBridge.nativeConfigure(
-            map, frameWidth, frameHeight, hostCpuMhz(),
+            map, frameWidth, frameHeight, topMhz,
             android.os.Build.MANUFACTURER, android.os.Build.MODEL,
             soc.firstOrNull().orEmpty(), soc.joinToString(" "),
         )
+        if (matchHostTopology && topo != null && topo.maxMhz.size > 1) {
+            WindowBridge.nativeConfigureCpuTopology(map, topo.maxMhz, topo.minMhz, topo.capacity, topo.effClass)
+        }
         val native = nativeScreen()
         WindowBridge.nativeSetScreen(map, frameWidth, frameHeight, native.first, native.second, false)
         val pfd = fdOf(shm)
@@ -110,6 +120,54 @@ object AvfPlan {
         val pfd = parcel.readFileDescriptor()
         parcel.recycle()
         return pfd
+    }
+
+    class HostCpuTopology(
+        val maxMhz: IntArray,
+        val minMhz: IntArray,
+        val capacity: IntArray,
+        val effClass: ByteArray,
+    )
+
+    /**
+     * Dynamically reads each host CPU's frequency bounds, Linux scheduler capacity, and relative
+     * efficiency tier (0 = lowest, higher = faster). Never assumes a fixed core layout.
+     */
+    fun hostCpuTopology(): HostCpuTopology? {
+        val cpuDir = File("/sys/devices/system/cpu")
+        val cores = (cpuDir.listFiles { f -> f.name.matches(Regex("cpu\\d+")) } ?: return null)
+            .mapNotNull { f -> f.name.removePrefix("cpu").toIntOrNull()?.let { it to f } }
+            .sortedBy { it.first }
+        if (cores.isEmpty()) return null
+        val n = cores.size.coerceAtMost(64)
+        val maxMhz = IntArray(n)
+        val minMhz = IntArray(n)
+        val rawCap = IntArray(n)
+        for (i in 0 until n) {
+            val dir = cores[i].second
+            maxMhz[i] = runCatching { File(dir, "cpufreq/cpuinfo_max_freq").readText().trim().toInt() / 1000 }.getOrDefault(0)
+            minMhz[i] = runCatching { File(dir, "cpufreq/cpuinfo_min_freq").readText().trim().toInt() / 1000 }.getOrDefault(0)
+            rawCap[i] = runCatching { File(dir, "cpu_capacity").readText().trim().toInt() }.getOrDefault(0)
+        }
+        val topMhz = maxMhz.maxOrNull() ?: 0
+        if (topMhz <= 0) return null
+        val capacity = IntArray(n) { i ->
+            when {
+                rawCap[i] > 0 -> rawCap[i]
+                maxMhz[i] > 0 -> ((maxMhz[i].toLong() * 1024L) / topMhz).toInt().coerceAtLeast(1)
+                else -> 1024
+            }
+        }
+        for (i in 0 until n) {
+            if (maxMhz[i] <= 0) maxMhz[i] = topMhz
+            if (minMhz[i] <= 0 || minMhz[i] >= maxMhz[i]) minMhz[i] = (maxMhz[i] / 10).coerceAtLeast(1)
+        }
+        // Rank distinct performance tiers ascending: lowest tier = 0, highest = tiers.size - 1.
+        val tiers = (0 until n).map { capacity[it] to maxMhz[it] }.distinct().sortedWith(compareBy({ it.first }, { it.second }))
+        val effClass = ByteArray(n) { i ->
+            tiers.indexOf(capacity[i] to maxMhz[i]).coerceIn(0, 255).toByte()
+        }
+        return HostCpuTopology(maxMhz, minMhz, capacity, effClass)
     }
 
     /** Top clock of the phone's fastest core, in MHz. */

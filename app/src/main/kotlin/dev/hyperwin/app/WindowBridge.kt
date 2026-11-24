@@ -16,6 +16,13 @@ object WindowBridge {
         cpuMaker: String,
         cpuName: String,
     )
+    external fun nativeConfigureCpuTopology(
+        buffer: ByteBuffer,
+        maxMhz: IntArray,
+        minMhz: IntArray,
+        capacity: IntArray,
+        effClass: ByteArray,
+    )
     /** The Windows screen size for the indirect display: the app's choice and the phone's own size. */
     external fun nativeSetScreen(buffer: ByteBuffer, width: Int, height: Int, nativeWidth: Int, nativeHeight: Int, ask: Boolean)
     external fun nativePoll(buffer: ByteBuffer): Int

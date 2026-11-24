@@ -91,6 +91,7 @@ object GuestAgent {
     fun stop() {
         vm = null
         connected = false
+        ExperimentalCpuPerformance.disconnected()
         guestRebootNeeded = false
         doneWatchers.keys.toList().forEach { doneWatchers.remove(it)?.invoke(-1) }
         fileResultOk = false
@@ -133,6 +134,7 @@ object GuestAgent {
                 Log.i(TAG, "link dropped: ${e.message}")
             } finally {
                 connected = false
+                ExperimentalCpuPerformance.disconnected()
                 agentVersion = 0
                 out = null
                 doneWatchers.keys.toList().forEach { doneWatchers.remove(it)?.invoke(-1) }
@@ -186,7 +188,7 @@ object GuestAgent {
                 agentVersion = buf[0].toInt()
                 Log.i(TAG, "agent version ${buf[0]}, network adapter ${if (buf[1].toInt() == 1) "ready" else "missing"}")
                 if (agentVersion < VERSION) updateAgent()
-                appContext?.let { DisplayWatchdog.agentUp(it) }
+                appContext?.let { DisplayWatchdog.agentUp(it); ExperimentalCpuPerformance.sync(it) }
                 // A boot cut short (the app closed, the phone low on memory) must not send Windows
                 // into its recovery screens, which this VM cannot run. Cheap to repeat each start.
                 exec("cmd /c bcdedit /set {current} recoveryenabled no & bcdedit /set {current} bootstatuspolicy ignoreallfailures")
@@ -235,11 +237,12 @@ object GuestAgent {
     }
 
     /** Runs a command line in Windows: as SYSTEM with output in logcat, or on the user's desktop. */
-    fun exec(command: String, desktop: Boolean = false, hidden: Boolean = false): Int {
+    fun exec(command: String, desktop: Boolean = false, hidden: Boolean = false, onExit: ((Int) -> Unit)? = null): Int {
         val id = nextId.getAndIncrement()
         val cmd = command.toByteArray()
         val mode = if (hidden) 2 else if (desktop) 1 else 0     // HW_AGENT_EXEC_*
         val p = ByteBuffer.allocate(5 + cmd.size).order(ByteOrder.LITTLE_ENDIAN).putInt(id).put(mode.toByte()).put(cmd).array()
+        if (onExit != null) doneWatchers[id] = onExit
         send(EXEC, p, p.size)
         return id
     }
@@ -247,6 +250,8 @@ object GuestAgent {
     private val doneWatchers = java.util.concurrent.ConcurrentHashMap<Int, (Int) -> Unit>()
     @Volatile private var fileResultLatch: java.util.concurrent.CountDownLatch? = null
     @Volatile private var fileResultOk = false
+
+    fun forgetCompletion(id: Int) { doneWatchers.remove(id) }
 
     /** Calls [onExit] with the exit code when command [id] (from [exec]) finishes. */
     fun onceDone(id: Int, onExit: (Int) -> Unit) { doneWatchers[id] = onExit }

@@ -54,6 +54,12 @@ for d in hwaudio hwhid; do
   mkdir -p "$OUT/guest/gpu/$d"
   cp "$ROOT/build/$d/$d.sys" "$ROOT/build/$d/$d.inf" "$OUT/guest/gpu/$d/"
 done
+# Optional CPU bridge: bundled but never started by the guest installer. The app setting controls it.
+for f in "$ROOT/guest/drivers/hwcpufreq/hwcpufreq.c" "$ROOT/guest/drivers/hwcpufreq/build.sh" "$ROOT/include/hw_abi.h"; do
+  [ "$ROOT/build/hwcpufreq/hwcpufreq.sys" -nt "$f" ] || { sh "$ROOT/guest/drivers/hwcpufreq/build.sh" >/dev/null; break; }
+done
+mkdir -p "$OUT/guest/gpu/cpu-performance"
+cp "$ROOT/build/hwcpufreq/hwcpufreq.sys" "$ROOT/guest/drivers/hwcpufreq/toggle.ps1" "$OUT/guest/gpu/cpu-performance/"
 # The render-only GPU adapter's package (wddm/README.md): driver, INF, and the Vulkan driver the INF
 # registers. Built here when its sources changed (the WDK headers are fetched into gpu/work, never kept).
 for f in "$ROOT"/gpu/guest/wddm/hwgpuw.c "$ROOT"/gpu/guest/wddm/hwgpuw.inf "$ROOT"/gpu/guest/wddm/hwdisplay.inc "$ROOT"/include/hw_wddm.h "$ROOT"/gpu/include/hwgpu_ring.h "$ROOT"/gpu/guest/hwd3d/umd.cpp "$ROOT"/gpu/guest/hwd3d/umd9.inc "$ROOT"/gpu/guest/hwd3d/umd12.inc "$ROOT"/gpu/guest/hwd3d/wire.h; do

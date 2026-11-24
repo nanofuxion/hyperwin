@@ -434,7 +434,20 @@ class HomeScreen(
             Ui.row(ctx, "Memory", "", value).apply { minimumHeight = ctx.dp(40) },
             slider.apply { setPadding(ctx.dp(12), 0, ctx.dp(12), ctx.dp(8)) },
         )
-        return Ui.section(ctx, "Performance", cores, memory)
+        val cpuStatus = Ui.text(ctx, M.attr.textAppearanceBodySmall, M.attr.colorOnSurfaceVariant,
+            if (ExperimentalCpuPerformance.enabled(ctx) && !GuestAgent.connected) "Will apply when Windows connects" else ExperimentalCpuPerformance.status)
+        val listener: (String) -> Unit = { cpuStatus.text = if (ExperimentalCpuPerformance.enabled(ctx) && !GuestAgent.connected) "Will apply when Windows connects" else it }
+        cpuStatus.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) { ExperimentalCpuPerformance.listen(listener) }
+            override fun onViewDetachedFromWindow(v: View) { ExperimentalCpuPerformance.unlisten(listener) }
+        })
+        val experimental = Ui.switchRow(ctx, "Experimental CPU topology",
+            "An experimental attempt to pass this phone's CPU topology into Windows, so it can see the little, mid, and big cores. Can increase heat and battery use. Applies now, or when Windows next connects.",
+            ExperimentalCpuPerformance.enabled(ctx)) { on -> ExperimentalCpuPerformance.setEnabled(ctx, on) }
+        experimental.gravity = Gravity.TOP
+        (experimental.getChildAt(1).layoutParams as LinearLayout.LayoutParams).topMargin = ctx.dp(2)
+        cpuStatus.setPadding(ctx.dp(20), 0, ctx.dp(20), ctx.dp(12))
+        return Ui.section(ctx, "Performance", cores, memory, experimental, cpuStatus)
     }
 
     private fun startup() = Ui.section(ctx, "When HyperWin opens",

@@ -54,6 +54,40 @@ Java_dev_hyperwin_app_WindowBridge_nativeConfigure(JNIEnv *env, jclass cls, jobj
     put_text(env, h->cpu_name, sizeof h->cpu_name, cpu_name);
 }
 
+JNIEXPORT void JNICALL
+Java_dev_hyperwin_app_WindowBridge_nativeConfigureCpuTopology(
+    JNIEnv *env, jclass cls, jobject buffer,
+    jintArray max_mhz, jintArray min_mhz, jintArray capacity, jbyteArray eff_class)
+{
+    struct hw_header *h = (*env)->GetDirectBufferAddress(env, buffer);
+    (void)cls;
+    if (!ready || !h) return;
+    h->cpu_topo_count = 0;
+    if (!max_mhz || !min_mhz || !capacity || !eff_class) return;
+    jsize n = (*env)->GetArrayLength(env, max_mhz);
+    if (n <= 0 || n > (jsize)HW_CPPC_MAX_CPUS) return;
+    if ((*env)->GetArrayLength(env, min_mhz) != n ||
+        (*env)->GetArrayLength(env, capacity) != n ||
+        (*env)->GetArrayLength(env, eff_class) != n) return;
+    jint *maxv = (*env)->GetIntArrayElements(env, max_mhz, NULL);
+    jint *minv = (*env)->GetIntArrayElements(env, min_mhz, NULL);
+    jint *capv = (*env)->GetIntArrayElements(env, capacity, NULL);
+    jbyte *effv = (*env)->GetByteArrayElements(env, eff_class, NULL);
+    if (maxv && minv && capv && effv) {
+        for (jsize i = 0; i < n; i++) {
+            h->cpu_max_mhz[i] = (uint16_t)(maxv[i] > 0 ? (maxv[i] > 65535 ? 65535 : maxv[i]) : 0);
+            h->cpu_min_mhz[i] = (uint16_t)(minv[i] > 0 ? (minv[i] > 65535 ? 65535 : minv[i]) : 0);
+            h->cpu_capacity[i] = (uint16_t)(capv[i] > 0 ? (capv[i] > 65535 ? 65535 : capv[i]) : 0);
+            h->cpu_eff_class[i] = (uint8_t)effv[i];
+        }
+        h->cpu_topo_count = (uint32_t)n;
+    }
+    if (maxv) (*env)->ReleaseIntArrayElements(env, max_mhz, maxv, JNI_ABORT);
+    if (minv) (*env)->ReleaseIntArrayElements(env, min_mhz, minv, JNI_ABORT);
+    if (capv) (*env)->ReleaseIntArrayElements(env, capacity, capv, JNI_ABORT);
+    if (effv) (*env)->ReleaseByteArrayElements(env, eff_class, effv, JNI_ABORT);
+}
+
 /* The Windows screen size for the indirect display (hw_abi.h): the size chosen in the app and the phone's
  * own. ask != 0 means Windows is running and should switch to it now. */
 JNIEXPORT void JNICALL

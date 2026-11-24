@@ -215,7 +215,7 @@ object AvfLaunch {
             val prev = sharedWindow
             sharedWindow = null
             prev?.close()
-            val window = AvfPlan.createWindow(ByteArray(0), width, height)
+            val window = AvfPlan.createWindow(ByteArray(0), width, height, matchHostTopology = machine.cpuCount > 1)
             sharedWindow = window
             return try {
                 HwGpu.start(ctx, window, width, height)
@@ -224,7 +224,7 @@ object AvfLaunch {
                 UsbBridge.start(ctx, window.usbBuffer)
                 WindowsService.start(ctx)
                 startDebugTap(window, File(dir, "frame.bgra"))
-                startCppcCounter(window)
+                startCppcCounter(window, ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
                 val report = boot(
                     ctx,
                     custom,
@@ -283,7 +283,7 @@ object AvfLaunch {
             UsbBridge.start(ctx, window.usbBuffer)
             WindowsService.start(ctx)
             startDebugTap(window, File(dir, "frame.bgra"))
-            startCppcCounter(window)
+            startCppcCounter(window, ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
             val report = boot(
                 ctx,
                 custom,
@@ -366,13 +366,31 @@ object AvfLaunch {
      * both read one value in the window. Windows checks that they run, so it advances in step with
      * time; equal counters tell Windows the processor runs at its rated speed.
      */
-    private fun startCppcCounter(window: AvfPlan.SharedWindow) {
+    private fun startCppcCounter(window: AvfPlan.SharedWindow, debug: Boolean) {
         Thread({
+            var lastLog = 0L
+            var lastDesired = ""
+            val diagnosticCpuCount = Runtime.getRuntime().availableProcessors().coerceIn(1, 64)
             while (window.isOpen && sharedWindow === window) {
                 val ok = window.withBuffer { raw ->
                     val b = raw.duplicate().order(ByteOrder.LITTLE_ENDIAN)
                     val now = System.nanoTime() / 1000
-                    runCatching { b.putLong(0xB00008, now); b.putLong(0xB00010, now) }   // HW_CPPC_REGS +0, +8
+                    runCatching {
+                        b.putLong(0xB00008, now); b.putLong(0xB00010, now)   // HW_CPPC_REGS +0, +8
+                        if (debug && now - lastLog >= 2_000_000L) {
+                            val sb = StringBuilder()
+                            for (i in 0 until diagnosticCpuCount) {
+                                if (i > 0) sb.append(',')
+                                sb.append(b.getLong(0xB00008 + 16 + 16 * i))
+                            }
+                            val cur = sb.toString()
+                            if (cur != lastDesired) {
+                                lastDesired = cur
+                                lastLog = now
+                                Log.i("HyperWinDbg", "cppc_desired=$cur")
+                            }
+                        }
+                    }
                     true
                 }
                 if (ok == null) break

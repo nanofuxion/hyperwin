@@ -76,19 +76,24 @@ static uint8_t *reg(uint8_t *p, int64_t offset)
     return put(p, b, sizeof b);
 }
 
-static uint8_t *cpu_device(uint8_t *p, uint32_t index, uint32_t uid, uint32_t mhz)
+static uint8_t *cpu_device(
+    uint8_t *p, uint32_t index, uint32_t uid,
+    uint32_t perf_high, uint32_t perf_low, uint32_t max_mhz, uint32_t min_mhz)
 {
     static const char hex[] = "0123456789ABCDEF";
     static uint8_t dev[512], pkg[400];
     uint8_t *d = dev, *k = pkg;
     int64_t desired = 16 + 16 * (int64_t)index, limited = desired + 8;
+    if (perf_high < 2u) perf_high = PERF;
+    if (perf_low == 0u || perf_low >= perf_high) perf_low = perf_high > 1u ? perf_high - 1u : 1u;
+    if (min_mhz == 0u || min_mhz >= max_mhz) min_mhz = max_mhz > 1u ? max_mhz * perf_low / perf_high : 1u;
     *k++ = 23;                                            /* elements */
     k = dword(k, 23);                                     /* NumEntries */
     k = dword(k, 3);                                      /* Revision */
-    k = dword(k, PERF);                                   /* Highest */
-    k = dword(k, PERF);                                   /* Nominal */
-    k = dword(k, PERF_LOW);                               /* Lowest nonlinear */
-    k = dword(k, PERF_LOW);                               /* Lowest */
+    k = dword(k, perf_high);                              /* Highest */
+    k = dword(k, perf_high);                              /* Nominal */
+    k = dword(k, perf_low);                               /* Lowest nonlinear */
+    k = dword(k, perf_low);                               /* Lowest */
     k = reg(k, -1);                                       /* Guaranteed performance */
     k = reg(k, desired);                                  /* Desired performance */
     k = reg(k, -1);                                       /* Minimum performance */
@@ -103,9 +108,9 @@ static uint8_t *cpu_device(uint8_t *p, uint32_t index, uint32_t uid, uint32_t mh
     k = dword(k, 0);                                      /* Autonomous selection: off */
     k = reg(k, -1);                                       /* Autonomous activity window */
     k = reg(k, -1);                                       /* Energy performance preference */
-    k = dword(k, PERF);                                   /* Reference performance */
-    k = dword(k, mhz * PERF_LOW / PERF);                  /* Lowest frequency, MHz */
-    k = dword(k, mhz);                                    /* Nominal frequency, MHz */
+    k = dword(k, perf_high);                              /* Reference performance */
+    k = dword(k, min_mhz);                                /* Lowest frequency, MHz */
+    k = dword(k, max_mhz);                                /* Nominal frequency, MHz */
     *d++ = 'H'; *d++ = 'C'; *d++ = (uint8_t)hex[(index >> 4) & 15]; *d++ = (uint8_t)hex[index & 15];
     d = put(d, "\x08_HID\x0d" "ACPI0007", 14); *d++ = 0;
     d = put(d, "\x08_UID", 5); d = dword(d, uid);
@@ -121,15 +126,149 @@ static int guid_is(const uint8_t *g, const uint8_t *want)
     return i == 16;
 }
 
-/* The MADT's enabled GIC CPU interfaces, as ACPI processor UIDs. */
-static uint32_t processor_uids(void *system, uint32_t *uid, uint32_t max)
+static uint32_t fdt_be32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static int fdt_streq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+
+static int fdt_has_compat(const uint8_t *v, uint32_t len, const char *want)
+{
+    uint32_t i = 0;
+    while (i < len) {
+        uint32_t j = 0;
+        while (i + j < len && want[j] && v[i + j] == (uint8_t)want[j]) ++j;
+        if (i + j < len && !want[j] && !v[i + j]) return 1;
+        while (i < len && v[i]) ++i;
+        ++i;
+    }
+    return 0;
+}
+
+static uint64_t fdt_cells(const uint8_t *p, uint32_t n)
+{
+    uint64_t v = 0;
+    while (n--) { v = (v << 32) | fdt_be32(p); p += 4; }
+    return v;
+}
+
+/* Discover AVF/crosvm virtual cpufreq MMIO from the live FDT without accessing it.
+ * Record in hw_header; protocol 1 = android-v-only, 2 = upstream, 0 = absent/unsupported. */
+static uint32_t discover_virt_cpufreq(void *system, struct hw_header *h)
+{
+    static const uint8_t fdt_guid[16] = {
+        0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41,
+        0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0
+    };
+    uint64_t n = *(uint64_t *)((uint8_t *)system + 0x68), i;
+    const uint8_t *tables = *(const uint8_t **)((uint8_t *)system + 0x70), *fdt = 0;
+    uint32_t off_struct, off_strings, proto = 0, total, struct_size, strings_size;
+    const uint8_t *p, *strings, *end;
+    uint32_t ac[16], sc[16];
+    const uint8_t *reg_v[16];
+    uint32_t reg_len[16], node_proto[16];
+    int depth = -1;
+    uint64_t base = 0, size = 0;
+
+    h->virt_cpufreq_base = 0;
+    h->virt_cpufreq_size = 0;
+    h->virt_cpufreq_proto = 0;
+
+    for (i = 0; i < n && i < 64 && !fdt; ++i)
+        if (guid_is(tables + i * 24, fdt_guid))
+            fdt = *(const uint8_t **)(tables + i * 24 + 16);
+    if (!fdt || fdt_be32(fdt) != 0xd00dfeedu) return 0;
+
+    off_struct = fdt_be32(fdt + 8);
+    off_strings = fdt_be32(fdt + 12);
+    total = fdt_be32(fdt + 4);
+    strings_size = fdt_be32(fdt + 32);
+    struct_size = fdt_be32(fdt + 36);
+    if (total < 40 || total > 16u * 1024u * 1024u ||
+        off_struct > total || struct_size > total - off_struct ||
+        off_strings > total || strings_size > total - off_strings) return 0;
+    p = fdt + off_struct;
+    end = p + struct_size;
+    strings = fdt + off_strings;
+
+    for (;;) {
+        if ((uint64_t)(end - p) < 4) return 0;
+        uint32_t tok = fdt_be32(p);
+        p += 4;
+        if (tok == 1) {
+            const char *name = (const char *)p;
+            uint32_t len = 0;
+            while (p + len < end && name[len]) ++len;
+            if (p + len == end || (uint64_t)(end - p) < (((uint64_t)len + 4u) & ~3ull)) return 0;
+            p += (len + 4) & ~3u;
+            if (++depth >= 16) break;
+            ac[depth] = 2; sc[depth] = 1;
+            reg_v[depth] = 0; reg_len[depth] = 0; node_proto[depth] = 0;
+        } else if (tok == 3) {
+            if ((uint64_t)(end - p) < 8) return 0;
+            uint32_t len = fdt_be32(p), nameoff = fdt_be32(p + 4);
+            const uint8_t *v = p + 8;
+            if ((((uint64_t)len + 3u) & ~3ull) > (uint64_t)(end - v) || nameoff >= strings_size) return 0;
+            const char *pn = (const char *)strings + nameoff;
+            uint32_t name_len = nameoff;
+            while (name_len < strings_size && strings[name_len]) ++name_len;
+            if (name_len == strings_size) return 0;
+            if (depth >= 0 && depth < 16) {
+                if (fdt_streq(pn, "#address-cells") && len == 4) ac[depth] = fdt_be32(v);
+                else if (fdt_streq(pn, "#size-cells") && len == 4) sc[depth] = fdt_be32(v);
+                else if (fdt_streq(pn, "reg")) { reg_v[depth] = v; reg_len[depth] = len; }
+                else if (fdt_streq(pn, "compatible")) {
+                    if (fdt_has_compat(v, len, "qemu,virtual-cpufreq")) node_proto[depth] = 2;
+                    else if (fdt_has_compat(v, len, "virtual,android-v-only-cpufreq")) node_proto[depth] = 1;
+                }
+            }
+            p += 8 + ((len + 3) & ~3u);
+        } else if (tok == 2) {
+            if (depth >= 0 && depth < 16 && node_proto[depth] && reg_v[depth]) {
+                /* Nested buses need ranges translation; unsupported means no control. */
+                if (depth != 1) return 0;
+                uint32_t pa = depth > 0 ? ac[depth - 1] : 2;
+                uint32_t ps = depth > 0 ? sc[depth - 1] : 1;
+                if (pa <= 2 && ps <= 2 && reg_len[depth] >= 4 * (pa + ps)) {
+                    proto = node_proto[depth];
+                    base = fdt_cells(reg_v[depth], pa);
+                    size = fdt_cells(reg_v[depth] + 4 * pa, ps);
+                    break;
+                }
+            }
+            --depth;
+        } else if (tok == 4) {
+        } else {
+            break;
+        }
+    }
+
+    /* Root-child registers are guest physical addresses. Do not truncate a region size. */
+    if (!proto || !base || !size || size > 0xffffffffu || base > UINT64_MAX - size) return 0;
+    h->virt_cpufreq_base = base;
+    h->virt_cpufreq_size = (uint32_t)size;
+    h->virt_cpufreq_proto = proto;
+    return proto;
+}
+
+/* The MADT's enabled GIC CPU interfaces, as ACPI processor UIDs.
+ * When eff_class != NULL and its count matches the enabled GICC entries, also writes each
+ * GICC's ProcessorPowerEfficiencyClass (ACPI 6.0+ offset 76) and updates the MADT checksum. */
+static uint32_t processor_uids(void *system, uint32_t *uid, uint32_t max,
+                               const uint8_t *eff_class, uint32_t eff_count)
 {
     static const uint8_t acpi20[16] = {
         0x71, 0xe8, 0x68, 0x88, 0xf1, 0xe4, 0xd3, 0x11, 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81
     };
     uint64_t n = *(uint64_t *)((uint8_t *)system + 0x68), i, xsdt = 0, count;
     uint8_t *tables = *(uint8_t **)((uint8_t *)system + 0x70);
-    uint32_t found = 0;
+    uint8_t *madt = 0;
+    uint32_t madt_len = 0, found = 0;
     for (i = 0; i < n && i < 64 && !xsdt; ++i)
         if (guid_is(tables + i * 24, acpi20)) {
             const uint8_t *rsdp = *(const uint8_t **)(tables + i * 24 + 16);
@@ -138,13 +277,31 @@ static uint32_t processor_uids(void *system, uint32_t *uid, uint32_t max)
     if (!xsdt) return 0;
     count = (*(const uint32_t *)(xsdt + 4) - 36) / 8;
     for (i = 0; i < count && i < 64; ++i) {
-        const uint8_t *t = *(const uint8_t **)(xsdt + 36 + i * 8);
+        uint8_t *t = *(uint8_t **)(xsdt + 36 + i * 8);
         uint32_t len, off;
         if (t[0] != 'A' || t[1] != 'P' || t[2] != 'I' || t[3] != 'C') continue;
         len = *(const uint32_t *)(t + 4);
+        madt = t;
+        madt_len = len;
         for (off = 44; off + 2 <= len && t[off + 1]; off += t[off + 1]) {
             if (t[off] == 0x0b && t[off + 1] >= 16 && (*(const uint32_t *)(t + off + 12) & 1) && found < max)
                 uid[found++] = *(const uint32_t *)(t + off + 8);
+        }
+    }
+    if (madt && madt_len >= 44 && eff_class && eff_count == found && found > 1) {
+        uint32_t off, idx = 0, patched = 0;
+        for (off = 44; off + 2 <= madt_len && madt[off + 1]; off += madt[off + 1]) {
+            if (madt[off] == 0x0b && madt[off + 1] >= 77 && (*(const uint32_t *)(madt + off + 12) & 1) && idx < found) {
+                madt[off + 76] = eff_class[idx];
+                patched = 1;
+                idx++;
+            }
+        }
+        if (patched) {
+            uint32_t sum = 0;
+            madt[9] = 0;
+            for (off = 0; off < madt_len; ++off) sum += madt[off];
+            madt[9] = (uint8_t)(0x100 - (sum & 0xff));
         }
     }
     return found;
@@ -213,18 +370,34 @@ int64_t HyperwinInstallCpuSsdt(void *system)
     };
     static uint8_t table[36 + 64 * 420], body[sizeof table];
     static uint32_t uid[HW_CPPC_MAX_CPUS];
-    const struct hw_header *h = (const struct hw_header *)HW_WINDOW_PA;
+    struct hw_header *h = (struct hw_header *)HW_WINDOW_PA;
     void *bs = *(void **)((uint8_t *)system + 0x60), *protocol = 0;
     uint32_t cpus, i, size, sum = 0, mhz;
     uint64_t key = 0;
     uint8_t *p;
     if (h->magic[0] != 'H' || h->magic[1] != 'Y' || h->header_bytes < sizeof *h || !h->cpu_mhz) return -1;
+    discover_virt_cpufreq(system, h);
     mhz = h->cpu_mhz;
-    cpus = processor_uids(system, uid, HW_CPPC_MAX_CPUS);
+    cpus = processor_uids(system, uid, HW_CPPC_MAX_CPUS,
+                          h->cpu_topo_count > 1 ? h->cpu_eff_class : 0,
+                          h->cpu_topo_count);
     if (!cpus) return -2;
     p = body + 16;                                        /* devices first, then wrapped in Scope */
     p = put(p, "\\_SB_", 5);
-    for (i = 0; i < cpus; ++i) p = cpu_device(p, i, uid[i], mhz);
+    for (i = 0; i < cpus; ++i) {
+        uint32_t perf_high = PERF, perf_low = PERF_LOW;
+        uint32_t max_mhz = mhz, min_mhz = mhz * PERF_LOW / PERF;
+        if (h->cpu_topo_count == cpus && cpus > 1 && h->cpu_capacity[i] >= 2 && h->cpu_max_mhz[i] > 0) {
+            perf_high = h->cpu_capacity[i];
+            max_mhz = h->cpu_max_mhz[i];
+            min_mhz = h->cpu_min_mhz[i];
+            if (min_mhz == 0 || min_mhz >= max_mhz) min_mhz = max_mhz > 10 ? max_mhz / 10 : 1;
+            perf_low = perf_high * min_mhz / max_mhz;
+            if (perf_low == 0) perf_low = 1;
+            if (perf_low >= perf_high) perf_low = perf_high - 1;
+        }
+        p = cpu_device(p, i, uid[i], perf_high, perf_low, max_mhz, min_mhz);
+    }
     p = wrap(body, (const uint8_t *)"\x10", 1, body + 16, (uint32_t)(p - body - 16));
     size = 36 + (uint32_t)(p - body);
     p = table;
@@ -271,7 +444,7 @@ int main(int argc, char **argv)
     FILE *f;
     (void)argc;
     p = put(p, "\\_SB_", 5);
-    for (i = 0; i < 8; ++i) p = cpu_device(p, i, i, 2802);
+    for (i = 0; i < 8; ++i) p = cpu_device(p, i, i, PERF, PERF_LOW, 2802, 280);
     p = wrap(body, (const uint8_t *)"\x10", 1, body + 16, (uint32_t)(p - body - 16));
     size = 36 + (uint32_t)(p - body);
     for (i = 0; i < 36; ++i) out[i] = 0;

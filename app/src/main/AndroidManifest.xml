@@ -19,6 +19,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Ongoing "Windows is running" notification on Android 13+ (WindowsService.kt). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.software.virtualization_framework" android:required="false" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <queries><package android:name="moe.shizuku.privileged.api" /></queries>

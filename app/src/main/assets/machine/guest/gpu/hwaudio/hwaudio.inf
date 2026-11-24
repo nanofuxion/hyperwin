@@ -7,7 +7,7 @@ Class=MEDIA
 ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider=%HyperWin%
 ; build.sh sets the version from the driver's hash
-DriverVer=11/17/2026,1.0.49822.51550
+DriverVer=11/17/2026,1.0.45847.61756
 CatalogFile=hwaudio.cat
 PnpLockdown=1
 

@@ -106,7 +106,11 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
     private val requestMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         GuestAudio.micChanged(this)
     }
+    private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it) WindowsService.refresh(this)
+    }
     private var micAsked = false
+    private var notificationsAsked = false
     private val controls by lazy { InputControlsView(this).apply { visibility = View.GONE } }
 
     private fun toggleControls(edit: Boolean) {
@@ -392,6 +396,14 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
         requestMic.launch(android.Manifest.permission.RECORD_AUDIO)
     }
 
+    /** Once per launch on Android 13+, so WindowsService's ongoing notification stays visible. */
+    private fun askNotifications() {
+        if (notificationsAsked || android.os.Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        notificationsAsked = true
+        requestNotifications.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     private fun preparedMachine(): Machine? =
         Machine.active(this)?.takeIf { it.prepared }
             ?: Machine.all(this).firstOrNull { it.prepared }?.also { Machine.setActive(this, it) }
@@ -410,6 +422,7 @@ class MainActivity : AppCompatActivity(), HomeScreen.Actions {
             showBar(false)
             guest.requestFocus()
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            askNotifications()
         } else {
             guest.hideKeyboard()
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
